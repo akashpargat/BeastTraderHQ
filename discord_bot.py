@@ -1561,35 +1561,47 @@ async def full_scan():
         )
         await channel.send(embed=embed1)
 
-        # ── EMBED 2: Position Table (detailed) ──
-        table_header = f"```\n{'STOCK':6s} {'PRICE':>8s} {'P&L':>9s} {'%':>6s} │ {'RSI':>4s} {'VWAP':>5s} {'SENT':>5s} {'CONF':>5s} │ {'VERDICT':10s}\n{'─'*70}\n"
-        table_rows = []
+        # ── EMBED 2: Position Table (pure ASCII, perfectly aligned) ──
+        # Discord uses monospace in code blocks — ASCII chars only for alignment
+        hdr  = "+--------+----------+-----------+-------+-----+------+------+------+-----------+\n"
+        hdr += "| STOCK  |    PRICE |       P&L |     % | RSI | VWAP | SENT | CONF | VERDICT   |\n"
+        hdr += "+--------+----------+-----------+-------+-----+------+------+------+-----------+\n"
+        rows = []
         for p in sorted(positions, key=lambda x: x.unrealized_pl, reverse=True):
             pct = _pct(p)
             tv = tv_data.get(p.symbol, {})
-            rsi = f"{tv['rsi']:.0f}" if 'rsi' in tv else " — "
-            vwap = " ↑ " if tv.get('vwap_above') else " ↓ " if tv else " — "
+            rsi = f"{tv['rsi']:3.0f}" if 'rsi' in tv else " -- "
+            vwap = " UP " if tv.get('vwap_above') else " DN " if tv else " -- "
             sent = sentiments.get(p.symbol)
-            sent_v = f"{sent.total_score:+d}" if sent else " — "
+            sent_v = f"{sent.total_score:+3d} " if sent else " -- "
             cr = confidence_results.get(p.symbol)
-            conf_v = f"{cr.overall_confidence:.0%}" if cr else " — "
+            conf_v = f" {cr.overall_confidence:3.0%}" if cr else " -- "
             ai_v = ai_verdicts.get(p.symbol, {})
             verdict = ai_v.get('action', 'HOLD')
 
-            if pct >= 5: verdict_icon = "★ RUNNER"
-            elif pct >= 2: verdict_icon = "✦ SCALP"
-            elif verdict == 'SELL': verdict_icon = "✗ SELL"
-            elif verdict == 'BUY': verdict_icon = "✦ ADD"
-            elif pct >= 0: verdict_icon = "✓ HOLD"
-            elif pct > -5: verdict_icon = "⊘ HOLD"
-            else: verdict_icon = "⚠ DEEP RED"
+            if pct >= 5:    vd = ">> RUNNER"
+            elif pct >= 2:  vd = "-> SCALP "
+            elif verdict == 'SELL': vd = "!! SELL  "
+            elif verdict == 'BUY':  vd = "++ ADD   "
+            elif pct >= 0:  vd = "   HOLD  "
+            elif pct > -5:  vd = ".. HOLD  "
+            else:           vd = "** DEEP  "
 
-            table_rows.append(
-                f"{p.symbol:6s} ${p.current_price:7.2f} ${p.unrealized_pl:+8.2f} {pct:+5.1f}% │ {rsi:>4s} {vwap:>5s} {sent_v:>5s} {conf_v:>5s} │ {verdict_icon:10s}"
+            tag = "+" if pct >= 0 else "-"
+            rows.append(
+                f"| {tag}{p.symbol:5s} | ${p.current_price:7.2f} | ${p.unrealized_pl:+8.2f} | {pct:+5.1f}% | {rsi:>3s} | {vwap:>4s} | {sent_v:>4s} | {conf_v:>4s} | {vd:9s} |"
             )
 
-        table_str = table_header + "\n".join(table_rows) + "\n```"
-        embed2 = discord.Embed(title="📊 Position Dashboard", description=table_str, color=0x2b2d31)
+        footer = "+--------+----------+-----------+-------+-----+------+------+------+-----------+"
+        table_str = f"```\n{hdr}" + "\n".join(rows) + f"\n{footer}\n```"
+
+        embed2 = discord.Embed(
+            title="📊 Position Dashboard",
+            description=table_str,
+            color=0x2b2d31
+        )
+        # Add legend below table
+        embed2.set_footer(text=">> RUNNER (+5%) | -> SCALP (+2%) | ++ ADD (AI buy) | !! SELL (AI sell) | ** DEEP RED | UP/DN = VWAP")
         await channel.send(embed=embed2)
 
         # ── EMBED 3: Per-Stock Deep Analysis (WHY buy/sell/hold) ──
