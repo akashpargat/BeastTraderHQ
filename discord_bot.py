@@ -708,6 +708,150 @@ async def performance_cmd(ctx):
         await ctx.send(f"❌ Performance report failed: {e}")
 
 
+# ── !analytics (comprehensive dashboard) ──────────────
+
+@bot.command(name='analytics')
+async def analytics_cmd(ctx):
+    """Comprehensive analytics: equity curve, trade patterns, market analysis."""
+    try:
+        from trade_db import TradeDB
+        from performance_tracker import PerformanceTracker
+        db = TradeDB()
+        tracker = PerformanceTracker(db)
+
+        # ── EMBED 1: Overall Stats ──
+        stats = db.get_overall_stats()
+        streak = db.get_streak()
+        embed1 = discord.Embed(title="📊 BEAST ANALYTICS DASHBOARD", color=0x3498db)
+        embed1.add_field(name="📈 Overall Performance", value=(
+            f"```\n"
+            f"Total Trades:   {stats.get('total_trades', 0):>6d}\n"
+            f"Win Rate:       {stats.get('win_rate', 0):>5.1%}\n"
+            f"Total P&L:     ${stats.get('total_pnl', 0):>+9.2f}\n"
+            f"Avg Trade:     ${stats.get('avg_pnl', 0):>+9.2f}\n"
+            f"Profit Factor:  {stats.get('profit_factor', 0):>6.2f}\n"
+            f"Max Win:       ${stats.get('max_win', 0):>+9.2f}\n"
+            f"Max Loss:      ${stats.get('max_loss', 0):>+9.2f}\n"
+            f"Streak:         {streak.get('count', 0)}x {'WIN' if streak.get('type') == 'win' else 'LOSS'}\n"
+            f"```"
+        ), inline=False)
+
+        # ── Strategy Breakdown ──
+        by_strat = db.get_stats_by_strategy()
+        if by_strat:
+            strat_table = "```\n"
+            strat_table += f"{'STRAT':8s} {'TRADES':>6s} {'WR':>6s} {'P&L':>10s} {'AVG':>8s}\n"
+            strat_table += f"{'─'*42}\n"
+            for s in by_strat[:8]:
+                strat_table += f"{s['strategy'][:8]:8s} {s['trades']:>6d} {s['win_rate']:>5.0f}% ${s['total_pnl']:>+9.2f} ${s['avg_pnl']:>+7.2f}\n"
+            strat_table += "```"
+            embed1.add_field(name="📋 By Strategy", value=strat_table, inline=False)
+
+        # ── Stock Breakdown ──
+        by_stock = db.get_stats_by_stock()
+        if by_stock:
+            stock_table = "```\n"
+            stock_table += f"{'STOCK':6s} {'TRADES':>6s} {'WR':>6s} {'P&L':>10s}\n"
+            stock_table += f"{'─'*32}\n"
+            for s in by_stock[:10]:
+                stock_table += f"{s['symbol']:6s} {s['trades']:>6d} {s['win_rate']:>5.0f}% ${s['total_pnl']:>+9.2f}\n"
+            stock_table += "```"
+            embed1.add_field(name="📈 By Stock", value=stock_table, inline=False)
+
+        await ctx.send(embed=embed1)
+
+        # ── EMBED 2: Daily P&L ──
+        by_day = db.get_stats_by_day(14)
+        if by_day:
+            embed2 = discord.Embed(title="📅 Daily P&L (Last 14 Days)", color=0x2ecc71)
+            day_table = "```\n"
+            day_table += f"{'DATE':12s} {'TRADES':>6s} {'WR':>6s} {'P&L':>10s}\n"
+            day_table += f"{'─'*38}\n"
+            for d in by_day:
+                icon = "+" if (d.get('daily_pnl') or 0) >= 0 else "-"
+                day_table += f"{icon}{d['trade_date']:11s} {d['trades']:>6d} {d['win_rate']:>5.0f}% ${d['daily_pnl']:>+9.2f}\n"
+            day_table += "```"
+            embed2.description = day_table
+            await ctx.send(embed=embed2)
+
+        # ── EMBED 3: Equity Curve ──
+        eq_data = db.get_equity_curve(48)  # Last 48 data points
+        if eq_data:
+            embed3 = discord.Embed(title="📈 Equity Curve", color=0x9b59b6)
+            eq_data.reverse()  # Oldest first
+            # ASCII bar chart
+            equities = [e['equity'] for e in eq_data]
+            if equities:
+                min_eq = min(equities)
+                max_eq = max(equities)
+                range_eq = max_eq - min_eq or 1
+                chart = "```\n"
+                chart += f"${max_eq:,.0f} ┤\n"
+                for e in eq_data[-20:]:
+                    bar_len = int((e['equity'] - min_eq) / range_eq * 30)
+                    bar = "█" * max(1, bar_len)
+                    chart += f"        │{bar} ${e['equity']:,.0f}\n"
+                chart += f"${min_eq:,.0f} ┤\n"
+                chart += "```"
+                embed3.description = chart[:2000]
+            await ctx.send(embed=embed3)
+
+        # ── EMBED 4: Regime Performance ──
+        by_regime = db.get_stats_by_regime()
+        if by_regime:
+            embed4 = discord.Embed(title="🌍 Performance by Market Regime", color=0xe74c3c)
+            regime_table = "```\n"
+            regime_table += f"{'REGIME':10s} {'TRADES':>6s} {'WR':>6s} {'P&L':>10s}\n"
+            regime_table += f"{'─'*36}\n"
+            for r in by_regime:
+                regime_table += f"{r['regime'][:10]:10s} {r['trades']:>6d} {r['win_rate']:>5.0f}% ${r['total_pnl']:>+9.2f}\n"
+            regime_table += "```"
+            embed4.description = regime_table
+            await ctx.send(embed=embed4)
+
+        # ── EMBED 5: Recent Scans ──
+        scans = db.get_scan_history(10)
+        if scans:
+            embed5 = discord.Embed(title="🔍 Recent Scan Log", color=0x1abc9c)
+            scan_table = "```\n"
+            scan_table += f"{'TIME':8s} {'TYPE':5s} {'REG':6s} {'EQ':>10s} {'P&L':>9s} {'TV':>3s} {'AI':>3s} {'TR':>3s}\n"
+            scan_table += f"{'─'*52}\n"
+            for s in scans[:10]:
+                t = s.get('timestamp', '')[-8:]
+                scan_table += f"{t:8s} {s.get('scan_type','?'):5s} {s.get('regime','?')[:6]:6s} ${s.get('equity',0):>9,.0f} ${s.get('total_pl',0):>+8.2f} {s.get('tv_reads',0):>3d} {s.get('ai_calls',0):>3d} {s.get('trump_score',0):>+3d}\n"
+            scan_table += "```"
+            embed5.description = scan_table
+            embed5.set_footer(text="!performance for full report | !backtest NVDA for strategy test")
+            await ctx.send(embed=embed5)
+
+        if not any([by_strat, by_stock, by_day, eq_data, scans]):
+            await ctx.send("📊 No analytics data yet. The bot needs to make some trades first!")
+
+    except Exception as e:
+        await ctx.send(f"❌ Analytics failed: {e}")
+
+
+# ── !debug (show recent errors) ───────────────────────
+
+@bot.command(name='debug')
+async def debug_cmd(ctx, component: str = None):
+    """Show recent debug/error log entries."""
+    try:
+        from trade_db import TradeDB
+        db = TradeDB()
+        entries = db.get_debug_log(20, component)
+        if not entries:
+            await ctx.send("✅ No debug entries found. System is clean!")
+            return
+        text = "```\n"
+        for e in entries:
+            text += f"[{e.get('timestamp','')[-8:]}] {e.get('level','')[:4]} {e.get('component','')[:10]:10s} {e.get('message','')[:60]}\n"
+        text += "```"
+        await ctx.send(f"🔧 **Debug Log** (last 20)\n{text}")
+    except Exception as e:
+        await ctx.send(f"❌ Debug log failed: {e}")
+
+
 # ── !approve / !reject (Remote trade control) ─────────
 
 pending_trades = {}  # symbol → trade proposal data
@@ -1176,15 +1320,27 @@ def _pct(p) -> float:
     cost = p.avg_entry * p.qty
     return (p.unrealized_pl / cost * 100) if cost > 0 else 0
 
-# Trade action log — tracks all auto-trades for reporting
-_trade_log = []  # list of {'time', 'action', 'symbol', 'qty', 'price', 'reason', 'scan_type'}
+# Trade action log — tracks all auto-trades for reporting + persists to DB
+_trade_log = []
+_trade_db = None
+
+def _get_trade_db():
+    global _trade_db
+    if _trade_db is None:
+        try:
+            from trade_db import TradeDB
+            _trade_db = TradeDB()
+        except Exception as e:
+            log.warning(f"TradeDB init failed: {e}")
+    return _trade_db
 
 def _log_trade(action, symbol, qty, price, reason, scan_type="60s"):
-    """Log a trade action for the next report."""
+    """Log a trade action to memory + SQLite database."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("America/New_York"))
     _trade_log.append({
-        'time': datetime.now(ZoneInfo("America/New_York")).strftime('%H:%M:%S'),
+        'time': now.strftime('%H:%M:%S'),
         'action': action,
         'symbol': symbol,
         'qty': qty,
@@ -1192,6 +1348,19 @@ def _log_trade(action, symbol, qty, price, reason, scan_type="60s"):
         'reason': reason,
         'scan_type': scan_type,
     })
+    # Persist to SQLite
+    db = _get_trade_db()
+    if db:
+        try:
+            side = 'sell' if 'SELL' in action.upper() else 'buy'
+            if side == 'buy':
+                db.log_entry(symbol=symbol, qty=qty, price=price,
+                            strategy=scan_type, reason=f"{action}: {reason}")
+            else:
+                db.log_entry(symbol=symbol, qty=qty, price=price,
+                            strategy=scan_type, reason=f"{action}: {reason}")
+        except Exception as e:
+            log.debug(f"Trade DB write failed: {e}")
 
 def _is_market_hours() -> bool:
     from datetime import datetime
@@ -1760,6 +1929,24 @@ async def full_scan():
 
         _last_full_scan = time.time()
         log.info(f"Full scan sent at {now.strftime('%H:%M')} [TV:{len(tv_data)} AI:{len(ai_verdicts)}]")
+
+        # ── LOG TO DATABASE (scan log + equity curve + position snapshots) ──
+        db = _get_trade_db()
+        if db:
+            try:
+                conf_data = {sym: cr.overall_confidence for sym, cr in confidence_results.items()}
+                db.log_scan(
+                    regime=regime.value, spy_change=spy_change, equity=equity,
+                    total_pl=total_pl, positions_count=len(positions),
+                    tv_count=len(tv_data), sentiment_count=len(sentiments),
+                    ai_count=len(ai_verdicts), trump_score=trump_score,
+                    confidence_scores=conf_data
+                )
+                db.log_equity(equity, total_pl, len(positions))
+                db.snapshot_positions(positions)
+                log.info(f"  DB: scan + equity + snapshots logged")
+            except Exception as e:
+                log.debug(f"DB logging failed: {e}")
 
     except Exception as e:
         log.error(f"Full scan error: {e}\n{traceback.format_exc()}")

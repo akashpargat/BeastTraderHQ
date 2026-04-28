@@ -130,6 +130,7 @@ class TradeDB:
         CREATE INDEX IF NOT EXISTS idx_snapshots_time ON position_snapshots(timestamp);
         """)
         self.conn.commit()
+        self._create_analytics_tables()
 
     # ── Trade CRUD ─────────────────────────────────────
 
@@ -373,6 +374,107 @@ class TradeDB:
             INSERT INTO alerts_log (alert_type, symbol, message, sent_telegram, sent_discord)
             VALUES (?, ?, ?, ?, ?)
         """, (alert_type, symbol, message, 1 if telegram else 0, 1 if discord else 0))
+        self.conn.commit()
+
+    # ── Scan Logging (every 5-min full scan) ──────────
+
+    def log_scan(self, regime: str, spy_change: float, equity: float,
+                 total_pl: float, positions_count: int, tv_count: int,
+                 sentiment_count: int, ai_count: int, trump_score: int,
+                 confidence_scores: dict = None, scan_type: str = '5min'):
+        """Log every scan cycle for pattern analysis and debugging."""
+        self.conn.execute("""
+            INSERT OR IGNORE INTO scan_log 
+            (scan_type, regime, spy_change, equity, total_pl, positions,
+             tv_reads, sentiments, ai_calls, trump_score, confidence_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (scan_type, regime, spy_change, equity, total_pl, positions_count,
+              tv_count, sentiment_count, ai_count, trump_score,
+              str(confidence_scores or {})))
+        self.conn.commit()
+
+    def get_scan_history(self, limit: int = 50) -> list:
+        rows = self.conn.execute("""
+            SELECT * FROM scan_log ORDER BY timestamp DESC LIMIT ?
+        """, (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Portfolio Equity Curve ─────────────────────────
+
+    def log_equity(self, equity: float, total_pl: float, positions: int):
+        """Log equity for charting equity curve over time."""
+        self.conn.execute("""
+            INSERT INTO equity_curve (equity, total_pl, positions_count)
+            VALUES (?, ?, ?)
+        """, (equity, total_pl, positions))
+        self.conn.commit()
+
+    def get_equity_curve(self, limit: int = 200) -> list:
+        rows = self.conn.execute("""
+            SELECT * FROM equity_curve ORDER BY timestamp DESC LIMIT ?
+        """, (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Debug Log ──────────────────────────────────────
+
+    def log_debug(self, component: str, message: str, level: str = 'INFO'):
+        """Log debug entries for troubleshooting."""
+        self.conn.execute("""
+            INSERT INTO debug_log (component, level, message) VALUES (?, ?, ?)
+        """, (component, level, message))
+        self.conn.commit()
+
+    def get_debug_log(self, limit: int = 100, component: str = None) -> list:
+        if component:
+            rows = self.conn.execute(
+                "SELECT * FROM debug_log WHERE component = ? ORDER BY timestamp DESC LIMIT ?",
+                (component, limit)).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM debug_log ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Create New Tables ──────────────────────────────
+
+    def _create_analytics_tables(self):
+        """Additional tables for scan logging, equity curve, debug."""
+        self.conn.executescript("""
+        CREATE TABLE IF NOT EXISTS scan_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT DEFAULT (datetime('now')),
+            scan_type TEXT DEFAULT '5min',
+            regime TEXT,
+            spy_change REAL,
+            equity REAL,
+            total_pl REAL,
+            positions INTEGER,
+            tv_reads INTEGER,
+            sentiments INTEGER,
+            ai_calls INTEGER,
+            trump_score INTEGER,
+            confidence_data TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS equity_curve (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT DEFAULT (datetime('now')),
+            equity REAL,
+            total_pl REAL,
+            positions_count INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS debug_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT DEFAULT (datetime('now')),
+            component TEXT,
+            level TEXT DEFAULT 'INFO',
+            message TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_scan_time ON scan_log(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_equity_time ON equity_curve(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_debug_time ON debug_log(timestamp);
+        """)
         self.conn.commit()
 
     def close(self):
