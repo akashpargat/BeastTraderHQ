@@ -1097,12 +1097,309 @@ async def full_scan_cmd(ctx):
         await ctx.send(embed=ai_embed)
 
 
+# ── AUTONOMOUS LOOP (runs inside Discord bot) ─────────
+
+SCAN_CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', '1498363431013716079'))
+_prev_prices = {}
+_cycle_count = 0
+_last_full_scan = 0
+
+@tasks.loop(seconds=60)
+async def position_monitor():
+    """Every 60s: check positions, alert drops, auto-scalp, auto-protect."""
+    global _prev_prices, _cycle_count
+    _cycle_count += 1
+    try:
+        positions = gw.get_positions()
+        if not positions:
+            return
+        channel = bot.get_channel(SCAN_CHANNEL_ID)
+        total_pl = sum(p.unrealized_pl for p in positions)
+        greens = sum(1 for p in positions if p.unrealized_pl >= 0)
+
+        for p in positions:
+            prev = _prev_prices.get(p.symbol, p.current_price)
+            pct = (p.unrealized_pl / p.cost_basis * 100) if p.cost_basis else 0
+
+            # ── AUTO-SCALP: +5% runner → sell half at market ──
+            if pct >= 5.0 and not _prev_prices.get(f"_runner_{p.symbol}"):
+                half = max(1, p.qty // 2)
+                try:
+                    gw.place_sell(p.symbol, half, round(p.current_price * 0.999, 2),
+                                  reason=f"Auto-runner +{pct:.1f}%")
+                    _prev_prices[f"_runner_{p.symbol}"] = True
+                    if channel:
+                        await channel.send(f"🏃 **AUTO-RUNNER SELL: {p.symbol}** +{pct:.1f}%\nSelling {half} shares @ ~${p.current_price:.2f}\nLocking ${p.unrealized_pl/2:+.2f} profit!")
+                    log.info(f"AUTO-RUNNER: {p.symbol} +{pct:.1f}% selling {half}")
+                except Exception as e:
+                    log.error(f"Auto-runner sell failed {p.symbol}: {e}")
+
+            # ── AUTO-SCALP: +2% scalp target → place limit sell for half ──
+            elif pct >= 2.0 and not _prev_prices.get(f"_scalp_{p.symbol}"):
+                half = max(1, p.qty // 2)
+                sell_price = round(p.current_price * 1.005, 2)  # Sell slightly above current
+                try:
+                    gw.place_sell(p.symbol, half, sell_price,
+                                  reason=f"Auto-scalp +{pct:.1f}%")
+                    _prev_prices[f"_scalp_{p.symbol}"] = True
+                    if channel:
+                        await channel.send(f"🎯 **AUTO-SCALP: {p.symbol}** +{pct:.1f}%\nLimit sell {half} shares @ ${sell_price}\nTarget P&L: ${p.unrealized_pl/2:+.2f}")
+                    log.info(f"AUTO-SCALP: {p.symbol} +{pct:.1f}% limit sell {half} @ {sell_price}")
+                except Exception as e:
+                    log.error(f"Auto-scalp sell failed {p.symbol}: {e}")
+
+            # ── DROP ALERT: >2% sudden drop since last check ──
+            if prev > 0:
+                chg = (p.current_price - prev) / prev * 100
+                if chg <= -2.0 and channel:
+                    await channel.send(f"🚨 **DROP ALERT: {p.symbol}** ${prev:.2f} → ${p.current_price:.2f} ({chg:+.1f}%)\nP&L: ${p.unrealized_pl:+.2f}\nIron Law 1: HOLD (never sell at loss)")
+
+            # ── IRON LAW 1: Loss alert at -$500 (NEVER sell, just alert) ──
+            if p.unrealized_pl <= -500 and not _prev_prices.get(f"_loss500_{p.symbol}"):
+                _prev_prices[f"_loss500_{p.symbol}"] = True
+                if channel:
+                    await channel.send(f"⛔ **IRON LAW 1 ALERT: {p.symbol}**\nLoss: ${p.unrealized_pl:.2f}\nEntry: ${p.avg_entry:.2f} → ${p.current_price:.2f}\n**ACTION: HOLD** (Iron Law 1 = NEVER sell at loss)")
+
+            _prev_prices[p.symbol] = p.current_price
+
+        # Summary every 5 cycles (5 min)
+        if _cycle_count % 5 == 0 and channel:
+            lines = [f"📊 **Position Check #{_cycle_count}** | P&L: ${total_pl:+.2f} | G:{greens} R:{len(positions)-greens}"]
+            for p in sorted(positions, key=lambda x: x.unrealized_pl, reverse=True)[:6]:
+                pct = (p.unrealized_pl / p.cost_basis * 100) if p.cost_basis else 0
+                icon = "🟢" if p.unrealized_pl >= 0 else "🔴"
+                lines.append(f"{icon} {p.symbol} ${p.unrealized_pl:+.2f} ({pct:+.1f}%)")
+            await channel.send("\n".join(lines))
+        log.info(f"[Monitor #{_cycle_count}] {len(positions)} pos | P&L: ${total_pl:+.2f}")
+    except Exception as e:
+        log.error(f"Position monitor error: {e}")
+
+@tasks.loop(minutes=5)
+async def full_scan():
+    """Every 5 min: full Beast scan with sentiment, AI, movers, action table."""
+    global _last_full_scan
+    try:
+        channel = bot.get_channel(SCAN_CHANNEL_ID)
+        if not channel:
+            return
+
+        # ── POSITIONS ──
+        positions = gw.get_positions()
+        acct = gw.get_account()
+        equity = float(acct.get('equity', 100000))
+        total_pl = sum(p.unrealized_pl for p in positions)
+        held = [p.symbol for p in positions]
+
+        # ── REGIME ──
+        spy_change = 0
+        try:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockSnapshotRequest
+            dc = StockHistoricalDataClient(os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'))
+            snap = dc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols='SPY', feed='iex'))
+            if 'SPY' in snap:
+                s = snap['SPY']
+                spy_change = (float(s.daily_bar.close) - float(s.previous_daily_bar.close)) / float(s.previous_daily_bar.close)
+        except:
+            pass
+        regime = regime_det.detect(spy_change)
+
+        # ── SENTIMENT ──
+        sentiments = {}
+        try:
+            from sentiment_analyst import SentimentAnalyst
+            sa = SentimentAnalyst()
+            for sym in held[:8]:
+                try:
+                    sentiments[sym] = sa.analyze(sym)
+                except:
+                    pass
+        except:
+            pass
+
+        # ── OPEN ORDERS ──
+        open_orders = gw.get_open_orders()
+
+        # ── AI ANALYSIS ──
+        ai_verdicts = {}
+        if brain and brain.is_available:
+            for sym in held[:6]:
+                try:
+                    pos = next((p for p in positions if p.symbol == sym), None)
+                    if not pos:
+                        continue
+                    sent = sentiments.get(sym)
+                    data = {
+                        'price': pos.current_price, 'entry': pos.avg_entry,
+                        'pnl': pos.unrealized_pl, 'qty': pos.qty,
+                        'regime': regime.value,
+                        'sentiment': getattr(sent, 'overall_score', 50) if sent else 50,
+                        'rsi': 50, 'macd_hist': 0, 'vwap_above': False,
+                        'volume_ratio': 1.0, 'bb_position': 'mid',
+                        'confluence': 5, 'ema_9': 0, 'ema_21': 0,
+                        'yahoo_score': getattr(sent, 'yahoo_score', 50) if sent else 50,
+                        'analyst_score': getattr(sent, 'analyst_score', 50) if sent else 50,
+                        'reddit_score': getattr(sent, 'reddit_score', 50) if sent else 50,
+                        'trump_score': getattr(sent, 'trump_score', 50) if sent else 50,
+                        'sector': '?', 'earnings_days': 999, 'holding': True,
+                        'unrealized_pl': pos.unrealized_pl,
+                    }
+                    ai_verdicts[sym] = brain.analyze_stock(sym, data)
+                except:
+                    pass
+
+        # ── BUILD REPORT ──
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+
+        embed = discord.Embed(
+            title=f"🦍 BEAST SCAN — {now.strftime('%I:%M %p ET')}",
+            color=0x00ff00 if total_pl >= 0 else 0xff0000
+        )
+        embed.add_field(name="💰 Portfolio", value=f"Equity: ${equity:,.0f}\nP&L: ${total_pl:+.2f}\nRegime: {regime.value}\nSPY: {spy_change:+.2%}", inline=True)
+        embed.add_field(name="📋 Orders", value=f"{len(open_orders)} open orders\n{len(positions)} positions", inline=True)
+
+        # Action table
+        action_lines = []
+        for p in sorted(positions, key=lambda x: x.unrealized_pl, reverse=True):
+            pct = (p.unrealized_pl / p.cost_basis * 100) if p.cost_basis else 0
+            ai_v = ai_verdicts.get(p.symbol, {})
+            ai_act = ai_v.get('action', '-')
+            sent = sentiments.get(p.symbol)
+            sent_s = getattr(sent, 'overall_score', '-') if sent else '-'
+            if pct >= 5: action = "RUNNER🏃"
+            elif pct >= 2: action = "SCALP🎯"
+            elif pct >= 0: action = "HOLD✅"
+            elif pct > -5: action = "HOLD🔒"
+            else: action = "DEEP RED⚠️"
+            icon = "🟢" if pct >= 0 else "🔴"
+            action_lines.append(f"{icon} **{p.symbol}** ${p.unrealized_pl:+.2f} ({pct:+.1f}%) S:{sent_s} AI:{ai_act} → {action}")
+
+        embed.add_field(name="📊 Positions", value="\n".join(action_lines[:12]) or "None", inline=False)
+
+        # Sentiment highlights
+        sent_highlights = []
+        for sym, s in sentiments.items():
+            if hasattr(s, 'trump_score') and s.trump_score < 30:
+                sent_highlights.append(f"⚠️ {sym}: Trump/tariff risk")
+            if hasattr(s, 'overall_score') and s.overall_score > 70:
+                sent_highlights.append(f"🟢 {sym}: bullish sentiment ({s.overall_score})")
+            if hasattr(s, 'overall_score') and s.overall_score < 30:
+                sent_highlights.append(f"🔴 {sym}: bearish sentiment ({s.overall_score})")
+        if sent_highlights:
+            embed.add_field(name="📰 Sentiment", value="\n".join(sent_highlights[:5]), inline=False)
+
+        # AI summary
+        if ai_verdicts:
+            ai_lines = []
+            for sym, v in ai_verdicts.items():
+                act = v.get('action', '?')
+                conf = v.get('confidence', 0)
+                reason = v.get('reasoning', '')[:60]
+                ai_lines.append(f"{'🟢' if act=='BUY' else '🔴' if act=='SELL' else '🟡'} {sym}: {act} ({conf}%) {reason}")
+            embed.add_field(name="🧠 AI Verdicts", value="\n".join(ai_lines[:6]), inline=False)
+
+        embed.set_footer(text=f"Beast V3 | Auto-scan every 5min | Cycle #{_cycle_count}")
+        await channel.send(embed=embed)
+
+        _last_full_scan = time.time()
+        log.info(f"Full scan sent to Discord at {now.strftime('%H:%M')}")
+
+    except Exception as e:
+        log.error(f"Full scan error: {e}\n{traceback.format_exc()}")
+
+@tasks.loop(minutes=10)
+async def decision_report():
+    """Every 10 min: trading decisions + comprehensive portfolio summary to Discord."""
+    try:
+        channel = bot.get_channel(SCAN_CHANNEL_ID)
+        if not channel:
+            return
+        positions = gw.get_positions()
+        acct = gw.get_account()
+        equity = float(acct.get('equity', 0))
+        total_pl = sum(p.unrealized_pl for p in positions)
+        greens = sum(1 for p in positions if p.unrealized_pl >= 0)
+
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+
+        embed = discord.Embed(title=f"📊 HOURLY REPORT — {now.strftime('%I:%M %p ET')}", color=0x0099ff)
+        embed.add_field(name="Portfolio", value=f"${equity:,.0f} | P&L: ${total_pl:+.2f}\n{len(positions)} pos (G:{greens} R:{len(positions)-greens})", inline=False)
+
+        for p in sorted(positions, key=lambda x: x.unrealized_pl, reverse=True):
+            pct = (p.unrealized_pl / p.cost_basis * 100) if p.cost_basis else 0
+            embed.add_field(name=f"{'🟢' if pct>=0 else '🔴'} {p.symbol}", value=f"${p.unrealized_pl:+.2f} ({pct:+.1f}%)", inline=True)
+
+        open_orders = gw.get_open_orders()
+        if open_orders:
+            order_lines = [f"{'🟢' if o.get('side')=='buy' else '🔴'} {o.get('side','?').upper()} {o.get('symbol','?')} x{o.get('qty','?')} @ ${o.get('limit_price','?')}" for o in open_orders[:8]]
+            embed.add_field(name=f"📋 Open Orders ({len(open_orders)})", value="\n".join(order_lines), inline=False)
+
+        embed.set_footer(text="Beast V3 Autonomous | Decisions every 10 min")
+        await channel.send(embed=embed)
+    except Exception as e:
+        log.error(f"Decision report error: {e}")
+
+@position_monitor.before_loop
+async def before_monitor():
+    await bot.wait_until_ready()
+
+@full_scan.before_loop
+async def before_scan():
+    await bot.wait_until_ready()
+    await asyncio.sleep(10)  # Let bot fully initialize
+
+@decision_report.before_loop
+async def before_decision():
+    await bot.wait_until_ready()
+    await asyncio.sleep(30)
+
+@bot.event
+async def on_ready():
+    log.info(f"🦍 Beast Discord Bot online as {bot.user}")
+    log.info(f"   AI Brain: {'✅ Opus 4.7' if brain and brain.is_available else '❌ offline'}")
+    # Check TV
+    tv_ok = False
+    try:
+        from tv_cdp_client import TVClient
+        tv_ok = TVClient().health_check()
+    except:
+        pass
+    log.info(f"   TradingView: {'✅' if tv_ok else '❌'}")
+
+    # Start autonomous loops
+    if not position_monitor.is_running():
+        position_monitor.start()
+        log.info("   ✅ Position monitor: every 60s")
+    if not full_scan.is_running():
+        full_scan.start()
+        log.info("   ✅ Full scan: every 5 min")
+    if not decision_report.is_running():
+        decision_report.start()
+        log.info("   ✅ Decision report: every 10 min")
+
+    channel = bot.get_channel(SCAN_CHANNEL_ID)
+    if channel:
+        await channel.send(
+            "🦍 **BEAST ENGINE V3 ONLINE**\n"
+            f"• Position monitor: every 60s\n"
+            f"• Full scan: every 5 min\n"
+            f"• Decision report: every 10 min\n"
+            f"• AI: {'Claude Opus 4.7 ✅' if brain and brain.is_available else 'Deterministic ❌'}\n"
+            f"• TV: {'Connected ✅' if tv_ok else 'Offline ❌'}\n"
+            f"• Iron Laws: HARDCODED ✅"
+        )
+
 # ── Run ────────────────────────────────────────────────
 
 if __name__ == '__main__':
+    import asyncio
     token = os.getenv('DISCORD_BOT_TOKEN', '')
     if not token:
         print("❌ DISCORD_BOT_TOKEN not set in .env")
         sys.exit(1)
-    print("🦍 Starting Beast Discord Bot...")
+    print("🦍 Starting Beast Discord Bot with Autonomous Loop...")
     bot.run(token)
