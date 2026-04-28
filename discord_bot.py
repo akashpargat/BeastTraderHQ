@@ -1,4 +1,4 @@
-import sys, io
+﻿import sys, io
 if sys.platform == 'win32' and hasattr(sys.stdout, 'buffer'):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
@@ -29,6 +29,7 @@ import os
 import sys
 import asyncio
 import logging
+import traceback
 import time
 import discord
 from discord.ext import commands, tasks
@@ -1110,7 +1111,7 @@ async def position_monitor():
     global _prev_prices, _cycle_count
     _cycle_count += 1
     try:
-        positions = gw.get_positions()
+        positions = gateway.get_positions()
         if not positions:
             return
         channel = bot.get_channel(SCAN_CHANNEL_ID)
@@ -1125,7 +1126,7 @@ async def position_monitor():
             if pct >= 5.0 and not _prev_prices.get(f"_runner_{p.symbol}"):
                 half = max(1, p.qty // 2)
                 try:
-                    gw.place_sell(p.symbol, half, round(p.current_price * 0.999, 2),
+                    gateway.place_sell(p.symbol, half, round(p.current_price * 0.999, 2),
                                   reason=f"Auto-runner +{pct:.1f}%")
                     _prev_prices[f"_runner_{p.symbol}"] = True
                     if channel:
@@ -1139,7 +1140,7 @@ async def position_monitor():
                 half = max(1, p.qty // 2)
                 sell_price = round(p.current_price * 1.005, 2)  # Sell slightly above current
                 try:
-                    gw.place_sell(p.symbol, half, sell_price,
+                    gateway.place_sell(p.symbol, half, sell_price,
                                   reason=f"Auto-scalp +{pct:.1f}%")
                     _prev_prices[f"_scalp_{p.symbol}"] = True
                     if channel:
@@ -1184,8 +1185,8 @@ async def full_scan():
             return
 
         # ── POSITIONS ──
-        positions = gw.get_positions()
-        acct = gw.get_account()
+        positions = gateway.get_positions()
+        acct = gateway.get_account()
         equity = float(acct.get('equity', 100000))
         total_pl = sum(p.unrealized_pl for p in positions)
         held = [p.symbol for p in positions]
@@ -1218,7 +1219,7 @@ async def full_scan():
             pass
 
         # ── OPEN ORDERS ──
-        open_orders = gw.get_open_orders()
+        open_orders = gateway.get_open_orders()
 
         # ── AI ANALYSIS ──
         ai_verdicts = {}
@@ -1316,8 +1317,8 @@ async def decision_report():
         channel = bot.get_channel(SCAN_CHANNEL_ID)
         if not channel:
             return
-        positions = gw.get_positions()
-        acct = gw.get_account()
+        positions = gateway.get_positions()
+        acct = gateway.get_account()
         equity = float(acct.get('equity', 0))
         total_pl = sum(p.unrealized_pl for p in positions)
         greens = sum(1 for p in positions if p.unrealized_pl >= 0)
@@ -1333,7 +1334,7 @@ async def decision_report():
             pct = (p.unrealized_pl / p.cost_basis * 100) if p.cost_basis else 0
             embed.add_field(name=f"{'🟢' if pct>=0 else '🔴'} {p.symbol}", value=f"${p.unrealized_pl:+.2f} ({pct:+.1f}%)", inline=True)
 
-        open_orders = gw.get_open_orders()
+        open_orders = gateway.get_open_orders()
         if open_orders:
             order_lines = [f"{'🟢' if o.get('side')=='buy' else '🔴'} {o.get('side','?').upper()} {o.get('symbol','?')} x{o.get('qty','?')} @ ${o.get('limit_price','?')}" for o in open_orders[:8]]
             embed.add_field(name=f"📋 Open Orders ({len(open_orders)})", value="\n".join(order_lines), inline=False)
