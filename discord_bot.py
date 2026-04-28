@@ -1120,7 +1120,7 @@ async def position_monitor():
 
         for p in positions:
             prev = _prev_prices.get(p.symbol, p.current_price)
-            pct = (p.unrealized_pl / p.cost_basis * 100) if p.cost_basis else 0
+            pct = (p.unrealized_pl / (p.avg_entry * p.qty) * 100) if (p.avg_entry * p.qty) else 0
 
             # ── AUTO-SCALP: +5% runner → sell half at market ──
             if pct >= 5.0 and not _prev_prices.get(f"_runner_{p.symbol}"):
@@ -1167,7 +1167,7 @@ async def position_monitor():
         if _cycle_count % 5 == 0 and channel:
             lines = [f"📊 **Position Check #{_cycle_count}** | P&L: ${total_pl:+.2f} | G:{greens} R:{len(positions)-greens}"]
             for p in sorted(positions, key=lambda x: x.unrealized_pl, reverse=True)[:6]:
-                pct = (p.unrealized_pl / p.cost_basis * 100) if p.cost_basis else 0
+                pct = (p.unrealized_pl / (p.avg_entry * p.qty) * 100) if (p.avg_entry * p.qty) else 0
                 icon = "🟢" if p.unrealized_pl >= 0 else "🔴"
                 lines.append(f"{icon} {p.symbol} ${p.unrealized_pl:+.2f} ({pct:+.1f}%)")
             await channel.send("\n".join(lines))
@@ -1264,7 +1264,7 @@ async def full_scan():
         # Action table
         action_lines = []
         for p in sorted(positions, key=lambda x: x.unrealized_pl, reverse=True):
-            pct = (p.unrealized_pl / p.cost_basis * 100) if p.cost_basis else 0
+            pct = (p.unrealized_pl / (p.avg_entry * p.qty) * 100) if (p.avg_entry * p.qty) else 0
             ai_v = ai_verdicts.get(p.symbol, {})
             ai_act = ai_v.get('action', '-')
             sent = sentiments.get(p.symbol)
@@ -1331,7 +1331,7 @@ async def decision_report():
         embed.add_field(name="Portfolio", value=f"${equity:,.0f} | P&L: ${total_pl:+.2f}\n{len(positions)} pos (G:{greens} R:{len(positions)-greens})", inline=False)
 
         for p in sorted(positions, key=lambda x: x.unrealized_pl, reverse=True):
-            pct = (p.unrealized_pl / p.cost_basis * 100) if p.cost_basis else 0
+            pct = (p.unrealized_pl / (p.avg_entry * p.qty) * 100) if (p.avg_entry * p.qty) else 0
             embed.add_field(name=f"{'🟢' if pct>=0 else '🔴'} {p.symbol}", value=f"${p.unrealized_pl:+.2f} ({pct:+.1f}%)", inline=True)
 
         open_orders = gateway.get_open_orders()
