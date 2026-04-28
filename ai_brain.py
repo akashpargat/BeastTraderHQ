@@ -24,7 +24,9 @@ from datetime import datetime
 log = logging.getLogger('Beast.RemoteAI')
 
 AI_API_URL = os.getenv('AI_API_URL', 'http://localhost:5555')
+AI_API_KEY = os.getenv('AI_API_KEY', 'beast-v3-sk-7f3a9e2b4d1c8f5e6a0b3d9c')
 AI_TIMEOUT = 30
+AI_HEADERS = {'X-API-Key': AI_API_KEY, 'Content-Type': 'application/json'}
 
 
 class AIBrain:
@@ -59,7 +61,7 @@ class AIBrain:
             return self._deterministic_fallback(symbol, data)
         try:
             data['symbol'] = symbol
-            resp = requests.post(f"{AI_API_URL}/analyze", json=data, timeout=AI_TIMEOUT)
+            resp = requests.post(f"{AI_API_URL}/analyze", json=data, headers=AI_HEADERS, timeout=AI_TIMEOUT)
             if resp.status_code == 200:
                 return resp.json()
         except Exception as e:
@@ -72,7 +74,7 @@ class AIBrain:
                     'bull_confidence': 50, 'bear_confidence': 50}
         try:
             data['symbol'] = symbol
-            resp = requests.post(f"{AI_API_URL}/debate", json=data, timeout=AI_TIMEOUT)
+            resp = requests.post(f"{AI_API_URL}/debate", json=data, headers=AI_HEADERS, timeout=AI_TIMEOUT)
             if resp.status_code == 200:
                 return resp.json()
         except:
@@ -87,7 +89,7 @@ class AIBrain:
         try:
             resp = requests.post(f"{AI_API_URL}/briefing", json={
                 'market': market_data, 'positions': positions, 'sentiment': sentiment
-            }, timeout=AI_TIMEOUT)
+            }, headers=AI_HEADERS, timeout=AI_TIMEOUT)
             if resp.status_code == 200:
                 return resp.json().get('briefing', '')
         except:
