@@ -1099,6 +1099,7 @@ async def full_scan_cmd(ctx):
 
 
 # ── AUTONOMOUS LOOP (runs inside Discord bot) ─────────
+import asyncio
 
 SCAN_CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', '1498363431013716079'))
 _prev_prices = {}
@@ -1296,62 +1297,79 @@ async def full_scan():
             pass
         regime = regime_det.detect(spy_change)
 
-        # ── TV INDICATORS (read from TradingView CDP) ──
+        # ── TV INDICATORS (read from TradingView CDP) — in thread ──
         tv_data = {}
-        for sym in held[:6]:
-            indicators = _get_tv_indicators(sym)
-            if indicators:
-                tv_data[sym] = indicators
+        def _read_tv(syms):
+            d = {}
+            for sym in syms:
+                ind = _get_tv_indicators(sym)
+                if ind:
+                    d[sym] = ind
+            return d
+        tv_data = await asyncio.to_thread(_read_tv, held[:6])
 
-        # ── SENTIMENT ──
+        # ── SENTIMENT — in thread ──
         sentiments = {}
-        try:
-            from sentiment_analyst import SentimentAnalyst
-            sa = SentimentAnalyst()
-            for sym in held[:8]:
-                try:
-                    sentiments[sym] = sa.analyze(sym)
-                except:
-                    pass
-        except:
-            pass
+        def _read_sentiment(syms):
+            r = {}
+            try:
+                from sentiment_analyst import SentimentAnalyst
+                sa = SentimentAnalyst()
+                for sym in syms:
+                    try: r[sym] = sa.analyze(sym)
+                    except: pass
+            except: pass
+            return r
+        sentiments = await asyncio.to_thread(_read_sentiment, held[:8])
 
         # ── OPEN ORDERS ──
         open_orders = gateway.get_open_orders()
 
-        # ── AI ANALYSIS (with TV data now!) ──
+        # ── AI ANALYSIS (with TV data now!) — run in thread to avoid blocking Discord ──
         ai_verdicts = {}
         if brain and brain.is_available:
+            import asyncio, functools
+            def _run_ai_batch(positions_data, sentiments_data, tv_data_local, regime_val):
+                results = {}
+                for sym, pdata in positions_data.items():
+                    try:
+                        sent = sentiments_data.get(sym)
+                        tv = tv_data_local.get(sym, {})
+                        data = {
+                            'price': pdata['price'], 'entry': pdata['entry'],
+                            'pnl': pdata['pnl'], 'qty': pdata['qty'],
+                            'regime': regime_val,
+                            'sentiment': sent.total_score if sent else 0,
+                            'rsi': tv.get('rsi', 50),
+                            'macd_hist': tv.get('macd_hist', 0),
+                            'vwap_above': tv.get('vwap_above', False),
+                            'volume_ratio': tv.get('volume_ratio', 1.0),
+                            'bb_position': tv.get('bb_position', 'mid'),
+                            'confluence': tv.get('confluence', 5),
+                            'ema_9': tv.get('ema_9', 0),
+                            'ema_21': tv.get('ema_21', 0),
+                            'yahoo_score': sent.yahoo_score if sent else 0,
+                            'analyst_score': sent.analyst_score if sent else 0,
+                            'reddit_score': sent.reddit_score if sent else 0,
+                            'trump_score': getattr(sent, 'trump_score', 0) if sent else 0,
+                            'sector': '?', 'earnings_days': 999, 'holding': True,
+                            'unrealized_pl': pdata['pnl'],
+                        }
+                        results[sym] = brain.analyze_stock(sym, data)
+                    except:
+                        pass
+                return results
+
+            pos_data = {}
             for sym in held[:6]:
-                try:
-                    pos = next((p for p in positions if p.symbol == sym), None)
-                    if not pos:
-                        continue
-                    sent = sentiments.get(sym)
-                    tv = tv_data.get(sym, {})
-                    data = {
-                        'price': pos.current_price, 'entry': pos.avg_entry,
-                        'pnl': pos.unrealized_pl, 'qty': pos.qty,
-                        'regime': regime.value,
-                        'sentiment': sent.total_score if sent else 0,
-                        'rsi': tv.get('rsi', 50),
-                        'macd_hist': tv.get('macd_hist', 0),
-                        'vwap_above': tv.get('vwap_above', False),
-                        'volume_ratio': tv.get('volume_ratio', 1.0),
-                        'bb_position': tv.get('bb_position', 'mid'),
-                        'confluence': tv.get('confluence', 5),
-                        'ema_9': tv.get('ema_9', 0),
-                        'ema_21': tv.get('ema_21', 0),
-                        'yahoo_score': sent.yahoo_score if sent else 0,
-                        'analyst_score': sent.analyst_score if sent else 0,
-                        'reddit_score': sent.reddit_score if sent else 0,
-                        'trump_score': getattr(sent, 'trump_score', 0) if sent else 0,
-                        'sector': '?', 'earnings_days': 999, 'holding': True,
-                        'unrealized_pl': pos.unrealized_pl,
-                    }
-                    ai_verdicts[sym] = brain.analyze_stock(sym, data)
-                except:
-                    pass
+                pos = next((p for p in positions if p.symbol == sym), None)
+                if pos:
+                    pos_data[sym] = {'price': pos.current_price, 'entry': pos.avg_entry,
+                                     'pnl': pos.unrealized_pl, 'qty': pos.qty}
+            if pos_data:
+                ai_verdicts = await asyncio.to_thread(
+                    _run_ai_batch, pos_data, sentiments, tv_data, regime.value
+                )
 
         # ── MARKET CONTEXT (pre/post market) ──
         market_status = "MARKET" if _is_market_hours() else ("EXTENDED" if _is_extended_hours() else "CLOSED")
