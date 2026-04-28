@@ -1262,13 +1262,15 @@ async def position_monitor():
 
 @tasks.loop(minutes=5)
 async def full_scan():
-    """Every 5 min: full Beast scan with TV indicators, sentiment, AI, movers."""
+    """Every 5 min: MANDATORY full scan — TV + ALL sentiment + confidence engine + AI.
+    NO EXCEPTIONS. Every source runs. Confidence is generated. AI analyzes AFTER data."""
     global _last_full_scan
     try:
         channel = bot.get_channel(SCAN_CHANNEL_ID)
         if not channel:
             return
 
+        import asyncio
         from datetime import datetime
         from zoneinfo import ZoneInfo
         now = datetime.now(ZoneInfo("America/New_York"))
@@ -1297,47 +1299,118 @@ async def full_scan():
             pass
         regime = regime_det.detect(spy_change)
 
-        # ── TV INDICATORS (read from TradingView CDP) — in thread ──
+        # ══════════════════════════════════════════════════
+        # MANDATORY PIPELINE — NO EXCEPTIONS
+        # Step 1: TV indicators (ALL strategies)
+        # Step 2: ALL sentiment (Yahoo + Reddit + Google News + Trump + Analyst)
+        # Step 3: Confidence Engine (11 strategies scored)
+        # Step 4: AI analysis (AFTER data, not before)
+        # ══════════════════════════════════════════════════
+
+        # ── STEP 1: TV INDICATORS (MANDATORY) ──
         tv_data = {}
-        def _read_tv(syms):
+        def _read_all_tv(syms):
             d = {}
             for sym in syms:
                 ind = _get_tv_indicators(sym)
                 if ind:
                     d[sym] = ind
+                    log.info(f"  TV {sym}: RSI={ind.get('rsi','?'):.0f} MACD={ind.get('macd_hist','?')} VWAP={'above' if ind.get('vwap_above') else 'BELOW'}")
             return d
-        tv_data = await asyncio.to_thread(_read_tv, held[:6])
+        tv_data = await asyncio.to_thread(_read_all_tv, held[:10])
+        log.info(f"  TV: read {len(tv_data)}/{len(held)} stocks")
 
-        # ── SENTIMENT — in thread ──
+        # ── STEP 2: ALL SENTIMENT (MANDATORY — 5 sources) ──
         sentiments = {}
-        def _read_sentiment(syms):
-            r = {}
+        trump_score = 0
+        trump_headlines = []
+        def _read_all_sentiment(syms):
+            from sentiment_analyst import SentimentAnalyst
+            sa = SentimentAnalyst()
+            results = {}
+            # Per-stock sentiment (Yahoo + Reddit + Analyst)
+            for sym in syms:
+                try:
+                    results[sym] = sa.analyze(sym)
+                except Exception as e:
+                    log.warning(f"  Sentiment {sym} failed: {e}")
+            # Trump/tariff/geopolitical (Google News RSS — NO API KEY)
             try:
-                from sentiment_analyst import SentimentAnalyst
-                sa = SentimentAnalyst()
-                for sym in syms:
-                    try: r[sym] = sa.analyze(sym)
-                    except: pass
-            except: pass
-            return r
-        sentiments = await asyncio.to_thread(_read_sentiment, held[:8])
+                t_score, t_headlines = sa.get_trump_sentiment()
+                results['_trump'] = {'score': t_score, 'headlines': t_headlines}
+            except Exception as e:
+                log.warning(f"  Trump sentiment failed: {e}")
+            # Market-wide sentiment
+            try:
+                results['_market'] = sa.analyze_market()
+            except:
+                pass
+            return results
+        sent_raw = await asyncio.to_thread(_read_all_sentiment, held[:10])
+        # Extract trump data
+        trump_info = sent_raw.pop('_trump', {})
+        trump_score = trump_info.get('score', 0)
+        trump_headlines = trump_info.get('headlines', [])
+        market_sent = sent_raw.pop('_market', None)
+        sentiments = sent_raw
+        log.info(f"  Sentiment: {len(sentiments)} stocks | Trump: {trump_score:+d} | Headlines: {len(trump_headlines)}")
+
+        # ── STEP 3: CONFIDENCE ENGINE (11 strategies, MANDATORY) ──
+        confidence_results = {}
+        def _run_confidence(syms, tv_d, sent_d, reg):
+            from engine.confidence_engine import ConfidenceEngine
+            from models import TechnicalSignals
+            ce = ConfidenceEngine()
+            results = {}
+            for sym in syms:
+                tv = tv_d.get(sym, {})
+                sent = sent_d.get(sym)
+                pos = next((p for p in positions if p.symbol == sym), None)
+                price = pos.current_price if pos else 0
+                # Build TechnicalSignals from TV data
+                tech = TechnicalSignals(
+                    rsi=tv.get('rsi', 50),
+                    macd_histogram=tv.get('macd_hist', 0),
+                    above_vwap=tv.get('vwap_above', False),
+                    volume_ratio=tv.get('volume_ratio', 1.0),
+                    above_upper_bb=tv.get('bb_position') == 'upper',
+                    below_lower_bb=tv.get('bb_position') == 'lower',
+                    ema_9=tv.get('ema_9', 0),
+                    ema_21=tv.get('ema_21', 0),
+                    confluence_score=tv.get('confluence', 5),
+                )
+                if not sent:
+                    from models import SentimentScore as SS
+                    sent = SS(symbol=sym)
+                try:
+                    cr = ce.score(sym, tech, sent, reg, current_price=price)
+                    results[sym] = cr
+                except Exception as e:
+                    log.warning(f"  Confidence {sym}: {e}")
+            return results
+        confidence_results = await asyncio.to_thread(_run_confidence, held[:10], tv_data, sentiments, regime)
+        log.info(f"  Confidence: {len(confidence_results)} scored")
 
         # ── OPEN ORDERS ──
-        open_orders = gateway.get_open_orders()
+        open_orders = await asyncio.to_thread(gateway.get_open_orders)
 
-        # ── AI ANALYSIS (with TV data now!) — run in thread to avoid blocking Discord ──
+        # ── STEP 4: AI ANALYSIS (AFTER all data collected) ──
         ai_verdicts = {}
         if brain and brain.is_available:
-            import asyncio, functools
-            def _run_ai_batch(positions_data, sentiments_data, tv_data_local, regime_val):
+            def _run_ai_final(pos_list, sent_d, tv_d, conf_d, regime_val, t_score):
                 results = {}
-                for sym, pdata in positions_data.items():
+                for pos in pos_list:
                     try:
-                        sent = sentiments_data.get(sym)
-                        tv = tv_data_local.get(sym, {})
+                        sym = pos.symbol
+                        sent = sent_d.get(sym)
+                        tv = tv_d.get(sym, {})
+                        cr = conf_d.get(sym)
+                        conf_pct = int(cr.overall_confidence * 100) if cr else 50
+                        best_strat = cr.best_strategy.value if cr and cr.best_strategy else 'none'
+                        signal = cr.signal.value if cr else 'no_trade'
                         data = {
-                            'price': pdata['price'], 'entry': pdata['entry'],
-                            'pnl': pdata['pnl'], 'qty': pdata['qty'],
+                            'price': pos.current_price, 'entry': pos.avg_entry,
+                            'pnl': pos.unrealized_pl, 'qty': pos.qty,
                             'regime': regime_val,
                             'sentiment': sent.total_score if sent else 0,
                             'rsi': tv.get('rsi', 50),
@@ -1351,79 +1424,208 @@ async def full_scan():
                             'yahoo_score': sent.yahoo_score if sent else 0,
                             'analyst_score': sent.analyst_score if sent else 0,
                             'reddit_score': sent.reddit_score if sent else 0,
-                            'trump_score': getattr(sent, 'trump_score', 0) if sent else 0,
+                            'trump_score': t_score,
+                            'confidence_engine': conf_pct,
+                            'best_strategy': best_strat,
+                            'signal': signal,
                             'sector': '?', 'earnings_days': 999, 'holding': True,
-                            'unrealized_pl': pdata['pnl'],
+                            'unrealized_pl': pos.unrealized_pl,
                         }
                         results[sym] = brain.analyze_stock(sym, data)
                     except:
                         pass
                 return results
+            ai_verdicts = await asyncio.to_thread(
+                _run_ai_final, positions[:8], sentiments, tv_data,
+                confidence_results, regime.value, trump_score
+            )
+        log.info(f"  AI: {len(ai_verdicts)} analyzed")
 
-            pos_data = {}
-            for sym in held[:6]:
-                pos = next((p for p in positions if p.symbol == sym), None)
-                if pos:
-                    pos_data[sym] = {'price': pos.current_price, 'entry': pos.avg_entry,
-                                     'pnl': pos.unrealized_pl, 'qty': pos.qty}
-            if pos_data:
-                ai_verdicts = await asyncio.to_thread(
-                    _run_ai_batch, pos_data, sentiments, tv_data, regime.value
-                )
-
-        # ── MARKET CONTEXT (pre/post market) ──
+        # ── MARKET CONTEXT ──
         market_status = "MARKET" if _is_market_hours() else ("EXTENDED" if _is_extended_hours() else "CLOSED")
 
-        # ── BUILD REPORT ──
-        embed = discord.Embed(
-            title=f"🦍 BEAST SCAN — {now.strftime('%I:%M %p ET')} [{market_status}]",
-            color=0x00ff00 if total_pl >= 0 else 0xff0000
-        )
-        embed.add_field(name="💰 Portfolio", value=f"Equity: ${equity:,.0f}\nP&L: ${total_pl:+.2f}\nRegime: {regime.value}\nSPY: {spy_change:+.2%}", inline=True)
-        embed.add_field(name="📋 Status", value=f"{len(open_orders)} orders\n{len(positions)} positions\nTV: {len(tv_data)}/{len(held)} read", inline=True)
+        # ══════════════════════════════════════════════════
+        # BUILD RICH DISCORD REPORT (Multiple Embeds)
+        # Elaborative, detailed, explains WHY for each stock
+        # ══════════════════════════════════════════════════
 
-        # Action table with TV data
-        action_lines = []
+        # ── EMBED 1: Portfolio Overview ──
+        embed1 = discord.Embed(
+            title=f"🦍 BEAST SCAN — {now.strftime('%I:%M %p ET')} [{market_status}]",
+            description=(
+                f"```\n"
+                f"{'═' * 45}\n"
+                f"  Portfolio: ${equity:,.0f}  │  Day P&L: ${total_pl:+.2f}\n"
+                f"  Regime:    {regime.value.upper():10s}  │  SPY:     {spy_change:+.2%}\n"
+                f"  Positions: {len(positions):3d}          │  Orders:  {len(open_orders)}\n"
+                f"  Trump:     {trump_score:+d}            │  Market:  {market_status}\n"
+                f"{'═' * 45}\n"
+                f"  Pipeline: TV:{len(tv_data)} Sent:{len(sentiments)} Conf:{len(confidence_results)} AI:{len(ai_verdicts)}\n"
+                f"```"
+            ),
+            color=0x00ff00 if total_pl >= 0 else 0xff4444
+        )
+        await channel.send(embed=embed1)
+
+        # ── EMBED 2: Position Table (detailed) ──
+        table_header = f"```\n{'STOCK':6s} {'PRICE':>8s} {'P&L':>9s} {'%':>6s} │ {'RSI':>4s} {'VWAP':>5s} {'SENT':>5s} {'CONF':>5s} │ {'VERDICT':10s}\n{'─'*70}\n"
+        table_rows = []
         for p in sorted(positions, key=lambda x: x.unrealized_pl, reverse=True):
             pct = _pct(p)
-            ai_v = ai_verdicts.get(p.symbol, {})
-            ai_act = ai_v.get('action', '-')
             tv = tv_data.get(p.symbol, {})
-            rsi_str = f"RSI:{tv['rsi']:.0f}" if 'rsi' in tv else ""
+            rsi = f"{tv['rsi']:.0f}" if 'rsi' in tv else " — "
+            vwap = " ↑ " if tv.get('vwap_above') else " ↓ " if tv else " — "
             sent = sentiments.get(p.symbol)
-            sent_s = sent.total_score if sent else '-'
-            if pct >= 5: action = "RUNNER🏃"
-            elif pct >= 2: action = "SCALP🎯"
-            elif pct >= 0: action = "HOLD✅"
-            elif pct > -5: action = "HOLD🔒"
-            else: action = "DEEP RED⚠️"
-            icon = "🟢" if pct >= 0 else "🔴"
-            action_lines.append(f"{icon} **{p.symbol}** {pct:+.1f}% ${p.unrealized_pl:+.0f} {rsi_str} S:{sent_s} AI:{ai_act} → {action}")
+            sent_v = f"{sent.total_score:+d}" if sent else " — "
+            cr = confidence_results.get(p.symbol)
+            conf_v = f"{cr.overall_confidence:.0%}" if cr else " — "
+            ai_v = ai_verdicts.get(p.symbol, {})
+            verdict = ai_v.get('action', 'HOLD')
 
-        embed.add_field(name="📊 Positions", value="\n".join(action_lines[:12]) or "None", inline=False)
+            if pct >= 5: verdict_icon = "★ RUNNER"
+            elif pct >= 2: verdict_icon = "✦ SCALP"
+            elif verdict == 'SELL': verdict_icon = "✗ SELL"
+            elif verdict == 'BUY': verdict_icon = "✦ ADD"
+            elif pct >= 0: verdict_icon = "✓ HOLD"
+            elif pct > -5: verdict_icon = "⊘ HOLD"
+            else: verdict_icon = "⚠ DEEP RED"
 
-        # Sentiment highlights
-        sent_highlights = []
-        for sym, s in sentiments.items():
-            if s.total_score >= 5:
-                sent_highlights.append(f"🟢 {sym}: bullish ({s.total_score:+d})")
-            elif s.total_score <= -3:
-                sent_highlights.append(f"🔴 {sym}: bearish ({s.total_score:+d})")
-        if sent_highlights:
-            embed.add_field(name="📰 Sentiment", value="\n".join(sent_highlights[:5]), inline=False)
+            table_rows.append(
+                f"{p.symbol:6s} ${p.current_price:7.2f} ${p.unrealized_pl:+8.2f} {pct:+5.1f}% │ {rsi:>4s} {vwap:>5s} {sent_v:>5s} {conf_v:>5s} │ {verdict_icon:10s}"
+            )
 
-        # AI summary
-        if ai_verdicts:
-            ai_lines = []
-            for sym, v in ai_verdicts.items():
-                act = v.get('action', '?')
-                conf = v.get('confidence', 0)
-                reason = v.get('reasoning', '')[:60]
-                ai_lines.append(f"{'🟢' if act=='BUY' else '🔴' if act=='SELL' else '🟡'} {sym}: {act} ({conf}%) {reason}")
-            embed.add_field(name="🧠 AI Verdicts", value="\n".join(ai_lines[:6]), inline=False)
+        table_str = table_header + "\n".join(table_rows) + "\n```"
+        embed2 = discord.Embed(title="📊 Position Dashboard", description=table_str, color=0x2b2d31)
+        await channel.send(embed=embed2)
 
-        embed.set_footer(text=f"Beast V3 | Scan #{_cycle_count} | TV:{len(tv_data)} AI:{'✅' if brain and brain.is_available else '❌'}")
-        await channel.send(embed=embed)
+        # ── EMBED 3: Per-Stock Deep Analysis (WHY buy/sell/hold) ──
+        embed3 = discord.Embed(title="🔍 Stock-by-Stock Analysis", color=0x5865f2)
+        for p in sorted(positions, key=lambda x: abs(x.unrealized_pl), reverse=True)[:8]:
+            pct = _pct(p)
+            tv = tv_data.get(p.symbol, {})
+            sent = sentiments.get(p.symbol)
+            cr = confidence_results.get(p.symbol)
+            ai_v = ai_verdicts.get(p.symbol, {})
+
+            # Build WHY explanation
+            reasons = []
+            # Technical reasons
+            if 'rsi' in tv:
+                if tv['rsi'] > 70: reasons.append(f"⚠️ RSI {tv['rsi']:.0f} — overbought, pullback risk")
+                elif tv['rsi'] < 30: reasons.append(f"📉 RSI {tv['rsi']:.0f} — oversold, bounce candidate")
+                else: reasons.append(f"RSI {tv['rsi']:.0f} — neutral zone")
+            if tv.get('vwap_above'): reasons.append("✅ Above VWAP — institutional buying")
+            elif tv: reasons.append("⚠️ Below VWAP — institutional selling")
+            if tv.get('bb_position') == 'lower': reasons.append("📉 At lower Bollinger Band — mean reversion setup")
+            elif tv.get('bb_position') == 'upper': reasons.append("📈 At upper Bollinger Band — momentum strong")
+            if tv.get('confluence', 0) >= 7: reasons.append(f"🔥 Confluence {tv['confluence']}/10 — multiple signals align")
+
+            # Sentiment reasons
+            if sent:
+                if sent.yahoo_score >= 3: reasons.append(f"📰 Yahoo: bullish headlines ({sent.yahoo_score:+d})")
+                elif sent.yahoo_score <= -2: reasons.append(f"📰 Yahoo: bearish news ({sent.yahoo_score:+d})")
+                if sent.reddit_score >= 2: reasons.append(f"🐒 Reddit: WSB is bullish ({sent.reddit_score:+d})")
+                elif sent.reddit_score <= -2: reasons.append(f"🐒 Reddit: bears in control ({sent.reddit_score:+d})")
+                if sent.analyst_score >= 2: reasons.append(f"🏦 Analysts: upgrades/strong buy ({sent.analyst_score:+d})")
+                elif sent.analyst_score <= -2: reasons.append(f"🏦 Analysts: downgrades ({sent.analyst_score:+d})")
+
+            # Trump/geopolitical (for energy/defense)
+            if trump_score <= -3 and p.symbol in ['OXY', 'DVN', 'XOM', 'LMT']:
+                reasons.append(f"🏛️ Geopolitical risk: Trump score {trump_score:+d}")
+            elif trump_score >= 3 and p.symbol in ['OXY', 'DVN', 'XOM', 'LMT']:
+                reasons.append(f"🏛️ Oil tailwind: Trump score {trump_score:+d}")
+
+            # Confidence engine
+            if cr:
+                reasons.append(f"🎯 Confidence: {cr.overall_confidence:.0%} — best strategy: {cr.best_strategy.value if cr.best_strategy else 'none'}")
+
+            # P&L context
+            if pct >= 5: reasons.append(f"🏃 RUNNER +{pct:.1f}% — take partial profits, trail stop the rest")
+            elif pct >= 2: reasons.append(f"🎯 SCALP target +{pct:.1f}% — sell half, let runner ride")
+            elif pct > 0: reasons.append(f"✅ Green +{pct:.1f}% — hold, approaching scalp target")
+            elif pct > -3: reasons.append(f"🔒 Slight red {pct:.1f}% — HOLD per Iron Law 1 (never sell at loss)")
+            else: reasons.append(f"⚠️ Deep red {pct:.1f}% — HOLD (Iron Law 1), wait for recovery")
+
+            # AI reasoning
+            ai_reason = ai_v.get('reasoning', '')
+            if ai_reason:
+                reasons.append(f"🧠 AI: {ai_reason[:100]}")
+
+            # Determine icon
+            if pct >= 2: title_icon = "🟢"
+            elif pct >= 0: title_icon = "🟡"
+            else: title_icon = "🔴"
+
+            action = ai_v.get('action', 'HOLD')
+            ai_conf = ai_v.get('confidence', 0)
+
+            embed3.add_field(
+                name=f"{title_icon} {p.symbol} — {action} ({ai_conf}%) | P&L: ${p.unrealized_pl:+.2f} ({pct:+.1f}%)",
+                value="\n".join(reasons[:5]) or "No data available",
+                inline=False
+            )
+
+        await channel.send(embed=embed3)
+
+        # ── EMBED 4: Sentiment & Geopolitical ──
+        embed4 = discord.Embed(title="📰 Sentiment & Geopolitical Intel", color=0xf0b232)
+
+        # Trump/Geopolitical
+        if trump_headlines:
+            trump_text = f"**Score: {trump_score:+d}** {'🟢 Bullish' if trump_score > 0 else '🔴 Bearish' if trump_score < 0 else '⚪ Neutral'}\n"
+            for h in trump_headlines[:4]:
+                trump_text += f"• {h[:80]}\n"
+            embed4.add_field(name="🏛️ Trump / Tariffs / Geopolitics", value=trump_text, inline=False)
+
+        # Per-stock sentiment table
+        sent_table = "```\n"
+        sent_table += f"{'STOCK':6s} {'YAHOO':>6s} {'REDDIT':>7s} {'ANALYST':>8s} {'TOTAL':>6s} │ {'VERDICT':8s}\n"
+        sent_table += f"{'─'*50}\n"
+        for sym in held[:10]:
+            s = sentiments.get(sym)
+            if s:
+                verdict = "BULLISH" if s.total_score >= 3 else ("BEARISH" if s.total_score <= -3 else "NEUTRAL")
+                sent_table += f"{sym:6s} {s.yahoo_score:>+6d} {s.reddit_score:>+7d} {s.analyst_score:>+8d} {s.total_score:>+6d} │ {verdict:8s}\n"
+        sent_table += "```"
+        embed4.add_field(name="📊 Sentiment Breakdown (5 Sources)", value=sent_table, inline=False)
+
+        await channel.send(embed=embed4)
+
+        # ── EMBED 5: Buy Signals & Opportunities ──
+        buy_signals = []
+        for sym, cr in confidence_results.items():
+            if cr.overall_confidence >= 0.60:
+                is_new = sym not in {p.symbol for p in positions}
+                strat = cr.best_strategy.value if cr.best_strategy else '?'
+                tag = "NEW BUY" if is_new else "ADD MORE"
+                buy_signals.append((sym, cr.overall_confidence, strat, cr.signal.value, tag))
+
+        if buy_signals or ai_verdicts:
+            embed5 = discord.Embed(title="🔥 Opportunities & Signals", color=0x57f287)
+
+            if buy_signals:
+                buy_text = ""
+                for sym, conf, strat, sig, tag in sorted(buy_signals, key=lambda x: -x[1])[:6]:
+                    buy_text += f"🎯 **{sym}** — {conf:.0%} confidence [{strat}] → {tag}\n"
+                embed5.add_field(name="📈 Confidence Engine Signals (≥60%)", value=buy_text, inline=False)
+
+            # AI buy recommendations
+            ai_buys = [(sym, v) for sym, v in ai_verdicts.items() if v.get('action') == 'BUY' and v.get('confidence', 0) >= 60]
+            if ai_buys:
+                ai_buy_text = ""
+                for sym, v in sorted(ai_buys, key=lambda x: -x[1].get('confidence', 0)):
+                    ai_buy_text += f"🧠 **{sym}** — BUY ({v['confidence']}%) {v.get('reasoning', '')[:70]}\n"
+                embed5.add_field(name="🧠 AI Buy Recommendations", value=ai_buy_text, inline=False)
+
+            # AI sell recommendations
+            ai_sells = [(sym, v) for sym, v in ai_verdicts.items() if v.get('action') == 'SELL']
+            if ai_sells:
+                ai_sell_text = ""
+                for sym, v in ai_sells:
+                    ai_sell_text += f"🔴 **{sym}** — SELL ({v.get('confidence', 0)}%) {v.get('reasoning', '')[:70]}\n"
+                embed5.add_field(name="⚠️ AI Sell Recommendations", value=ai_sell_text, inline=False)
+
+            await channel.send(embed=embed5)
 
         _last_full_scan = time.time()
         log.info(f"Full scan sent at {now.strftime('%H:%M')} [TV:{len(tv_data)} AI:{len(ai_verdicts)}]")
