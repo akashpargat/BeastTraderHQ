@@ -1464,12 +1464,11 @@ async def full_scan():
                 price = pos.current_price if pos else 0
                 # Build TechnicalSignals from TV data
                 tech = TechnicalSignals(
+                    symbol=sym,
                     rsi=tv.get('rsi', 50),
                     macd_histogram=tv.get('macd_hist', 0),
-                    above_vwap=tv.get('vwap_above', False),
+                    price_vs_vwap=1.0 if tv.get('vwap_above') else -1.0,
                     volume_ratio=tv.get('volume_ratio', 1.0),
-                    above_upper_bb=tv.get('bb_position') == 'upper',
-                    below_lower_bb=tv.get('bb_position') == 'lower',
                     ema_9=tv.get('ema_9', 0),
                     ema_21=tv.get('ema_21', 0),
                     confluence_score=tv.get('confluence', 5),
