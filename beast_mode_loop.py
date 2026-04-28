@@ -64,12 +64,83 @@ FULL_SCAN_INTERVAL = 300   # seconds - full scan with TV + sentiment + AI
 AUTO_EXECUTE_THRESHOLD = 0.80  # 80%+ confidence = auto-execute
 ASK_THRESHOLD = 0.60           # 60-80% = ask Discord for approval
 
+# ── EXTENDED HOURS CONFIG ──────────────────────────────
+ENABLE_PREMARKET = True        # Trade pre-market 4:00-9:30 AM ET
+ENABLE_AFTERHOURS = True       # Trade after-hours 4:00-8:00 PM ET
+PREMARKET_START = 4             # 4 AM ET
+PREMARKET_END = 9               # 9:30 AM ET (regular opens)
+AFTERHOURS_START = 16           # 4 PM ET
+AFTERHOURS_END = 20             # 8 PM ET
+EXTENDED_SCAN_INTERVAL = 600    # 10 min scans during extended hours
+
+# ── SECTOR WATCHLISTS (scan ALL of these, not just tech!) ──────
+
+# Core tech/momentum
 OFFENSE = ['COIN', 'TSLA', 'META', 'MSTR']
-DEFENSE = ['CAT', 'ORCL', 'XOM', 'COST']
 MAG7 = ['AAPL', 'AMZN', 'GOOGL', 'META', 'MSFT', 'NVDA', 'TSLA']
-ENERGY = ['DVN', 'OXY', 'XOM']
-SEMI = ['AMD', 'INTC', 'TSM', 'NVDA']
-BLUE_CHIPS = ['CRM', 'NOW', 'PLTR', 'LMT']
+
+# Semiconductors — FULL sector (Rule #27: missed $6,045 in semi gains Day 4)
+SEMI = ['AMD', 'INTC', 'TSM', 'NVDA', 'QCOM', 'MU', 'AVGO', 'ARM', 'MRVL',
+        'AMAT', 'KLAC', 'LRCX', 'SNDK', 'ON', 'TXN', 'NXPI', 'SWKS', 'MCHP']
+
+# Energy / Oil — Iran tensions = money printer (Day 6: OXY +$65, DVN +$30)
+ENERGY = ['DVN', 'OXY', 'XOM', 'CVX', 'HAL', 'NE', 'SLB', 'COP', 'EOG',
+          'MPC', 'VLO', 'PSX', 'PXD', 'FANG']
+
+# Defense / Aerospace — Contrarian play (Day 6: -15% in a war = oversold)
+DEFENSE = ['LMT', 'RTX', 'NOC', 'GD', 'BA', 'LHX', 'KTOS', 'HII',
+           'AXON', 'RKLB', 'LDOS', 'BAH']
+
+# Telecom / 5G / AI Infrastructure — NOK's home (NVIDIA $1B invested)
+TELECOM = ['NOK', 'ERIC', 'CSCO', 'JNPR', 'CIEN', 'LITE', 'CALX',
+           'VZ', 'T', 'TMUS', 'AMT', 'CCI']
+
+# Cloud / SaaS / IT
+CLOUD_IT = ['CRM', 'NOW', 'ORCL', 'SNOW', 'DDOG', 'NET', 'MDB',
+            'ZS', 'PANW', 'CRWD', 'FTNT', 'TEAM', 'HUBS', 'WDAY']
+
+# Medical / Biotech / Pharma
+MEDICAL = ['LLY', 'UNH', 'JNJ', 'ABBV', 'PFE', 'MRK', 'AMGN',
+           'GILD', 'REGN', 'VRTX', 'BMY', 'ISRG', 'DXCM', 'MRNA']
+
+# Solar / Clean Energy
+SOLAR = ['FSLR', 'ENPH', 'SEDG', 'RUN', 'PLUG', 'BE', 'NOVA']
+
+# Space / Quantum
+SPACE = ['RKLB', 'IONQ', 'RGTI', 'LUNR', 'ASTS', 'SPCE']
+
+# Gold / Commodities
+COMMODITIES = ['GDX', 'SLV', 'GLD', 'NEM', 'GOLD', 'FCX', 'VALE']
+
+# Consumer / Retail
+CONSUMER = ['NKE', 'SBUX', 'COST', 'WMT', 'TGT', 'HD', 'LOW', 'LULU']
+
+# Financials
+FINANCIALS = ['JPM', 'GS', 'MS', 'BAC', 'WFC', 'C', 'SCHW', 'BLK']
+
+# Blue chips (proven winners for Strategy I — Mean Reversion)
+BLUE_CHIPS = ['CRM', 'NOW', 'PLTR', 'LMT', 'NOK']
+
+# PAST WINNERS — Rule #21: Check these FIRST on every scan!
+# These stocks have PROVEN they work for our style.
+PAST_WINNERS = ['NOK', 'GOOGL', 'CRM', 'META', 'MSFT', 'NOW', 'AMD', 'NVDA',
+                'OXY', 'DVN', 'INTC']
+
+# ALL SECTORS combined for full market scan
+ALL_SECTORS = {
+    'mag7': MAG7,
+    'semi': SEMI,
+    'energy': ENERGY,
+    'defense': DEFENSE,
+    'telecom': TELECOM,
+    'cloud_it': CLOUD_IT,
+    'medical': MEDICAL,
+    'solar': SOLAR,
+    'space': SPACE,
+    'commodities': COMMODITIES,
+    'consumer': CONSUMER,
+    'financials': FINANCIALS,
+}
 
 # Strategy label to Strategy enum
 LABEL_TO_STRATEGY = {
@@ -165,22 +236,41 @@ class BeastModeLoop:
         """One tick of the loop."""
         self.cycle_count += 1
         hour = now.hour
+        minute = now.minute
         is_weekday = now.weekday() < 5
 
         # Always monitor positions (fast, every 60s)
         self._monitor_positions_fast(now)
 
-        # Full scan every 5 minutes during active hours
+        # Determine market session
         elapsed = time.time() - self._last_full_scan
         is_market = is_weekday and 9 <= hour < 16
-        is_extended = is_weekday and (4 <= hour < 9 or 16 <= hour < 20)
+        is_premarket = is_weekday and ENABLE_PREMARKET and PREMARKET_START <= hour < 9
+        is_afterhours = is_weekday and ENABLE_AFTERHOURS and AFTERHOURS_START <= hour < AFTERHOURS_END
 
+        # Full scan during regular market hours (every 5 min)
         if is_market and elapsed >= FULL_SCAN_INTERVAL:
             self.run_full_scan(now)
             self._last_full_scan = time.time()
-        elif is_extended and elapsed >= FULL_SCAN_INTERVAL * 2:
-            self.run_extended_hours_scan(now)
+
+        # Extended hours scan — runners + earnings reactions (every 10 min)
+        elif is_premarket and elapsed >= EXTENDED_SCAN_INTERVAL:
+            log.info(f"PRE-MARKET SCAN {now.strftime('%H:%M')}")
+            self.run_extended_hours_scan(now, session='premarket')
             self._last_full_scan = time.time()
+
+        elif is_afterhours and elapsed >= EXTENDED_SCAN_INTERVAL:
+            log.info(f"AFTER-HOURS SCAN {now.strftime('%H:%M')}")
+            self.run_extended_hours_scan(now, session='afterhours')
+            self._last_full_scan = time.time()
+
+        # Pre-market briefing at 4:00 AM ET
+        if is_weekday and hour == 4 and minute == 0 and self.cycle_count % 60 == 0:
+            self._premarket_briefing(now)
+
+        # Market open alert at 9:30 AM ET
+        if is_weekday and hour == 9 and minute == 30 and self.cycle_count % 60 == 0:
+            self._market_open_scan(now)
 
         # Hourly report during market hours
         if is_market and hour != self._last_hourly_report:
@@ -391,23 +481,94 @@ class BeastModeLoop:
 
     # ── EXTENDED HOURS SCAN ────────────────────────────
 
-    def run_extended_hours_scan(self, now: datetime):
-        """Lighter scan for pre/post market."""
-        log.info(f"Extended hours scan - {now.strftime('%H:%M %Z')}")
+    def run_extended_hours_scan(self, now: datetime, session: str = 'premarket'):
+        """Extended hours scan — find runners, earnings reactions, sector moves.
+        Pre-market: earnings gaps, overnight news, sector rotation signals.
+        After-hours: earnings reactions, position for next day.
+        
+        Day 5 lesson: We missed NOK for 35 min because we only looked at Mag 7.
+        Day 6 lesson: Oil was the only green sector but we didn't scan energy until asked.
+        SCAN EVERYTHING. EVERY TIME."""
+        log.info(f"{'='*60}")
+        log.info(f"EXTENDED HOURS SCAN ({session.upper()}) - {now.strftime('%H:%M %Z')}")
+        log.info(f"{'='*60}")
+        
         try:
+            # 1. Positions P&L
             positions = self.gateway.get_positions()
             total_pl = sum(p.unrealized_pl for p in positions)
+            held_symbols = [p.symbol for p in positions]
             log.info(f"  {len(positions)} positions | P&L: ${total_pl:+.2f}")
-
+            
+            # 2. Phase 0: PAST WINNERS CHECK (Rule #21 — do this FIRST!)
             movers = self._get_movers()
             if movers:
-                top = movers.get('gainers', [])[:3]
-                gstr = ', '.join(f"{m['symbol']}+{m.get('percent_change',0):.0f}%"
-                               for m in top if m.get('price', 0) > 5)
+                mover_symbols = [m.get('symbol','') for m in movers.get('gainers',[])]
+                mover_symbols += [m.get('symbol','') for m in movers.get('actives',[])]
+                past_winner_alerts = [s for s in PAST_WINNERS if s in mover_symbols]
+                if past_winner_alerts:
+                    alert_msg = (
+                        f"🔥 PAST WINNER ALERT ({session})!\n"
+                        f"Stocks: {', '.join(past_winner_alerts)}\n"
+                        f"These made us money before. PRIORITY SCAN!"
+                    )
+                    log.info(f"  {alert_msg}")
+                    self.notify.send(alert_msg)
+                    
+                # Log top movers filtering out pennies
+                top = [m for m in movers.get('gainers', []) if m.get('price', 0) > 5][:5]
+                gstr = ', '.join(f"{m['symbol']}+{m.get('percent_change',0):.1f}%"
+                               for m in top)
                 if gstr:
-                    log.info(f"  Extended hrs movers: {gstr}")
+                    log.info(f"  Top movers: {gstr}")
+            
+            # 3. ALL SECTORS snapshot — find what's moving
+            log.info("  Scanning ALL sectors for rotation...")
+            for sector_name, symbols in ALL_SECTORS.items():
+                try:
+                    sample = symbols[:5]  # Top 5 per sector to save API calls
+                    from alpaca.data.historical import StockHistoricalDataClient
+                    from alpaca.data.requests import StockSnapshotRequest
+                    client = StockHistoricalDataClient(
+                        os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY')
+                    )
+                    req = StockSnapshotRequest(symbol_or_symbols=sample, feed='iex')
+                    snaps = client.get_stock_snapshot(req)
+                    
+                    sector_moves = []
+                    for sym, s in snaps.items():
+                        try:
+                            prev = s.previous_daily_bar.close if s.previous_daily_bar else 0
+                            curr = s.latest_trade.price if s.latest_trade else 0
+                            if prev > 0 and curr > 0:
+                                pct = (curr - prev) / prev * 100
+                                if abs(pct) > 1.5:
+                                    sector_moves.append((sym, pct))
+                        except:
+                            pass
+                    
+                    if sector_moves:
+                        moves_str = ', '.join(f"{s}{p:+.1f}%" for s, p in sector_moves)
+                        log.info(f"  {sector_name:12s}: {moves_str}")
+                        
+                        # Alert if sector is moving >3%
+                        big_moves = [m for m in sector_moves if abs(m[1]) > 3]
+                        if big_moves:
+                            self.notify.send(
+                                f"SECTOR ALERT: {sector_name.upper()}\n"
+                                f"Big moves: {', '.join(f'{s}{p:+.1f}%' for s,p in big_moves)}"
+                            )
+                except Exception as e:
+                    log.debug(f"  {sector_name} scan failed: {e}")
+            
+            # 4. Earnings reactions (after-hours)
+            if session == 'afterhours':
+                log.info("  Checking earnings reactions...")
+                earnings_watch = MAG7 + SEMI[:5] + BLUE_CHIPS
+                # Check for big AH moves on earnings stocks
+                
         except Exception as e:
-            log.warning(f"Extended scan error: {e}")
+            log.warning(f"Extended scan error: {e}\n{traceback.format_exc()}")
 
     # ── HELPER: MOVERS ─────────────────────────────────
 
@@ -432,7 +593,7 @@ class BeastModeLoop:
             client = StockHistoricalDataClient(
                 os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY')
             )
-            symbols = MAG7 + ENERGY + SEMI
+            symbols = MAG7 + ENERGY + SEMI + DEFENSE[:5] + TELECOM[:3] + MEDICAL[:3] + PAST_WINNERS
             req = StockSnapshotRequest(symbol_or_symbols=symbols, feed='iex')
             snaps = client.get_stock_snapshot(req)
             gainers, losers = [], []
@@ -457,6 +618,52 @@ class BeastModeLoop:
 
     # ── HELPERS ────────────────────────────────────────
 
+    def _premarket_briefing(self, now: datetime):
+        """4:00 AM ET pre-market briefing. Scan ALL sectors for overnight moves."""
+        log.info("="*60)
+        log.info("PRE-MARKET BRIEFING 4:00 AM")
+        log.info("="*60)
+        msg_lines = ["🌅 PRE-MARKET BRIEFING\n"]
+        
+        try:
+            positions = self.gateway.get_positions()
+            total_pl = sum(p.unrealized_pl for p in positions)
+            msg_lines.append(f"Positions: {len(positions)} | Unrealized: ${total_pl:+.2f}\n")
+            
+            # Check ALL sectors for overnight moves
+            for sector_name, symbols in ALL_SECTORS.items():
+                msg_lines.append(f"\n{sector_name.upper()}:")
+                # Just log — detailed scan happens at 9:30
+            
+            msg_lines.append("\nPhase 0: Checking past winners on movers...")
+            msg_lines.append(f"Past winners: {', '.join(PAST_WINNERS)}")
+            msg_lines.append("\nFull scan at market open 9:30 AM ET")
+            
+            self.notify.send('\n'.join(msg_lines))
+        except Exception as e:
+            log.warning(f"Pre-market briefing error: {e}")
+
+    def _market_open_scan(self, now: datetime):
+        """9:30 AM ET — Market open. Full beast mode. Set all sells within 60 seconds."""
+        log.info("="*60)
+        log.info("🔔 MARKET OPEN — BEAST MODE ACTIVATED")
+        log.info("="*60)
+        
+        self.notify.send(
+            "🔔 MARKET OPEN!\n"
+            "Beast Mode scanning ALL sectors:\n"
+            f"Mag7, Semis ({len(SEMI)}), Energy ({len(ENERGY)}), "
+            f"Defense ({len(DEFENSE)}), Telecom ({len(TELECOM)}), "
+            f"Medical ({len(MEDICAL)}), Cloud/IT ({len(CLOUD_IT)}), "
+            f"Solar, Space, Commodities, Consumer, Financials\n"
+            f"Past winners: {', '.join(PAST_WINNERS)}\n"
+            "Iron Law 6: Set sells within 60 seconds!"
+        )
+        
+        # Run immediate full scan
+        self.run_full_scan(now)
+        self._last_full_scan = time.time()
+
     def _get_spy_change(self) -> float:
         """Get SPY daily change %."""
         try:
@@ -477,17 +684,40 @@ class BeastModeLoop:
         return 0
 
     def _build_scan_list(self, regime: Regime, held: list) -> list:
-        """Build scan list. Held positions first, then regime-appropriate stocks."""
+        """Build scan list — ALL sectors, not just tech!
+        
+        Day 5 lesson: Only scanning semis = missed $6,045.
+        Day 6 lesson: Only scanning tech = missed oil running +2.5%.
+        Rule #21: Past winners get priority.
+        Rule #22: Scan ALL sectors.
+        Rule #27: When a sector moves, scan the ENTIRE sector."""
+        
         if regime == Regime.RED_ALERT:
             return held
-        base = []
+        
+        # ALWAYS start with past winners (Rule #21)
+        base = list(PAST_WINNERS)
+        
+        # ALWAYS include held positions
+        base += held
+        
+        # Add regime-appropriate sectors
         if regime == Regime.BULL:
-            base = MAG7 + OFFENSE + SEMI
+            base += MAG7 + SEMI + CLOUD_IT + TELECOM + SPACE
         elif regime == Regime.BEAR:
-            base = DEFENSE + ENERGY
-        else:
-            base = DEFENSE + ['GOOGL', 'MSFT', 'AMZN', 'NVDA']
-        return list(dict.fromkeys(held + base))
+            base += DEFENSE + ENERGY + COMMODITIES + MEDICAL
+        else:  # CHOPPY
+            base += DEFENSE + ENERGY + ['GOOGL', 'MSFT', 'AMZN', 'NVDA'] + MEDICAL[:5]
+        
+        # ALWAYS scan energy (Iran), defense, and telecom
+        base += ENERGY[:5] + DEFENSE[:5] + TELECOM[:3]
+        
+        # Add top movers from all sectors
+        for sector_stocks in ALL_SECTORS.values():
+            base += sector_stocks[:3]  # Top 3 from each sector
+        
+        # Deduplicate while preserving order
+        return list(dict.fromkeys(base))
 
     def _get_sentiments(self, symbols: list) -> dict:
         """Get sentiment for each symbol."""

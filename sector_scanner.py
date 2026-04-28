@@ -43,10 +43,10 @@ SECTORS = {
         'etf': 'XLE',
     },
     'defense': {
-        'name': 'Defense / Industrial',
+        'name': 'Defense / Aerospace',
         'stocks': ['CAT', 'DE', 'LMT', 'RTX', 'NOC', 'GD', 'BA',
-                   'HON', 'GE', 'MMM'],
-        'etf': 'XLI',
+                   'HON', 'GE', 'LHX', 'KTOS', 'HII', 'AXON', 'RKLB'],
+        'etf': 'ITA',
     },
     'cloud': {
         'name': 'Cloud / SaaS',
@@ -71,6 +71,24 @@ SECTORS = {
         'stocks': ['AMC', 'GME', 'PLTR', 'SOFI', 'IONQ', 'NOK',
                    'BB', 'HOOD', 'RIVN', 'LCID'],
         'etf': None,
+    },
+    'telecom_5g': {
+        'name': 'Telecom / 5G / AI Infrastructure',
+        'stocks': ['NOK', 'ERIC', 'CSCO', 'JNPR', 'CIEN', 'LITE',
+                   'INFN', 'CALX', 'COMM', 'VZ', 'T', 'TMUS'],
+        'etf': 'FIVG',
+    },
+    'solar': {
+        'name': 'Solar / Clean Energy',
+        'stocks': ['FSLR', 'ENPH', 'SEDG', 'RUN', 'PLUG', 'BE',
+                   'SPWR', 'NOVA', 'CSIQ', 'JKS'],
+        'etf': 'TAN',
+    },
+    'space': {
+        'name': 'Space / Quantum',
+        'stocks': ['RKLB', 'IONQ', 'RGTI', 'LUNR', 'ASTS', 'ASTR',
+                   'SPCE', 'RDW', 'MNTS', 'BKSY'],
+        'etf': 'UFO',
     },
 }
 

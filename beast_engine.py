@@ -31,9 +31,11 @@ ET = ZoneInfo("America/New_York")
 # ── Watchlists ─────────────────────────────────────────
 
 OFFENSE_ROSTER = ['COIN', 'TSLA', 'META', 'MSTR']
-DEFENSE_ROSTER = ['CAT', 'ORCL', 'XOM', 'COST']
+DEFENSE_ROSTER = ['CAT', 'ORCL', 'XOM', 'COST', 'LMT', 'RTX']
 MAG7 = ['AAPL', 'AMZN', 'GOOGL', 'META', 'MSFT', 'NVDA', 'TSLA']
 BLUE_CHIPS = ['GOOGL', 'MSFT', 'AAPL', 'AMZN', 'CRM', 'NOW', 'NOK']
+ENERGY = ['DVN', 'OXY', 'XOM', 'CVX', 'HAL']
+PAST_WINNERS = ['NOK', 'GOOGL', 'CRM', 'META', 'MSFT', 'NOW', 'AMD', 'NVDA']
 
 # ── Logging ────────────────────────────────────────────
 

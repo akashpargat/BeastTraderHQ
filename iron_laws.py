@@ -1,14 +1,17 @@
 """
-Beast v2.0 — Iron Laws (HARDCODED, DETERMINISTIC)
+Beast v3.0 — Iron Laws (HARDCODED, DETERMINISTIC)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 These are NOT prompts. These are Python functions that return
 (approved: bool, reason: str). They cannot be overridden by AI.
+
+UPDATED: 2026-04-28 by Session 7a05060d (v7.1 — 23 Iron Laws)
+Lessons from Days 1-6 of live trading baked in.
 
 PRIORITY HIERARCHY (higher overrides lower):
   P5 SAFETY:      Account survival, kill switch ($500 daily loss)
   P4 REGULATORY:  PDT compliance, max positions
   P3 RISK_CAP:    Per-position max unrealized loss ($200)
-  P2 STRATEGY:    Iron Laws 1-13
+  P2 STRATEGY:    Iron Laws 1-23
   P1 PROFIT:      Strategy signals, preferences
 """
 from datetime import datetime, timedelta
@@ -22,12 +25,17 @@ from models import (
 MAX_DAILY_LOSS = -500.0
 MAX_POSITION_LOSS = -200.0
 MAX_DAY_TRADES = 3
-MAX_TOTAL_POSITIONS = 10
-COOLDOWN_SECONDS = 300          # 5 min re-entry cooldown
+MAX_TOTAL_POSITIONS = 12          # Raised from 10 — we run 12 positions now
+COOLDOWN_SECONDS = 300            # 5 min re-entry cooldown
 CONSECUTIVE_LOSS_STOP = 2
-TRADING_WINDOW_START = 9, 45    # 9:45 AM ET
-TRADING_WINDOW_END = 11, 0      # 11:00 AM ET
-MIN_CONFIDENCE = 0.40           # 40% minimum to trade
+TRADING_WINDOW_START = 9, 30      # Changed: 9:30 AM ET (was 9:45 — we missed moves)
+TRADING_WINDOW_END = 15, 55       # Changed: 3:55 PM ET (was 11:00 — we swing trade now)
+MIN_CONFIDENCE = 0.40             # 40% minimum to trade
+MIN_SCALP_PROFIT_PCT = 0.02       # Rule #17: Minimum 2% profit target on scalps
+MOMENTUM_RSI_OVERRIDE = True      # Rule #30: RSI>70 OK for momentum stocks with catalysts
+
+# ── PAST WINNERS (Rule #21: check these FIRST every scan) ──
+PAST_WINNERS = ['NOK', 'GOOGL', 'CRM', 'META', 'MSFT', 'NOW', 'AMD', 'NVDA']
 
 
 # ── Result Type ────────────────────────────────────────
@@ -234,18 +242,111 @@ def law_13_strategy_stock_match(strategy: str, symbol: str, regime: Regime) -> L
     return LawResult(True, "Strategy/stock/regime match OK", "LAW_13_STRATEGY_MATCH")
 
 
+# ── NEW LAWS v7.1 (Days 4-6 Learnings) ─────────────────
+
+def law_14_split_position(qty: int) -> LawResult:
+    """LAW 14: Split EVERY position — half scalp, half runner.
+    Day 4: META scalp +$43, runner +$94 = $137 total vs $43 if sold all."""
+    # This is enforced by OrderGateway — set TWO sell orders per buy
+    return LawResult(True,
+        f"Split position reminder: {qty//2} scalp + {qty - qty//2} runner",
+        "LAW_14_SPLIT_POSITION")
+
+
+def law_17_min_scalp_profit(entry_price: float, sell_price: float) -> LawResult:
+    """LAW 17: Minimum 2% profit target on scalps.
+    Day 5: Rookie set $263.75 sell on $262.63 buy = 0.03% = GARBAGE."""
+    if sell_price <= 0 or entry_price <= 0:
+        return LawResult(True, "Price check skipped", "LAW_17_MIN_PROFIT")
+    profit_pct = (sell_price - entry_price) / entry_price
+    if profit_pct < MIN_SCALP_PROFIT_PCT:
+        return LawResult(
+            False,
+            f"⛔ Iron Law 17: Sell target ${sell_price:.2f} is only {profit_pct:.1%} above "
+            f"entry ${entry_price:.2f}. Minimum {MIN_SCALP_PROFIT_PCT:.0%} required. "
+            f"Don't give away money!",
+            "LAW_17_MIN_PROFIT"
+        )
+    return LawResult(True, f"Profit target {profit_pct:.1%} OK", "LAW_17_MIN_PROFIT")
+
+
+def law_21_past_winners_priority(symbol: str, movers: list[str]) -> LawResult:
+    """LAW 21: Cross-reference movers with past winners. Flag immediately.
+    Day 5: NOK was #6 most active, ignored for 35 min = $880 lost."""
+    if symbol in PAST_WINNERS and symbol in movers:
+        return LawResult(
+            True,  # Approved — but with a HIGH PRIORITY flag
+            f"🔥 PAST WINNER ALERT: {symbol} is on movers list! "
+            f"This stock has made us money before. PRIORITY SCAN.",
+            "LAW_21_PAST_WINNER"
+        )
+    return LawResult(True, "No past winner flag", "LAW_21_PAST_WINNER")
+
+
+def law_29_no_chase(symbol: str, current_price: float, day_open: float) -> LawResult:
+    """LAW 29: Don't chase stocks that already ran 5%+.
+    Day 5: Bought NOK at $11.24 after +5% run. Lost $480.
+    If you missed the move, set a limit at VWAP and WAIT."""
+    if day_open > 0:
+        pct_from_open = (current_price - day_open) / day_open
+        if pct_from_open > 0.05:
+            return LawResult(
+                False,
+                f"⛔ Iron Law 29: {symbol} already up {pct_from_open:.1%} from open "
+                f"(${day_open:.2f} → ${current_price:.2f}). Don't chase! "
+                f"Set limit buy at VWAP or EMA and wait for pullback.",
+                "LAW_29_NO_CHASE"
+            )
+    return LawResult(True, "Not chasing", "LAW_29_NO_CHASE")
+
+
+def law_30_momentum_rsi_override(rsi: float, has_catalyst: bool, sma_slope_up: bool) -> LawResult:
+    """LAW 30: RSI>70 is OK for momentum stocks WITH real catalysts.
+    Days 3-6: INTC missed 3x because RSI>70. But SMA was vertical + earnings beat.
+    For MOMENTUM stocks: SMA slope UP + catalyst = buy despite high RSI."""
+    if rsi > 70 and not has_catalyst:
+        return LawResult(
+            False,
+            f"⛔ Iron Law 30: RSI {rsi:.0f} > 70 with NO catalyst. "
+            f"Don't buy overbought stocks without a reason.",
+            "LAW_30_RSI_MOMENTUM"
+        )
+    if rsi > 70 and has_catalyst and sma_slope_up:
+        return LawResult(
+            True,
+            f"✅ Iron Law 30 OVERRIDE: RSI {rsi:.0f} > 70 BUT has catalyst + SMA trending up. "
+            f"Momentum stocks stay overbought for days. Approved.",
+            "LAW_30_RSI_MOMENTUM"
+        )
+    return LawResult(True, "RSI check OK", "LAW_30_RSI_MOMENTUM")
+
+
 def check_trading_window() -> LawResult:
-    """Check if we're in the allowed trading window (9:45 AM - 11:00 AM ET for new entries)."""
+    """Check if we're in the allowed trading window.
+    Regular: 9:30 AM - 3:55 PM ET
+    Extended: 4:00 AM - 8:00 PM ET (pre-market + after-hours)
+    We trade ALL sessions now — not just 9:45-11:00."""
     from zoneinfo import ZoneInfo
     now = datetime.now(ZoneInfo("America/New_York"))
-    start = now.replace(hour=TRADING_WINDOW_START[0], minute=TRADING_WINDOW_START[1], second=0)
-    end = now.replace(hour=TRADING_WINDOW_END[0], minute=TRADING_WINDOW_END[1], second=0)
-
-    if now < start:
-        return LawResult(False, f"Before trading window ({now.strftime('%H:%M')} < 9:45 AM)", "TRADING_WINDOW")
-    if now > end:
-        return LawResult(False, f"After trading window ({now.strftime('%H:%M')} > 11:00 AM)", "TRADING_WINDOW")
-    return LawResult(True, f"In trading window ({now.strftime('%H:%M')})", "TRADING_WINDOW")
+    hour = now.hour
+    
+    # Extended hours: 4 AM - 8 PM ET
+    if hour < 4 or hour >= 20:
+        return LawResult(False, f"Outside all trading hours ({now.strftime('%H:%M')})", "TRADING_WINDOW")
+    
+    # Pre-market: 4:00 AM - 9:30 AM (lighter activity, wider spreads)
+    if 4 <= hour < 9 or (hour == 9 and now.minute < 30):
+        return LawResult(True, f"PRE-MARKET session ({now.strftime('%H:%M')}). Wider spreads — use limits only!", "TRADING_WINDOW")
+    
+    # Regular: 9:30 AM - 4:00 PM
+    if (hour == 9 and now.minute >= 30) or (9 < hour < 16):
+        return LawResult(True, f"REGULAR session ({now.strftime('%H:%M')})", "TRADING_WINDOW")
+    
+    # After-hours: 4:00 PM - 8:00 PM
+    if 16 <= hour < 20:
+        return LawResult(True, f"AFTER-HOURS session ({now.strftime('%H:%M')}). Earnings reactions — be cautious!", "TRADING_WINDOW")
+    
+    return LawResult(False, f"Unknown session ({now.strftime('%H:%M')})", "TRADING_WINDOW")
 
 
 # ── MASTER VALIDATION ──────────────────────────────────
