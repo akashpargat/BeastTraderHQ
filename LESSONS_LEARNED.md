@@ -62,7 +62,7 @@ These cost us 5+ hours. NEVER forget them.
 
 ## VM Quick Reference
 - **VM IP**: 172.179.234.42
-- **Login**: beastadmin / BeastTrader12,.
+- **Login**: beastadmin / [REDACTED — see Azure portal]
 - **Python**: C:\Python312\python.exe
 - **Git**: C:\Program Files\Git\cmd\git.exe
 - **Code**: C:\beast-test2 (was C:\beast-v3, moved due to locked folder)
