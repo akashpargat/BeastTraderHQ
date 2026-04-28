@@ -1,0 +1,46 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# BeastTraderHQ – example configuration
+#
+# Copy this file to config.yaml and fill in your exchange credentials.
+# config.yaml is listed in .gitignore so it will NEVER be committed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+exchange:
+  # Supported exchange IDs come from the CCXT library (https://ccxt.org).
+  # Examples: binance, coinbasepro, kraken, bybit, okx
+  id: binance
+  api_key: "YOUR_API_KEY"
+  api_secret: "YOUR_API_SECRET"
+  # Set to true to use the exchange's paper-trading / sandbox environment.
+  sandbox: true
+
+trading:
+  # Trading pair symbol in CCXT format, e.g. BTC/USDT, ETH/BTC
+  symbol: "BTC/USDT"
+  # Quote currency amount to allocate per trade order
+  trade_amount: 50.0
+  # Maximum number of open positions at any time
+  max_open_positions: 3
+  # Percentage of portfolio to risk per trade (0.01 = 1 %)
+  risk_per_trade: 0.01
+
+strategy:
+  # Available strategies: moving_average_crossover, rsi
+  name: moving_average_crossover
+  params:
+    # moving_average_crossover params
+    fast_period: 9
+    slow_period: 21
+    # rsi params
+    rsi_period: 14
+    rsi_overbought: 70
+    rsi_oversold: 30
+
+# OHLCV candle timeframe (1m, 5m, 15m, 1h, 4h, 1d …)
+timeframe: "1h"
+# How many historical candles to fetch for indicator calculations
+candle_limit: 100
+
+logging:
+  level: INFO          # DEBUG | INFO | WARNING | ERROR
+  file: "logs/beast_trader.log"
