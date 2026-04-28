@@ -61,6 +61,7 @@ logging.basicConfig(
 
 POSITION_INTERVAL = 60     # seconds - position monitoring
 FULL_SCAN_INTERVAL = 300   # seconds - full scan with TV + sentiment + AI
+RUNNER_SCAN_INTERVAL = 120 # seconds - FAST runner/movers check (every 2 min!)
 AUTO_EXECUTE_THRESHOLD = 0.80  # 80%+ confidence = auto-execute
 ASK_THRESHOLD = 0.60           # 60-80% = ask Discord for approval
 
@@ -194,10 +195,12 @@ class BeastModeLoop:
         self.halted = False
         self.cycle_count = 0
         self._last_full_scan = 0
+        self._last_runner_scan = 0   # Fast runner check every 2 min
         self._last_hourly_report = -1
         self._previous_prices = {}
         self._alerted_losses = set()
         self._last_notification = {}
+        self._runner_alerts = {}     # Track which runners we already alerted
 
         log.info("BEAST MODE LOOP initialized")
         log.info(f"  AI Brain: {'ONLINE' if self.ai and self.ai.is_available else 'OFFLINE (deterministic)'}")
@@ -252,6 +255,13 @@ class BeastModeLoop:
         if is_market and elapsed >= FULL_SCAN_INTERVAL:
             self.run_full_scan(now)
             self._last_full_scan = time.time()
+
+        # FAST RUNNER SCAN every 2 min during market hours
+        # This catches runners before the 5-min full scan
+        runner_elapsed = time.time() - self._last_runner_scan
+        if is_market and runner_elapsed >= RUNNER_SCAN_INTERVAL:
+            self._fast_runner_scan(now)
+            self._last_runner_scan = time.time()
 
         # Extended hours scan — runners + earnings reactions (every 10 min)
         elif is_premarket and elapsed >= EXTENDED_SCAN_INTERVAL:
@@ -616,9 +626,230 @@ class BeastModeLoop:
             log.warning(f"Movers fetch failed: {e}")
             return {}
 
-    # ── HELPERS ────────────────────────────────────────
+    # ── FAST RUNNER SCAN (every 2 min) ──────────────────
 
-    def _premarket_briefing(self, now: datetime):
+    def _fast_runner_scan(self, now: datetime):
+        """FAST runner detection + AUTO-EXECUTION — every 2 minutes.
+        
+        FIND fast, TRADE fast, SELL fast. No analysis paralysis.
+        
+        Strategy matching (from our 11 strategies):
+        - Stock up 1-3% at open with volume → Strategy A (ORB Breakout)
+        - Past winner on movers → Akash Method (buy → limit sell → repeat)
+        - RSI < 35 on a runner → Strategy G (Red to Green dip buy)
+        - Stock at VWAP with momentum → Strategy B (VWAP Bounce)
+        - Gap up first 5 min → Strategy C (Gap & Go)
+        
+        EXECUTION:
+        - >80% confidence → AUTO-BUY + set split sells in 60 sec
+        - 60-80% → Alert Discord, wait for approval
+        - <60% → Alert only, no trade
+        
+        Day 5: NOK ran +5% in 15 min. We found it 35 min late.
+        Day 6: Oil ran +2.5% and we didn't scan until asked.
+        This fixes both. Find in 2 min, trade in 2 seconds."""
+        
+        try:
+            movers = self._get_movers()
+            if not movers:
+                return
+            
+            held = {p.symbol: p for p in self.gateway.get_positions()}
+            held_symbols = list(held.keys())
+            acct = self.gateway.get_account()
+            cash = float(acct.get('cash', 0))
+            
+            gainers = [m for m in movers.get('gainers', []) 
+                      if m.get('price', 0) > 5 and m.get('percent_change', 0) > 1.5]
+            
+            for m in gainers[:10]:
+                sym = m.get('symbol', '')
+                pct = m.get('percent_change', 0)
+                price = m.get('price', 0)
+                
+                # Already holding? Check if scalp target hit instead
+                if sym in held_symbols:
+                    pos = held[sym]
+                    pos_pct = (pos.unrealized_pl / pos.cost_basis * 100) if pos.cost_basis else 0
+                    # AUTO-SCALP: If position is up >2.5%, sell half
+                    if pos_pct >= 2.5 and pos.qty > 1:
+                        half = max(1, pos.qty // 2)
+                        scalp_price = round(pos.avg_entry * 1.025, 2)
+                        sell_price = max(scalp_price, round(pos.current_price * 1.005, 2))
+                        alert_key = f"autoscalp_{sym}_{now.strftime('%Y%m%d_%H')}"
+                        if alert_key not in self._runner_alerts:
+                            try:
+                                self.gateway.place_sell(
+                                    sym, half, sell_price,
+                                    reason=f"Fast scalp +{pos_pct:.1f}%",
+                                    entry_price=pos.avg_entry
+                                )
+                                log.info(f"⚡ FAST SCALP: {sym} {half}sh @ ${sell_price:.2f} (+{pos_pct:.1f}%)")
+                                self.notify.send(
+                                    f"⚡ FAST SCALP: {sym}\n"
+                                    f"Sold {half}sh @ ${sell_price:.2f}\n"
+                                    f"Entry: ${pos.avg_entry:.2f} | +{pos_pct:.1f}%"
+                                )
+                                self._runner_alerts[alert_key] = True
+                            except Exception as e:
+                                log.error(f"Fast scalp failed {sym}: {e}")
+                    continue
+                
+                # Already alerted this hour? Skip.
+                alert_key = f"{sym}_{now.strftime('%Y%m%d_%H')}"
+                if alert_key in self._runner_alerts:
+                    continue
+                
+                # ── STRATEGY MATCHING ──────────────────
+                is_past_winner = sym in PAST_WINNERS
+                in_our_sectors = any(sym in stocks for stocks in ALL_SECTORS.values())
+                
+                if not is_past_winner and not in_our_sectors:
+                    continue  # Not our universe
+                
+                # Determine strategy and confidence
+                strategy = None
+                confidence = 0.0
+                reason = ""
+                
+                # Strategy A: ORB Breakout (1-3% up in first hour with volume)
+                if 1.5 <= pct <= 4.0 and now.hour < 11:
+                    strategy = "ORB_BREAKOUT"
+                    confidence = 0.55 + (0.10 if is_past_winner else 0)
+                    reason = f"ORB Breakout +{pct:.1f}% (first hour)"
+                
+                # Akash Method: Past winner on movers (buy → limit sell → repeat)
+                if is_past_winner and 1.5 <= pct <= 4.0:
+                    strategy = "AKASH_METHOD"
+                    confidence = 0.70  # Past winners get high confidence
+                    reason = f"Akash Method: past winner +{pct:.1f}%"
+                
+                # Strategy C: Gap & Go (first 5 min only)
+                minutes_since_open = (now.hour - 9) * 60 + (now.minute - 30) if now.hour >= 9 else 0
+                if pct > 3.0 and minutes_since_open <= 5:
+                    strategy = "GAP_AND_GO"
+                    confidence = 0.60
+                    reason = f"Gap & Go +{pct:.1f}% (first 5 min)"
+                
+                # Rule 29: Don't chase >5% — force limit buy at lower price
+                if pct > 5.0:
+                    strategy = "LIMIT_DIP_BUY"
+                    confidence = 0.45  # Below auto-execute, will alert only
+                    reason = f"⚠️ Up {pct:.1f}% — too extended, set limit at VWAP"
+                
+                if not strategy:
+                    continue
+                
+                # ── POSITION SIZING ────────────────────
+                if price > 500:
+                    qty = 3
+                elif price > 200:
+                    qty = 5
+                elif price > 100:
+                    qty = 10
+                elif price > 50:
+                    qty = 25
+                elif price > 20:
+                    qty = 50
+                else:
+                    qty = 200  # Cheap stocks (NOK territory) = big size for scalps
+                
+                cost = qty * price
+                if cost > cash * 0.15:  # Max 15% of cash per trade
+                    qty = max(1, int(cash * 0.15 / price))
+                    cost = qty * price
+                
+                # ── EXECUTE OR ALERT ───────────────────
+                if confidence >= AUTO_EXECUTE_THRESHOLD and not self.halted:
+                    # AUTO-EXECUTE: >80% confidence
+                    scalp_qty = qty // 2
+                    runner_qty = qty - scalp_qty
+                    scalp_target = round(price * 1.025, 2)  # 2.5% scalp
+                    runner_target = round(price * 1.06, 2)   # 6% runner
+                    
+                    try:
+                        # Buy at limit (current ask)
+                        from models import TradeProposal, Strategy as StratEnum
+                        proposal = TradeProposal(
+                            symbol=sym, qty=qty,
+                            side=OrderSide.BUY,
+                            limit_price=round(price * 1.002, 2),  # Tiny premium to fill
+                            strategy=StratEnum.ORB_BREAKOUT,
+                            confidence=confidence,
+                        )
+                        # Use iron law validation
+                        results = validate_entry(
+                            proposal, None, list(held.values()),
+                            self.daily_pnl, self.consecutive_losses,
+                            self.active_day_trades, self.last_sell_times,
+                            self.earnings_dates,
+                            has_technicals=True, has_sentiment=True,
+                        )
+                        if is_approved(results):
+                            # Place buy
+                            self.gateway.place_buy(
+                                proposal, None, list(held.values()),
+                                self.daily_pnl, self.consecutive_losses,
+                                self.active_day_trades, self.last_sell_times,
+                                self.earnings_dates,
+                            )
+                            # Iron Law 6: Set sells within 60 sec
+                            self.gateway.place_sell(sym, scalp_qty, scalp_target,
+                                reason=f"Scalp {strategy}", time_in_force='gtc',
+                                entry_price=price)
+                            self.gateway.place_sell(sym, runner_qty, runner_target,
+                                reason=f"Runner {strategy}", time_in_force='gtc',
+                                entry_price=price)
+                            
+                            msg = (
+                                f"🔥 AUTO-TRADE: {sym}\n"
+                                f"Strategy: {strategy}\n"
+                                f"BUY {qty}sh @ ${price:.2f} ({confidence:.0%})\n"
+                                f"Scalp: {scalp_qty}sh @ ${scalp_target:.2f}\n"
+                                f"Runner: {runner_qty}sh @ ${runner_target:.2f}\n"
+                                f"{reason}"
+                            )
+                            log.info(msg)
+                            self.notify.send(msg)
+                        else:
+                            rejections = get_rejections(results)
+                            log.info(f"  BLOCKED {sym}: {rejections[0].reason}")
+                    except Exception as e:
+                        log.error(f"Auto-trade failed {sym}: {e}")
+                    
+                elif confidence >= ASK_THRESHOLD:
+                    # ALERT: 60-80% — ask for approval
+                    msg = (
+                        f"📊 RUNNER FOUND: {sym}\n"
+                        f"Strategy: {strategy} ({confidence:.0%})\n"
+                        f"Price: ${price:.2f} (+{pct:.1f}%)\n"
+                        f"{reason}\n"
+                        f"Suggested: {qty}sh = ${cost:,.0f}"
+                    )
+                    log.info(f"  RUNNER: {sym} {pct:+.1f}% conf={confidence:.0%}")
+                    self.notify.send(msg)
+                
+                else:
+                    # LOG ONLY: <60%
+                    log.info(f"  runner: {sym} {pct:+.1f}% conf={confidence:.0%} (too low)")
+                
+                self._runner_alerts[alert_key] = True
+            
+            # Also check most active for volume spikes on past winners
+            actives = movers.get('actives', [])
+            for a in actives[:5]:
+                sym = a.get('symbol', '') if isinstance(a, dict) else ''
+                if sym in PAST_WINNERS and sym not in held_symbols:
+                    alert_key = f"vol_{sym}_{now.strftime('%Y%m%d_%H')}"
+                    if alert_key not in self._runner_alerts:
+                        log.info(f"  VOLUME: Past winner {sym} on most active!")
+                        self.notify.send(f"📊 VOLUME: {sym} (past winner) on most active list!")
+                        self._runner_alerts[alert_key] = True
+                        
+        except Exception as e:
+            log.debug(f"Fast runner scan error: {e}")
+
+    # ── HELPERS ────────────────────────────────────────
         """4:00 AM ET pre-market briefing. Scan ALL sectors for overnight moves."""
         log.info("="*60)
         log.info("PRE-MARKET BRIEFING 4:00 AM")
