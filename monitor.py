@@ -105,10 +105,13 @@ class MonitorLoop:
                     # Check if selling is allowed (Iron Law 1 — position is green)
                     verdict = self.policy.evaluate_exit(pos)
                     if verdict.approved:
-                        sell_price = round(pos.current_price, 2)  # Avoid sub-penny
+                        # Iron Law 17: sell at minimum 2% above entry, not at current price
+                        min_sell = round(pos.avg_entry * 1.02, 2)
+                        sell_price = max(round(pos.current_price, 2), min_sell)
                         self.gateway.place_sell(
                             symbol, partial_qty, sell_price,
-                            reason=f"Partial exit at +${milestone} milestone"
+                            reason=f"Partial exit at +${milestone} milestone",
+                            entry_price=pos.avg_entry
                         )
                         self.partial_exits_done[symbol].add(milestone)
                         log.info(f"💰 PARTIAL: Sold {partial_qty}x {symbol} "

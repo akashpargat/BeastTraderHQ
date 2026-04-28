@@ -166,18 +166,48 @@ class OrderGateway:
                 )
 
     def place_sell(self, symbol: str, qty: int, limit_price: float,
-                   reason: str = "exit") -> OrderRecord:
-        """Place a sell order. Checks Iron Law 1 and Law 7."""
+                   reason: str = "exit", time_in_force: str = "gtc",
+                   entry_price: float = 0.0) -> OrderRecord:
+        """Place a sell order. Checks Iron Law 1, Law 7, and Law 17.
+        
+        Changes from v2:
+        - Default GTC (not DAY) so orders don't expire overnight
+        - Iron Law 17: Enforces minimum 2% profit on scalps
+        - Won't adjust price below 2% of entry
+        """
         with self._lock:
+            # Iron Law 17: Minimum 2% profit check
+            if entry_price > 0:
+                min_sell = round(entry_price * 1.02, 2)
+                if limit_price < min_sell:
+                    log.warning(
+                        f"⛔ Law 17: {symbol} sell ${limit_price:.2f} is only "
+                        f"{((limit_price/entry_price)-1)*100:.1f}% above entry ${entry_price:.2f}. "
+                        f"Minimum 2%. Adjusting to ${min_sell:.2f}"
+                    )
+                    limit_price = min_sell
+
             # Iron Law 7: Check live price before selling
             live_price = self.get_live_price(symbol)
             if live_price and live_price < limit_price * 0.995:
-                log.warning(
-                    f"⚠️ Law 7: {symbol} live ${live_price:.2f} is below "
-                    f"limit ${limit_price:.2f}. Adjusting to ${live_price:.2f}"
-                )
-                # Round to 2 decimal places (avoid sub-penny rejection)
-                limit_price = round(live_price, 2)
+                # Don't adjust below 2% minimum if we have entry price
+                if entry_price > 0:
+                    min_sell = round(entry_price * 1.02, 2)
+                    adjusted = max(round(live_price, 2), min_sell)
+                    log.warning(
+                        f"⚠️ Law 7+17: {symbol} live ${live_price:.2f} below limit ${limit_price:.2f}. "
+                        f"Adjusted to ${adjusted:.2f} (min 2% above entry)"
+                    )
+                    limit_price = adjusted
+                else:
+                    log.warning(
+                        f"⚠️ Law 7: {symbol} live ${live_price:.2f} is below "
+                        f"limit ${limit_price:.2f}. Adjusting to ${live_price:.2f}"
+                    )
+                    limit_price = round(live_price, 2)
+
+            # Determine time in force
+            tif = TimeInForce.GTC if time_in_force.lower() == 'gtc' else TimeInForce.DAY
 
             try:
                 client_id = f"beast-sell-{uuid.uuid4().hex[:8]}"
@@ -185,7 +215,7 @@ class OrderGateway:
                     symbol=symbol,
                     qty=qty,
                     side=AlpacaSide.SELL,
-                    time_in_force=TimeInForce.DAY,
+                    time_in_force=tif,
                     limit_price=limit_price,
                     client_order_id=client_id,
                 )

@@ -1111,6 +1111,19 @@ _tv_client = None
 DIP_BUY_WATCHLIST = ['AAPL', 'AMZN', 'GOOGL', 'META', 'MSFT', 'NVDA', 'TSLA',
                      'AMD', 'TSM', 'INTC', 'CRM', 'PLTR', 'OXY', 'DVN', 'LMT']
 
+# Telegram notifier (sends to BOTH Telegram + Discord)
+_notifier = None
+def _tg(message: str):
+    """Send message to Telegram (non-blocking, fire-and-forget)."""
+    global _notifier
+    try:
+        if _notifier is None:
+            from notifier import Notifier
+            _notifier = Notifier()
+        _notifier.send(message)
+    except Exception as e:
+        log.debug(f"Telegram send failed: {e}")
+
 def _get_tv_indicators(symbol: str) -> dict:
     """Read RSI/MACD/VWAP/BB from TradingView CDP. Returns dict or empty."""
     global _tv_client
@@ -1118,30 +1131,67 @@ def _get_tv_indicators(symbol: str) -> dict:
         if _tv_client is None:
             from tv_cdp_client import TVClient
             _tv_client = TVClient()
-        if not _tv_client.health_check():
+            if not _tv_client.health_check():
+                log.warning(f"  TV CDP not available for {symbol}")
+                _tv_client = None
+                return {}
+            log.info("  TV CDP connected (reusable)")
+
+        # Switch symbol and wait for data to load
+        switched = _tv_client.set_symbol(symbol)
+        if not switched:
+            log.debug(f"  TV: failed to switch to {symbol}")
             return {}
-        _tv_client.set_symbol(symbol)
-        time.sleep(2)
+        time.sleep(3)  # Wait for chart to load
+
+        # Read study values
         studies = _tv_client.get_study_values()
-        quote = _tv_client.get_quote()
+        if not studies:
+            log.debug(f"  TV: no study values for {symbol} (after-hours?)")
+            return {}
+
+        # Parse via TV analyst
         from tv_analyst import TradingViewAnalyst
         tva = TradingViewAnalyst()
-        result = tva.analyze(symbol, mcp_tools={'studies': studies, 'quote': quote, 'labels': [], 'tables': []})
+        result = tva.analyze(symbol, mcp_tools={
+            'studies': studies, 'quote': {}, 'labels': [], 'tables': []
+        })
         if result:
             return {
                 'rsi': result.rsi, 'macd_hist': result.macd_histogram,
-                'vwap_above': result.above_vwap, 'bb_position': 'upper' if result.above_upper_bb else ('lower' if result.below_lower_bb else 'mid'),
-                'confluence': result.confluence_score, 'ema_9': result.ema_9, 'ema_21': result.ema_21,
+                'vwap_above': result.above_vwap,
+                'bb_position': 'upper' if result.above_upper_bb else ('lower' if result.below_lower_bb else 'mid'),
+                'confluence': result.confluence_score,
+                'ema_9': result.ema_9, 'ema_21': result.ema_21,
                 'volume_ratio': result.volume_ratio,
             }
+        log.debug(f"  TV: analyze returned None for {symbol}")
     except Exception as e:
-        log.debug(f"TV indicators for {symbol}: {e}")
+        log.warning(f"  TV indicators {symbol}: {e}")
+        _tv_client = None  # Reset connection on error
     return {}
 
 def _pct(p) -> float:
     """Position P&L percentage."""
     cost = p.avg_entry * p.qty
     return (p.unrealized_pl / cost * 100) if cost > 0 else 0
+
+# Trade action log — tracks all auto-trades for reporting
+_trade_log = []  # list of {'time', 'action', 'symbol', 'qty', 'price', 'reason', 'scan_type'}
+
+def _log_trade(action, symbol, qty, price, reason, scan_type="60s"):
+    """Log a trade action for the next report."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    _trade_log.append({
+        'time': datetime.now(ZoneInfo("America/New_York")).strftime('%H:%M:%S'),
+        'action': action,
+        'symbol': symbol,
+        'qty': qty,
+        'price': price,
+        'reason': reason,
+        'scan_type': scan_type,
+    })
 
 def _is_market_hours() -> bool:
     from datetime import datetime
@@ -1182,24 +1232,47 @@ async def position_monitor():
             if pct >= 5.0 and not _prev_prices.get(f"_runner_{p.symbol}") and _is_market_hours():
                 half = max(1, p.qty // 2)
                 try:
-                    gateway.place_sell(p.symbol, half, round(p.current_price * 0.999, 2),
+                    sell_price = round(p.current_price * 0.999, 2)
+                    gateway.place_sell(p.symbol, half, sell_price,
                                       reason=f"Auto-runner +{pct:.1f}%")
                     _prev_prices[f"_runner_{p.symbol}"] = True
+                    _log_trade("LIMIT SELL (Runner)", p.symbol, half, sell_price,
+                               f"+{pct:.1f}% runner — selling half to lock ${p.unrealized_pl/2:+.2f} profit. Keeping {p.qty-half} shares as trailing runner.", "60s Monitor")
                     if channel:
-                        await channel.send(f"🏃 **AUTO-RUNNER SELL: {p.symbol}** +{pct:.1f}%\nSelling {half} shares @ ~${p.current_price:.2f}\nLocking ${p.unrealized_pl/2:+.2f} profit!")
+                        await channel.send(
+                            f"🏃 **[60s MONITOR] AUTO-RUNNER SELL: {p.symbol}**\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"📈 Position up **+{pct:.1f}%** — Runner target hit!\n"
+                            f"📋 **Action:** Limit sell {half} of {p.qty} shares @ ${sell_price}\n"
+                            f"💰 **Locking:** ~${p.unrealized_pl/2:+.2f} profit\n"
+                            f"🏃 **Keeping:** {p.qty-half} shares as trailing runner\n"
+                            f"📊 Entry: ${p.avg_entry:.2f} → Now: ${p.current_price:.2f}\n"
+                            f"🧠 **Why:** +5% exceeds runner target. Session rules say split: lock scalp, let runner ride with trailing stop."
+                        )
                 except Exception as e:
                     log.error(f"Auto-runner failed {p.symbol}: {e}")
 
             # ── AUTO-SCALP: +2% → limit sell half ──
             elif pct >= 2.0 and not _prev_prices.get(f"_scalp_{p.symbol}") and _is_market_hours():
                 half = max(1, p.qty // 2)
-                sell_price = round(p.current_price * 1.005, 2)
+                sell_price = round(p.avg_entry * 1.025, 2)
+                sell_price = max(sell_price, round(p.current_price * 1.005, 2))
                 try:
                     gateway.place_sell(p.symbol, half, sell_price,
-                                      reason=f"Auto-scalp +{pct:.1f}%")
+                                      reason=f"Auto-scalp +{pct:.1f}%",
+                                      entry_price=p.avg_entry)
                     _prev_prices[f"_scalp_{p.symbol}"] = True
+                    _log_trade("LIMIT SELL (Scalp)", p.symbol, half, sell_price,
+                               f"+{pct:.1f}% hit 2% scalp target. Selling half, keeping half as runner.", "60s Monitor")
                     if channel:
-                        await channel.send(f"🎯 **AUTO-SCALP: {p.symbol}** +{pct:.1f}%\nLimit sell {half} shares @ ${sell_price}")
+                        await channel.send(
+                            f"🎯 **[60s MONITOR] AUTO-SCALP: {p.symbol}**\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"📈 Position up **+{pct:.1f}%** — Scalp target hit!\n"
+                            f"📋 **Action:** Limit sell {half} of {p.qty} shares @ ${sell_price}\n"
+                            f"📊 Entry: ${p.avg_entry:.2f} → Now: ${p.current_price:.2f}\n"
+                            f"🧠 **Why:** +2% minimum scalp target (Session Rule). Sell half to lock profit, keep half for +5% runner."
+                        )
                 except Exception as e:
                     log.error(f"Auto-scalp failed {p.symbol}: {e}")
 
@@ -1208,13 +1281,15 @@ async def position_monitor():
                 chg = (p.current_price - prev) / prev * 100
                 if chg <= -2.0 and channel and not _prev_prices.get(f"_drop_{p.symbol}_{_cycle_count//60}"):
                     _prev_prices[f"_drop_{p.symbol}_{_cycle_count//60}"] = True
-                    await channel.send(f"🚨 **DROP ALERT: {p.symbol}** ${prev:.2f} → ${p.current_price:.2f} ({chg:+.1f}%)\nP&L: ${p.unrealized_pl:+.2f}\nIron Law 1: HOLD")
+                    await channel.send(f"🚨 **[60s] DROP ALERT: {p.symbol}** ${prev:.2f} → ${p.current_price:.2f} ({chg:+.1f}%)\nP&L: ${p.unrealized_pl:+.2f}\nIron Law 1: HOLD")
+                    _tg(f"🚨 DROP: {p.symbol} {chg:+.1f}%\n${prev:.2f}→${p.current_price:.2f}\nP&L: ${p.unrealized_pl:+.2f}\nHOLD (Iron Law 1)")
 
             # ── IRON LAW 1: -$500 alert ──
             if p.unrealized_pl <= -500 and not _prev_prices.get(f"_loss500_{p.symbol}"):
                 _prev_prices[f"_loss500_{p.symbol}"] = True
                 if channel:
-                    await channel.send(f"⛔ **IRON LAW 1: {p.symbol}** Loss ${p.unrealized_pl:.2f}\nHOLD — never sell at loss")
+                    await channel.send(f"⛔ **[60s] IRON LAW 1: {p.symbol}** Loss ${p.unrealized_pl:.2f}\nHOLD — never sell at loss")
+                _tg(f"⛔ IRON LAW 1: {p.symbol}\nLoss: ${p.unrealized_pl:.2f}\nACTION: HOLD — NEVER sell at loss")
 
             _prev_prices[p.symbol] = p.current_price
 
@@ -1236,25 +1311,45 @@ async def position_monitor():
                             if day_change <= -5.0 and not _prev_prices.get(f"_dipbuy_{sym}"):
                                 acct = gateway.get_account()
                                 equity = float(acct.get('equity', 100000))
-                                qty = max(1, int(equity * 0.03 / price))  # 3% position size
-                                buy_price = round(price * 0.998, 2)  # Slightly below current
+                                qty = max(1, int(equity * 0.03 / price))
+                                buy_price = round(price * 0.998, 2)
                                 gateway.place_buy(sym, qty, buy_price,
                                                   reason=f"Akash Method: {day_change:+.1f}% dip")
                                 _prev_prices[f"_dipbuy_{sym}"] = True
+                                _log_trade("LIMIT BUY (Akash Method)", sym, qty, buy_price,
+                                           f"{day_change:+.1f}% daily drop. Oversold dip buy → limit sell at +2% → repeat.", "60s Monitor")
                                 if channel:
-                                    await channel.send(f"📉 **AKASH METHOD DIP BUY: {sym}** {day_change:+.1f}%\nLimit buy {qty} shares @ ${buy_price}\nOversold dip → buy → limit sell → repeat")
+                                    await channel.send(
+                                        f"📉 **[60s MONITOR] AKASH METHOD DIP BUY: {sym}**\n"
+                                        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                        f"📉 Daily drop: **{day_change:+.1f}%** — Oversold!\n"
+                                        f"📋 **Action:** Limit buy {qty} shares @ ${buy_price}\n"
+                                        f"💰 **Cost:** ~${buy_price * qty:,.2f} (3% of portfolio)\n"
+                                        f"🎯 **Exit plan:** Limit sell at +2% (${buy_price * 1.02:.2f})\n"
+                                        f"🧠 **Why:** Akash Method — buy oversold dips, set limit sell, repeat. {sym} dropped {day_change:+.1f}% today, likely bounce candidate."
+                                    )
                         except:
                             pass
             except Exception as e:
                 log.debug(f"Dip scan: {e}")
 
-        # Summary every 5 cycles
+        # Summary every 5 cycles + Telegram
         if _cycle_count % 5 == 0 and channel:
-            lines = [f"📊 **Monitor #{_cycle_count}** | P&L: ${total_pl:+.2f} | G:{greens} R:{len(positions)-greens}"]
+            lines = [f"📊 **[60s MONITOR #{_cycle_count}]** P&L: ${total_pl:+.2f} | G:{greens} R:{len(positions)-greens}"]
+            tg_lines = [f"📊 60s Monitor #{_cycle_count}\nP&L: ${total_pl:+.2f} | G:{greens} R:{len(positions)-greens}"]
             for p in sorted(positions, key=lambda x: x.unrealized_pl, reverse=True)[:6]:
                 icon = "🟢" if p.unrealized_pl >= 0 else "🔴"
                 lines.append(f"{icon} {p.symbol} ${p.unrealized_pl:+.2f} ({_pct(p):+.1f}%)")
+                tg_lines.append(f"{icon} {p.symbol} ${p.unrealized_pl:+.2f} ({_pct(p):+.1f}%)")
+            # Show recent trades if any
+            if _trade_log:
+                lines.append(f"\n📋 **Recent Trades ({len(_trade_log)}):**")
+                tg_lines.append(f"\n📋 Trades:")
+                for t in _trade_log[-3:]:
+                    lines.append(f"  {t['action']} {t['symbol']} x{t['qty']} @ ${t['price']} [{t['scan_type']}]")
+                    tg_lines.append(f"  {t['action']} {t['symbol']} x{t['qty']} @ ${t['price']}")
             await channel.send("\n".join(lines))
+            _tg("\n".join(tg_lines))
         log.info(f"[Monitor #{_cycle_count}] {len(positions)} pos | P&L: ${total_pl:+.2f}")
     except Exception as e:
         log.error(f"Position monitor error: {e}")
@@ -1626,6 +1721,31 @@ async def full_scan():
                 embed5.add_field(name="⚠️ AI Sell Recommendations", value=ai_sell_text, inline=False)
 
             await channel.send(embed=embed5)
+
+        # ── TELEGRAM SUMMARY (condensed version of full scan) ──
+        tg_report = f"🦍 BEAST SCAN [{market_status}] {now.strftime('%I:%M %p')}\n"
+        tg_report += f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        tg_report += f"💰 ${equity:,.0f} | P&L: ${total_pl:+.2f}\n"
+        tg_report += f"📈 Regime: {regime.value} | SPY: {spy_change:+.2%}\n"
+        tg_report += f"🏛️ Trump: {trump_score:+d}/5\n\n"
+        for p in sorted(positions, key=lambda x: x.unrealized_pl, reverse=True):
+            pct = _pct(p)
+            icon = "🟢" if pct >= 0 else "🔴"
+            ai_v = ai_verdicts.get(p.symbol, {})
+            cr = confidence_results.get(p.symbol)
+            tg_report += f"{icon} {p.symbol} {pct:+.1f}% ${p.unrealized_pl:+.0f}"
+            if cr: tg_report += f" C:{cr.overall_confidence:.0%}"
+            if ai_v: tg_report += f" AI:{ai_v.get('action','?')}"
+            tg_report += "\n"
+        if trump_headlines:
+            tg_report += f"\n📰 Headlines:\n"
+            for h in trump_headlines[:3]:
+                tg_report += f"• {h[:60]}\n"
+        if _trade_log:
+            tg_report += f"\n📋 Trades ({len(_trade_log)}):\n"
+            for t in _trade_log[-5:]:
+                tg_report += f"  {t['action']} {t['symbol']} x{t['qty']} @ ${t['price']}\n"
+        _tg(tg_report)
 
         _last_full_scan = time.time()
         log.info(f"Full scan sent at {now.strftime('%H:%M')} [TV:{len(tv_data)} AI:{len(ai_verdicts)}]")
