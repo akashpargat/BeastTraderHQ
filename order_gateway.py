@@ -358,3 +358,16 @@ class OrderGateway:
         except Exception as e:
             log.error(f"Account fetch failed: {e}")
             return {}
+
+    def get_open_orders(self) -> list:
+        """Get all open orders from Alpaca."""
+        try:
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            orders = self.client.get_orders(req)
+            return [{'symbol': o.symbol, 'side': o.side.value, 'qty': str(o.qty),
+                     'limit_price': str(o.limit_price) if o.limit_price else '?',
+                     'status': o.status.value, 'id': str(o.id)}
+                    for o in orders]
+        except Exception as e:
+            log.error(f"Open orders fetch failed: {e}")
+            return []

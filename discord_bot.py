@@ -1282,12 +1282,12 @@ async def full_scan():
         # Sentiment highlights
         sent_highlights = []
         for sym, s in sentiments.items():
-            if hasattr(s, 'trump_score') and s.trump_score < 30:
+            if hasattr(s, 'trump_score') and getattr(s, 'trump_score', 0) < 30:
                 sent_highlights.append(f"⚠️ {sym}: Trump/tariff risk")
-            if hasattr(s, 'overall_score') and s.overall_score > 70:
-                sent_highlights.append(f"🟢 {sym}: bullish sentiment ({s.overall_score})")
-            if hasattr(s, 'overall_score') and s.overall_score < 30:
-                sent_highlights.append(f"🔴 {sym}: bearish sentiment ({s.overall_score})")
+            if hasattr(s, 'overall_score') and s.total_score > 70:
+                sent_highlights.append(f"🟢 {sym}: bullish sentiment ({s.total_score})")
+            if hasattr(s, 'overall_score') and s.total_score < 30:
+                sent_highlights.append(f"🔴 {sym}: bearish sentiment ({s.total_score})")
         if sent_highlights:
             embed.add_field(name="📰 Sentiment", value="\n".join(sent_highlights[:5]), inline=False)
 
