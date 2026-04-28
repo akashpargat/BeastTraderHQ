@@ -1,4 +1,4 @@
-﻿import sys, io
+import sys, io
 if sys.platform == 'win32' and hasattr(sys.stdout, 'buffer'):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
@@ -1104,10 +1104,64 @@ SCAN_CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', '1498363431013716079'))
 _prev_prices = {}
 _cycle_count = 0
 _last_full_scan = 0
+_tv_client = None
+
+# Watchlist for auto-buy dips (Akash Method)
+DIP_BUY_WATCHLIST = ['AAPL', 'AMZN', 'GOOGL', 'META', 'MSFT', 'NVDA', 'TSLA',
+                     'AMD', 'TSM', 'INTC', 'CRM', 'PLTR', 'OXY', 'DVN', 'LMT']
+
+def _get_tv_indicators(symbol: str) -> dict:
+    """Read RSI/MACD/VWAP/BB from TradingView CDP. Returns dict or empty."""
+    global _tv_client
+    try:
+        if _tv_client is None:
+            from tv_cdp_client import TVClient
+            _tv_client = TVClient()
+        if not _tv_client.health_check():
+            return {}
+        _tv_client.set_symbol(symbol)
+        time.sleep(2)
+        studies = _tv_client.get_study_values()
+        quote = _tv_client.get_quote()
+        from tv_analyst import TradingViewAnalyst
+        tva = TradingViewAnalyst()
+        result = tva.analyze(symbol, mcp_tools={'studies': studies, 'quote': quote, 'labels': [], 'tables': []})
+        if result:
+            return {
+                'rsi': result.rsi, 'macd_hist': result.macd_histogram,
+                'vwap_above': result.above_vwap, 'bb_position': 'upper' if result.above_upper_bb else ('lower' if result.below_lower_bb else 'mid'),
+                'confluence': result.confluence_score, 'ema_9': result.ema_9, 'ema_21': result.ema_21,
+                'volume_ratio': result.volume_ratio,
+            }
+    except Exception as e:
+        log.debug(f"TV indicators for {symbol}: {e}")
+    return {}
+
+def _pct(p) -> float:
+    """Position P&L percentage."""
+    cost = p.avg_entry * p.qty
+    return (p.unrealized_pl / cost * 100) if cost > 0 else 0
+
+def _is_market_hours() -> bool:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("America/New_York"))
+    if now.weekday() >= 5:
+        return False
+    return 9 <= now.hour < 16 or (now.hour == 9 and now.minute >= 30)
+
+def _is_extended_hours() -> bool:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("America/New_York"))
+    if now.weekday() >= 5:
+        return False
+    return (4 <= now.hour < 9) or (16 <= now.hour < 20)
+
 
 @tasks.loop(seconds=60)
 async def position_monitor():
-    """Every 60s: check positions, alert drops, auto-scalp, auto-protect."""
+    """Every 60s: check positions, alert drops, auto-scalp, auto-protect, auto-buy dips."""
     global _prev_prices, _cycle_count
     _cycle_count += 1
     try:
@@ -1117,74 +1171,111 @@ async def position_monitor():
         channel = bot.get_channel(SCAN_CHANNEL_ID)
         total_pl = sum(p.unrealized_pl for p in positions)
         greens = sum(1 for p in positions if p.unrealized_pl >= 0)
+        held_symbols = {p.symbol for p in positions}
 
         for p in positions:
             prev = _prev_prices.get(p.symbol, p.current_price)
-            pct = (p.unrealized_pl / (p.avg_entry * p.qty) * 100) if (p.avg_entry * p.qty) else 0
+            pct = _pct(p)
 
-            # ── AUTO-SCALP: +5% runner → sell half at market ──
-            if pct >= 5.0 and not _prev_prices.get(f"_runner_{p.symbol}"):
+            # ── AUTO-RUNNER: +5% → sell half ──
+            if pct >= 5.0 and not _prev_prices.get(f"_runner_{p.symbol}") and _is_market_hours():
                 half = max(1, p.qty // 2)
                 try:
                     gateway.place_sell(p.symbol, half, round(p.current_price * 0.999, 2),
-                                  reason=f"Auto-runner +{pct:.1f}%")
+                                      reason=f"Auto-runner +{pct:.1f}%")
                     _prev_prices[f"_runner_{p.symbol}"] = True
                     if channel:
                         await channel.send(f"🏃 **AUTO-RUNNER SELL: {p.symbol}** +{pct:.1f}%\nSelling {half} shares @ ~${p.current_price:.2f}\nLocking ${p.unrealized_pl/2:+.2f} profit!")
-                    log.info(f"AUTO-RUNNER: {p.symbol} +{pct:.1f}% selling {half}")
                 except Exception as e:
-                    log.error(f"Auto-runner sell failed {p.symbol}: {e}")
+                    log.error(f"Auto-runner failed {p.symbol}: {e}")
 
-            # ── AUTO-SCALP: +2% scalp target → place limit sell for half ──
-            elif pct >= 2.0 and not _prev_prices.get(f"_scalp_{p.symbol}"):
+            # ── AUTO-SCALP: +2% → limit sell half ──
+            elif pct >= 2.0 and not _prev_prices.get(f"_scalp_{p.symbol}") and _is_market_hours():
                 half = max(1, p.qty // 2)
-                sell_price = round(p.current_price * 1.005, 2)  # Sell slightly above current
+                sell_price = round(p.current_price * 1.005, 2)
                 try:
                     gateway.place_sell(p.symbol, half, sell_price,
-                                  reason=f"Auto-scalp +{pct:.1f}%")
+                                      reason=f"Auto-scalp +{pct:.1f}%")
                     _prev_prices[f"_scalp_{p.symbol}"] = True
                     if channel:
-                        await channel.send(f"🎯 **AUTO-SCALP: {p.symbol}** +{pct:.1f}%\nLimit sell {half} shares @ ${sell_price}\nTarget P&L: ${p.unrealized_pl/2:+.2f}")
-                    log.info(f"AUTO-SCALP: {p.symbol} +{pct:.1f}% limit sell {half} @ {sell_price}")
+                        await channel.send(f"🎯 **AUTO-SCALP: {p.symbol}** +{pct:.1f}%\nLimit sell {half} shares @ ${sell_price}")
                 except Exception as e:
-                    log.error(f"Auto-scalp sell failed {p.symbol}: {e}")
+                    log.error(f"Auto-scalp failed {p.symbol}: {e}")
 
-            # ── DROP ALERT: >2% sudden drop since last check ──
+            # ── DROP ALERT: >2% sudden drop ──
             if prev > 0:
                 chg = (p.current_price - prev) / prev * 100
-                if chg <= -2.0 and channel:
-                    await channel.send(f"🚨 **DROP ALERT: {p.symbol}** ${prev:.2f} → ${p.current_price:.2f} ({chg:+.1f}%)\nP&L: ${p.unrealized_pl:+.2f}\nIron Law 1: HOLD (never sell at loss)")
+                if chg <= -2.0 and channel and not _prev_prices.get(f"_drop_{p.symbol}_{_cycle_count//60}"):
+                    _prev_prices[f"_drop_{p.symbol}_{_cycle_count//60}"] = True
+                    await channel.send(f"🚨 **DROP ALERT: {p.symbol}** ${prev:.2f} → ${p.current_price:.2f} ({chg:+.1f}%)\nP&L: ${p.unrealized_pl:+.2f}\nIron Law 1: HOLD")
 
-            # ── IRON LAW 1: Loss alert at -$500 (NEVER sell, just alert) ──
+            # ── IRON LAW 1: -$500 alert ──
             if p.unrealized_pl <= -500 and not _prev_prices.get(f"_loss500_{p.symbol}"):
                 _prev_prices[f"_loss500_{p.symbol}"] = True
                 if channel:
-                    await channel.send(f"⛔ **IRON LAW 1 ALERT: {p.symbol}**\nLoss: ${p.unrealized_pl:.2f}\nEntry: ${p.avg_entry:.2f} → ${p.current_price:.2f}\n**ACTION: HOLD** (Iron Law 1 = NEVER sell at loss)")
+                    await channel.send(f"⛔ **IRON LAW 1: {p.symbol}** Loss ${p.unrealized_pl:.2f}\nHOLD — never sell at loss")
 
             _prev_prices[p.symbol] = p.current_price
 
-        # Summary every 5 cycles (5 min)
+        # ── AUTO-BUY DIPS (Akash Method) ──
+        if _is_market_hours() and _cycle_count % 5 == 0:
+            try:
+                from alpaca.data.historical import StockHistoricalDataClient
+                from alpaca.data.requests import StockSnapshotRequest
+                dc = StockHistoricalDataClient(os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'))
+                watch = [s for s in DIP_BUY_WATCHLIST if s not in held_symbols][:8]
+                if watch:
+                    snaps = dc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=watch, feed='iex'))
+                    for sym, snap in snaps.items():
+                        try:
+                            price = float(snap.latest_trade.price)
+                            prev_close = float(snap.previous_daily_bar.close)
+                            day_change = (price - prev_close) / prev_close * 100
+                            # Akash Method: buy if >5% daily drop
+                            if day_change <= -5.0 and not _prev_prices.get(f"_dipbuy_{sym}"):
+                                acct = gateway.get_account()
+                                equity = float(acct.get('equity', 100000))
+                                qty = max(1, int(equity * 0.03 / price))  # 3% position size
+                                buy_price = round(price * 0.998, 2)  # Slightly below current
+                                gateway.place_buy(sym, qty, buy_price,
+                                                  reason=f"Akash Method: {day_change:+.1f}% dip")
+                                _prev_prices[f"_dipbuy_{sym}"] = True
+                                if channel:
+                                    await channel.send(f"📉 **AKASH METHOD DIP BUY: {sym}** {day_change:+.1f}%\nLimit buy {qty} shares @ ${buy_price}\nOversold dip → buy → limit sell → repeat")
+                        except:
+                            pass
+            except Exception as e:
+                log.debug(f"Dip scan: {e}")
+
+        # Summary every 5 cycles
         if _cycle_count % 5 == 0 and channel:
-            lines = [f"📊 **Position Check #{_cycle_count}** | P&L: ${total_pl:+.2f} | G:{greens} R:{len(positions)-greens}"]
+            lines = [f"📊 **Monitor #{_cycle_count}** | P&L: ${total_pl:+.2f} | G:{greens} R:{len(positions)-greens}"]
             for p in sorted(positions, key=lambda x: x.unrealized_pl, reverse=True)[:6]:
-                pct = (p.unrealized_pl / (p.avg_entry * p.qty) * 100) if (p.avg_entry * p.qty) else 0
                 icon = "🟢" if p.unrealized_pl >= 0 else "🔴"
-                lines.append(f"{icon} {p.symbol} ${p.unrealized_pl:+.2f} ({pct:+.1f}%)")
+                lines.append(f"{icon} {p.symbol} ${p.unrealized_pl:+.2f} ({_pct(p):+.1f}%)")
             await channel.send("\n".join(lines))
         log.info(f"[Monitor #{_cycle_count}] {len(positions)} pos | P&L: ${total_pl:+.2f}")
     except Exception as e:
         log.error(f"Position monitor error: {e}")
 
+
 @tasks.loop(minutes=5)
 async def full_scan():
-    """Every 5 min: full Beast scan with sentiment, AI, movers, action table."""
+    """Every 5 min: full Beast scan with TV indicators, sentiment, AI, movers."""
     global _last_full_scan
     try:
         channel = bot.get_channel(SCAN_CHANNEL_ID)
         if not channel:
             return
 
-        # ── POSITIONS ──
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+
+        # ── Skip off-hours (midnight to 4 AM) ──
+        if now.hour < 4 or now.hour >= 20:
+            return
+
         positions = gateway.get_positions()
         acct = gateway.get_account()
         equity = float(acct.get('equity', 100000))
@@ -1205,6 +1296,13 @@ async def full_scan():
             pass
         regime = regime_det.detect(spy_change)
 
+        # ── TV INDICATORS (read from TradingView CDP) ──
+        tv_data = {}
+        for sym in held[:6]:
+            indicators = _get_tv_indicators(sym)
+            if indicators:
+                tv_data[sym] = indicators
+
         # ── SENTIMENT ──
         sentiments = {}
         try:
@@ -1221,7 +1319,7 @@ async def full_scan():
         # ── OPEN ORDERS ──
         open_orders = gateway.get_open_orders()
 
-        # ── AI ANALYSIS ──
+        # ── AI ANALYSIS (with TV data now!) ──
         ai_verdicts = {}
         if brain and brain.is_available:
             for sym in held[:6]:
@@ -1230,18 +1328,24 @@ async def full_scan():
                     if not pos:
                         continue
                     sent = sentiments.get(sym)
+                    tv = tv_data.get(sym, {})
                     data = {
                         'price': pos.current_price, 'entry': pos.avg_entry,
                         'pnl': pos.unrealized_pl, 'qty': pos.qty,
                         'regime': regime.value,
-                        'sentiment': getattr(sent, 'overall_score', 50) if sent else 50,
-                        'rsi': 50, 'macd_hist': 0, 'vwap_above': False,
-                        'volume_ratio': 1.0, 'bb_position': 'mid',
-                        'confluence': 5, 'ema_9': 0, 'ema_21': 0,
-                        'yahoo_score': getattr(sent, 'yahoo_score', 50) if sent else 50,
-                        'analyst_score': getattr(sent, 'analyst_score', 50) if sent else 50,
-                        'reddit_score': getattr(sent, 'reddit_score', 50) if sent else 50,
-                        'trump_score': getattr(sent, 'trump_score', 50) if sent else 50,
+                        'sentiment': sent.total_score if sent else 0,
+                        'rsi': tv.get('rsi', 50),
+                        'macd_hist': tv.get('macd_hist', 0),
+                        'vwap_above': tv.get('vwap_above', False),
+                        'volume_ratio': tv.get('volume_ratio', 1.0),
+                        'bb_position': tv.get('bb_position', 'mid'),
+                        'confluence': tv.get('confluence', 5),
+                        'ema_9': tv.get('ema_9', 0),
+                        'ema_21': tv.get('ema_21', 0),
+                        'yahoo_score': sent.yahoo_score if sent else 0,
+                        'analyst_score': sent.analyst_score if sent else 0,
+                        'reddit_score': sent.reddit_score if sent else 0,
+                        'trump_score': getattr(sent, 'trump_score', 0) if sent else 0,
                         'sector': '?', 'earnings_days': 999, 'holding': True,
                         'unrealized_pl': pos.unrealized_pl,
                     }
@@ -1249,45 +1353,44 @@ async def full_scan():
                 except:
                     pass
 
-        # ── BUILD REPORT ──
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        now = datetime.now(ZoneInfo("America/New_York"))
+        # ── MARKET CONTEXT (pre/post market) ──
+        market_status = "MARKET" if _is_market_hours() else ("EXTENDED" if _is_extended_hours() else "CLOSED")
 
+        # ── BUILD REPORT ──
         embed = discord.Embed(
-            title=f"🦍 BEAST SCAN — {now.strftime('%I:%M %p ET')}",
+            title=f"🦍 BEAST SCAN — {now.strftime('%I:%M %p ET')} [{market_status}]",
             color=0x00ff00 if total_pl >= 0 else 0xff0000
         )
         embed.add_field(name="💰 Portfolio", value=f"Equity: ${equity:,.0f}\nP&L: ${total_pl:+.2f}\nRegime: {regime.value}\nSPY: {spy_change:+.2%}", inline=True)
-        embed.add_field(name="📋 Orders", value=f"{len(open_orders)} open orders\n{len(positions)} positions", inline=True)
+        embed.add_field(name="📋 Status", value=f"{len(open_orders)} orders\n{len(positions)} positions\nTV: {len(tv_data)}/{len(held)} read", inline=True)
 
-        # Action table
+        # Action table with TV data
         action_lines = []
         for p in sorted(positions, key=lambda x: x.unrealized_pl, reverse=True):
-            pct = (p.unrealized_pl / (p.avg_entry * p.qty) * 100) if (p.avg_entry * p.qty) else 0
+            pct = _pct(p)
             ai_v = ai_verdicts.get(p.symbol, {})
             ai_act = ai_v.get('action', '-')
+            tv = tv_data.get(p.symbol, {})
+            rsi_str = f"RSI:{tv['rsi']:.0f}" if 'rsi' in tv else ""
             sent = sentiments.get(p.symbol)
-            sent_s = getattr(sent, 'overall_score', '-') if sent else '-'
+            sent_s = sent.total_score if sent else '-'
             if pct >= 5: action = "RUNNER🏃"
             elif pct >= 2: action = "SCALP🎯"
             elif pct >= 0: action = "HOLD✅"
             elif pct > -5: action = "HOLD🔒"
             else: action = "DEEP RED⚠️"
             icon = "🟢" if pct >= 0 else "🔴"
-            action_lines.append(f"{icon} **{p.symbol}** ${p.unrealized_pl:+.2f} ({pct:+.1f}%) S:{sent_s} AI:{ai_act} → {action}")
+            action_lines.append(f"{icon} **{p.symbol}** {pct:+.1f}% ${p.unrealized_pl:+.0f} {rsi_str} S:{sent_s} AI:{ai_act} → {action}")
 
         embed.add_field(name="📊 Positions", value="\n".join(action_lines[:12]) or "None", inline=False)
 
         # Sentiment highlights
         sent_highlights = []
         for sym, s in sentiments.items():
-            if hasattr(s, 'trump_score') and getattr(s, 'trump_score', 0) < 30:
-                sent_highlights.append(f"⚠️ {sym}: Trump/tariff risk")
-            if hasattr(s, 'overall_score') and s.total_score > 70:
-                sent_highlights.append(f"🟢 {sym}: bullish sentiment ({s.total_score})")
-            if hasattr(s, 'overall_score') and s.total_score < 30:
-                sent_highlights.append(f"🔴 {sym}: bearish sentiment ({s.total_score})")
+            if s.total_score >= 5:
+                sent_highlights.append(f"🟢 {sym}: bullish ({s.total_score:+d})")
+            elif s.total_score <= -3:
+                sent_highlights.append(f"🔴 {sym}: bearish ({s.total_score:+d})")
         if sent_highlights:
             embed.add_field(name="📰 Sentiment", value="\n".join(sent_highlights[:5]), inline=False)
 
@@ -1301,37 +1404,41 @@ async def full_scan():
                 ai_lines.append(f"{'🟢' if act=='BUY' else '🔴' if act=='SELL' else '🟡'} {sym}: {act} ({conf}%) {reason}")
             embed.add_field(name="🧠 AI Verdicts", value="\n".join(ai_lines[:6]), inline=False)
 
-        embed.set_footer(text=f"Beast V3 | Auto-scan every 5min | Cycle #{_cycle_count}")
+        embed.set_footer(text=f"Beast V3 | Scan #{_cycle_count} | TV:{len(tv_data)} AI:{'✅' if brain and brain.is_available else '❌'}")
         await channel.send(embed=embed)
 
         _last_full_scan = time.time()
-        log.info(f"Full scan sent to Discord at {now.strftime('%H:%M')}")
+        log.info(f"Full scan sent at {now.strftime('%H:%M')} [TV:{len(tv_data)} AI:{len(ai_verdicts)}]")
 
     except Exception as e:
         log.error(f"Full scan error: {e}\n{traceback.format_exc()}")
 
+
 @tasks.loop(minutes=10)
 async def decision_report():
-    """Every 10 min: trading decisions + comprehensive portfolio summary to Discord."""
+    """Every 10 min: trading decisions with AI recommendations."""
     try:
         channel = bot.get_channel(SCAN_CHANNEL_ID)
         if not channel:
             return
+
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+        if now.hour < 4 or now.hour >= 20:
+            return
+
         positions = gateway.get_positions()
         acct = gateway.get_account()
         equity = float(acct.get('equity', 0))
         total_pl = sum(p.unrealized_pl for p in positions)
         greens = sum(1 for p in positions if p.unrealized_pl >= 0)
 
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        now = datetime.now(ZoneInfo("America/New_York"))
-
-        embed = discord.Embed(title=f"📊 HOURLY REPORT — {now.strftime('%I:%M %p ET')}", color=0x0099ff)
+        embed = discord.Embed(title=f"📋 DECISION REPORT — {now.strftime('%I:%M %p ET')}", color=0x0099ff)
         embed.add_field(name="Portfolio", value=f"${equity:,.0f} | P&L: ${total_pl:+.2f}\n{len(positions)} pos (G:{greens} R:{len(positions)-greens})", inline=False)
 
         for p in sorted(positions, key=lambda x: x.unrealized_pl, reverse=True):
-            pct = (p.unrealized_pl / (p.avg_entry * p.qty) * 100) if (p.avg_entry * p.qty) else 0
+            pct = _pct(p)
             embed.add_field(name=f"{'🟢' if pct>=0 else '🔴'} {p.symbol}", value=f"${p.unrealized_pl:+.2f} ({pct:+.1f}%)", inline=True)
 
         open_orders = gateway.get_open_orders()
@@ -1339,10 +1446,11 @@ async def decision_report():
             order_lines = [f"{'🟢' if o.get('side')=='buy' else '🔴'} {o.get('side','?').upper()} {o.get('symbol','?')} x{o.get('qty','?')} @ ${o.get('limit_price','?')}" for o in open_orders[:8]]
             embed.add_field(name=f"📋 Open Orders ({len(open_orders)})", value="\n".join(order_lines), inline=False)
 
-        embed.set_footer(text="Beast V3 Autonomous | Decisions every 10 min")
+        embed.set_footer(text="Beast V3 | Decisions every 10 min")
         await channel.send(embed=embed)
     except Exception as e:
         log.error(f"Decision report error: {e}")
+
 
 @position_monitor.before_loop
 async def before_monitor():
@@ -1351,7 +1459,7 @@ async def before_monitor():
 @full_scan.before_loop
 async def before_scan():
     await bot.wait_until_ready()
-    await asyncio.sleep(10)  # Let bot fully initialize
+    await asyncio.sleep(10)
 
 @decision_report.before_loop
 async def before_decision():
@@ -1362,7 +1470,6 @@ async def before_decision():
 async def on_ready():
     log.info(f"🦍 Beast Discord Bot online as {bot.user}")
     log.info(f"   AI Brain: {'✅ Opus 4.7' if brain and brain.is_available else '❌ offline'}")
-    # Check TV
     tv_ok = False
     try:
         from tv_cdp_client import TVClient
@@ -1371,13 +1478,12 @@ async def on_ready():
         pass
     log.info(f"   TradingView: {'✅' if tv_ok else '❌'}")
 
-    # Start autonomous loops
     if not position_monitor.is_running():
         position_monitor.start()
-        log.info("   ✅ Position monitor: every 60s")
+        log.info("   ✅ Position monitor: every 60s (auto-scalp + auto-buy dips)")
     if not full_scan.is_running():
         full_scan.start()
-        log.info("   ✅ Full scan: every 5 min")
+        log.info("   ✅ Full scan: every 5 min (TV + sentiment + AI)")
     if not decision_report.is_running():
         decision_report.start()
         log.info("   ✅ Decision report: every 10 min")
@@ -1386,13 +1492,16 @@ async def on_ready():
     if channel:
         await channel.send(
             "🦍 **BEAST ENGINE V3 ONLINE**\n"
-            f"• Position monitor: every 60s\n"
-            f"• Full scan: every 5 min\n"
+            f"• Position monitor: every 60s (auto-scalp/runner/dip-buy)\n"
+            f"• Full scan: every 5 min (TV + sentiment + AI)\n"
             f"• Decision report: every 10 min\n"
             f"• AI: {'Claude Opus 4.7 ✅' if brain and brain.is_available else 'Deterministic ❌'}\n"
             f"• TV: {'Connected ✅' if tv_ok else 'Offline ❌'}\n"
-            f"• Iron Laws: HARDCODED ✅"
+            f"• Iron Laws: HARDCODED ✅\n"
+            f"• Auto-buy dips: ENABLED (Akash Method)\n"
+            f"• Pre/post market: ENABLED (4AM-8PM)"
         )
+
 
 # ── Run ────────────────────────────────────────────────
 
