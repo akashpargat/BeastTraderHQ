@@ -1,143 +1,393 @@
 """
-Beast v3.0 — Remote AI Client
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Calls the work laptop's AI API server via Cloudflare Tunnel.
-Falls back to deterministic mode if laptop is offline.
+Beast V3 — Hybrid AI Brain
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+TWO AI engines working together:
 
-V3 DIFFERENCE FROM V2:
-  v2: Calls local copilot-api directly
-  v3: Calls work laptop's Flask API via HTTP tunnel
+EVERY 5 MIN → Azure GPT-4o (fast, structured, maxed-out analysis)
+  - Gets ALL data: TV indicators, sentiment, confidence, positions
+  - References the last Claude deep intel briefing
+  - Returns: action, confidence, reasoning, targets
 
-Same interface — all existing code works unchanged.
+EVERY 30 MIN → Claude Opus 4.7 via work laptop tunnel (ULTRA DEEP)
+  - Full bull/bear institutional debate
+  - Multi-scenario analysis (best/worst/likely)
+  - Sector correlation check
+  - Earnings risk assessment
+  - Produces "Deep Intel Briefing" that GPT-4o reads
 
-SETUP:
-  1. Work laptop runs: python ai_api_server.py (port 5555)
-  2. Work laptop runs: cloudflared tunnel (exposes port 5555)
-  3. Set AI_API_URL in .env to the tunnel URL
-  OR for local testing: AI_API_URL=http://localhost:5555
+Both AIs are told: "You are the world's best stock trader.
+You do TradingView technical analysis on EVERY scan."
+
+Fallback: deterministic rules if both are offline.
 """
 import os
 import logging
 import requests
+import json
 from datetime import datetime
+from openai import AzureOpenAI
 
-log = logging.getLogger('Beast.RemoteAI')
+log = logging.getLogger('Beast.HybridAI')
 
-AI_API_URL = os.getenv('AI_API_URL', 'http://localhost:5555')
-AI_API_KEY = os.getenv('AI_API_KEY', 'beast-v3-sk-7f3a9e2b4d1c8f5e6a0b3d9c')
-AI_TIMEOUT = 30
-AI_HEADERS = {'X-API-Key': AI_API_KEY, 'Content-Type': 'application/json'}
+# ── Azure GPT-4o (5-min quick scans) ──
+AZURE_ENDPOINT = os.getenv('AZURE_OPENAI_ENDPOINT', 'https://eastus.api.cognitive.microsoft.com/')
+AZURE_KEY = os.getenv('AZURE_OPENAI_KEY', '')
+AZURE_DEPLOYMENT = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt4o')
+AZURE_API_VERSION = '2024-10-21'
+
+# ── Claude Opus 4.7 via tunnel (30-min deep scans) ──
+CLAUDE_URL = os.getenv('AI_API_URL', 'https://ai.beast-trader.com')
+CLAUDE_API_KEY = os.getenv('AI_API_KEY', 'beast-v3-sk-7f3a9e2b4d1c8f5e6a0b3d9c')
+
+# ── Shared state ──
+_last_deep_briefing = {}  # symbol → last Claude analysis (for GPT-4o to reference)
+_last_deep_time = None
+
+
+# ══════════════════════════════════════════════════════
+# SYSTEM PROMPTS
+# ══════════════════════════════════════════════════════
+
+GPT4O_SYSTEM = """You are the world's #1 stock day trader. You have a 92% win rate.
+You are an expert in TradingView technical analysis — RSI, MACD, VWAP, Bollinger Bands,
+EMA crossovers, volume analysis, and confluence scoring are your bread and butter.
+
+You analyze EVERY stock using TradingView indicators as your PRIMARY signal.
+You combine technicals with sentiment (Yahoo, Reddit, analyst ratings, Trump/geopolitical)
+and a confidence engine that scores 11 trading strategies.
+
+Your job: Given all data, output a precise trading verdict.
+
+RULES:
+- Iron Law 1: NEVER recommend selling at a loss. EVER.
+- Minimum +2% for scalp target, +5% for runner target
+- Split every position: half scalp, half runner
+- If RSI < 30 = oversold = potential dip buy (Akash Method)
+- If RSI > 70 = overbought = consider taking profits
+- Above VWAP = institutional buying support
+- Below VWAP = weak, institutions selling
+- Confluence 8+/10 = high probability trade
+- Always factor in Trump/tariff risk for energy & defense stocks
+
+You MUST output valid JSON:
+{"action": "BUY|HOLD|SELL", "confidence": 0-100, "reasoning": "detailed explanation",
+ "targets": {"scalp": price, "runner": price}, "risk": "LOW|MEDIUM|HIGH",
+ "tv_analysis": "your TradingView technical read"}"""
+
+CLAUDE_DEEP_SYSTEM = """You are the world's most elite institutional stock trader.
+You manage a $500M hedge fund with a 15-year track record of 28% annual returns.
+You are THE expert in TradingView Premium technical analysis.
+
+This is your ULTRA DEEP 30-minute analysis. You go deeper than any other trader:
+
+1. TRADINGVIEW TECHNICAL ANALYSIS (MANDATORY):
+   - Read RSI, MACD histogram, VWAP position, Bollinger Band position
+   - EMA 9/21 crossover status (bullish/bearish/neutral)
+   - Volume ratio vs 20-bar average (accumulation or distribution?)
+   - Confluence score interpretation (how many signals align?)
+   - What is the TradingView chart TELLING you right now?
+
+2. BULL vs BEAR INSTITUTIONAL DEBATE:
+   - Make the STRONGEST bull case (why institutions would buy)
+   - Make the STRONGEST bear case (why institutions would sell)
+   - Who wins the debate and WHY?
+
+3. MULTI-SCENARIO ANALYSIS:
+   - BEST CASE: What happens if everything goes right? Price target?
+   - WORST CASE: What's the max downside? Where's support?
+   - MOST LIKELY: What's the realistic 1-week trajectory?
+
+4. SECTOR & CORRELATION:
+   - How does this stock correlate with our other holdings?
+   - Is the sector rotating in or out?
+   - Any earnings, Fed events, or geopolitical catalysts?
+
+5. RISK ASSESSMENT:
+   - Position size recommendation (% of portfolio)
+   - Where to set trailing stop
+   - What would make you WRONG about this trade?
+
+6. FINAL VERDICT:
+   - BUY MORE / HOLD / TRIM / EXIT
+   - Confidence 0-100%
+   - Specific price targets with timeframes
+
+RULES:
+- Iron Law 1: NEVER recommend selling at a loss
+- You MUST do TradingView analysis on every stock — it's your PRIMARY tool
+- Be specific with numbers, not vague
+- Think like you're risking YOUR OWN money
+
+Output valid JSON:
+{"action": "BUY|HOLD|SELL|TRIM", "confidence": 0-100,
+ "tv_analysis": "detailed TradingView read",
+ "bull_case": "strongest argument to buy",
+ "bear_case": "strongest argument to sell",
+ "best_case": {"price": x, "timeframe": "1 week"},
+ "worst_case": {"price": x, "support": x},
+ "most_likely": {"price": x, "trajectory": "description"},
+ "risk_level": "LOW|MEDIUM|HIGH|EXTREME",
+ "position_size_pct": 1-10,
+ "trailing_stop_pct": 1-5,
+ "reasoning": "full institutional-grade analysis"}"""
 
 
 class AIBrain:
-    """Remote AI client. Same interface as v2 but calls laptop via HTTP."""
+    """Hybrid AI: GPT-4o (5min) + Claude Opus (30min)."""
 
     def __init__(self):
-        self._available = False
-        self._check_connection()
+        self._gpt_available = False
+        self._claude_available = False
+        self._azure_client = None
 
-    def _check_connection(self):
+        # Check Azure GPT-4o
+        if AZURE_KEY:
+            try:
+                self._azure_client = AzureOpenAI(
+                    azure_endpoint=AZURE_ENDPOINT,
+                    api_key=AZURE_KEY,
+                    api_version=AZURE_API_VERSION,
+                )
+                self._gpt_available = True
+                log.info(f"🤖 Azure GPT-4o ONLINE ({AZURE_ENDPOINT})")
+            except Exception as e:
+                log.warning(f"Azure GPT-4o init failed: {e}")
+
+        # Check Claude tunnel
         try:
-            resp = requests.get(f"{AI_API_URL}/health", timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                self._available = data.get('ai_available', False)
-                if self._available:
-                    log.info(f"🧠 Remote AI Brain ONLINE ({AI_API_URL})")
-                else:
-                    log.warning("🧠 Remote AI reachable but AI unavailable")
+            resp = requests.get(f"{CLAUDE_URL}/health", timeout=5)
+            if resp.status_code == 200 and resp.json().get('ai_available'):
+                self._claude_available = True
+                log.info(f"🧠 Claude Opus 4.7 ONLINE ({CLAUDE_URL})")
             else:
-                log.warning(f"🧠 Remote AI returned {resp.status_code}")
-        except Exception:
-            log.warning(f"🧠 Remote AI OFFLINE — deterministic mode")
-            self._available = False
+                log.warning("🧠 Claude reachable but AI unavailable")
+        except:
+            log.warning("🧠 Claude OFFLINE — GPT-4o only mode")
 
     @property
     def is_available(self) -> bool:
-        return self._available
+        return self._gpt_available or self._claude_available
+
+    # ══════════════════════════════════════════════════
+    # 5-MIN SCAN: GPT-4o (fast, maxed out)
+    # ══════════════════════════════════════════════════
 
     def analyze_stock(self, symbol: str, data: dict) -> dict:
-        if not self._available:
-            return self._deterministic_fallback(symbol, data)
-        try:
-            data['symbol'] = symbol
-            resp = requests.post(f"{AI_API_URL}/analyze", json=data, headers=AI_HEADERS, timeout=AI_TIMEOUT)
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception as e:
-            log.warning(f"Remote AI failed for {symbol}: {e}")
+        """5-min scan: GPT-4o with ALL data + last Claude briefing."""
+        if self._gpt_available:
+            return self._gpt4o_analyze(symbol, data)
+        elif self._claude_available:
+            return self._claude_quick(symbol, data)
         return self._deterministic_fallback(symbol, data)
 
-    def bull_bear_debate(self, symbol: str, data: dict) -> dict:
-        if not self._available:
-            return {'bull_case': '', 'bear_case': '', 'verdict': 'HOLD',
-                    'bull_confidence': 50, 'bear_confidence': 50}
+    def _gpt4o_analyze(self, symbol: str, data: dict) -> dict:
+        """Azure GPT-4o: fast but thorough analysis."""
+        try:
+            # Include last Claude deep briefing if available
+            deep_ref = ""
+            if symbol in _last_deep_briefing:
+                brief = _last_deep_briefing[symbol]
+                deep_ref = f"\n\nLAST CLAUDE DEEP ANALYSIS (30-min ago):\n{json.dumps(brief, indent=2)[:800]}\nFactor this into your analysis — it's from a deeper scan."
+
+            user_msg = f"""Analyze {symbol} for day trading. Use TradingView data as PRIMARY signal.
+
+TRADINGVIEW INDICATORS:
+- RSI: {data.get('rsi', 'N/A')}
+- MACD Histogram: {data.get('macd_hist', 'N/A')}
+- VWAP: {'ABOVE (institutional buying)' if data.get('vwap_above') else 'BELOW (institutional selling)'}
+- Bollinger Band: {data.get('bb_position', 'N/A')}
+- EMA 9/21: {data.get('ema_9', 'N/A')} / {data.get('ema_21', 'N/A')}
+- Volume Ratio: {data.get('volume_ratio', 'N/A')}x vs average
+- Confluence: {data.get('confluence', 'N/A')}/10
+
+POSITION:
+- Current Price: ${data.get('price', 0):.2f}
+- Entry Price: ${data.get('entry', 0):.2f}
+- P&L: ${data.get('unrealized_pl', data.get('pnl', 0)):.2f}
+- Shares: {data.get('qty', 0)}
+- Holding: {data.get('holding', False)}
+
+SENTIMENT (5 sources):
+- Yahoo News: {data.get('yahoo_score', 'N/A')}/5
+- Reddit WSB: {data.get('reddit_score', 'N/A')}/5
+- Wall St Analysts: {data.get('analyst_score', 'N/A')}/5
+- Trump/Tariff Risk: {data.get('trump_score', 'N/A')}/5
+- Overall Sentiment: {data.get('sentiment', 'N/A')}
+
+CONFIDENCE ENGINE:
+- Engine Score: {data.get('confidence_engine', 'N/A')}%
+- Best Strategy: {data.get('best_strategy', 'N/A')}
+- Signal: {data.get('signal', 'N/A')}
+
+MARKET:
+- Regime: {data.get('regime', 'N/A')}
+- Sector: {data.get('sector', 'N/A')}
+{deep_ref}
+
+Give me your COMPLETE TradingView analysis and trading verdict. Be specific with numbers."""
+
+            response = self._azure_client.chat.completions.create(
+                model=AZURE_DEPLOYMENT,
+                messages=[
+                    {"role": "system", "content": GPT4O_SYSTEM},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.3,
+                max_tokens=600,
+                response_format={"type": "json_object"},
+            )
+
+            result = json.loads(response.choices[0].message.content)
+            result['ai_source'] = 'Azure GPT-4o'
+            result['scan_type'] = '5min'
+            log.info(f"GPT-4o {symbol}: {result.get('action')} ({result.get('confidence')}%)")
+            return result
+
+        except Exception as e:
+            log.warning(f"GPT-4o failed for {symbol}: {e}")
+            if self._claude_available:
+                return self._claude_quick(symbol, data)
+            return self._deterministic_fallback(symbol, data)
+
+    # ══════════════════════════════════════════════════
+    # 30-MIN SCAN: Claude Opus 4.7 (ULTRA DEEP)
+    # ══════════════════════════════════════════════════
+
+    def deep_analyze(self, symbol: str, data: dict) -> dict:
+        """30-min ultra deep: Claude Opus institutional-grade analysis."""
+        global _last_deep_briefing, _last_deep_time
+
+        if self._claude_available:
+            result = self._claude_deep(symbol, data)
+            # Cache for GPT-4o to reference
+            _last_deep_briefing[symbol] = result
+            _last_deep_time = datetime.now()
+            return result
+        elif self._gpt_available:
+            # Fallback: use GPT-4o with deeper prompt
+            return self._gpt4o_analyze(symbol, data)
+        return self._deterministic_fallback(symbol, data)
+
+    def _claude_deep(self, symbol: str, data: dict) -> dict:
+        """Claude Opus 4.7: ultra deep institutional analysis."""
+        try:
+            payload = {
+                'symbol': symbol,
+                'system_prompt': CLAUDE_DEEP_SYSTEM,
+                **data,
+            }
+            resp = requests.post(
+                f"{CLAUDE_URL}/analyze",
+                json=payload,
+                headers={'X-API-Key': CLAUDE_API_KEY, 'Content-Type': 'application/json'},
+                timeout=45,
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                result['ai_source'] = 'Claude Opus 4.7 (DEEP)'
+                result['scan_type'] = '30min_deep'
+                log.info(f"Claude DEEP {symbol}: {result.get('action')} ({result.get('confidence')}%)")
+                return result
+        except Exception as e:
+            log.warning(f"Claude deep failed for {symbol}: {e}")
+        return self._deterministic_fallback(symbol, data)
+
+    def _claude_quick(self, symbol: str, data: dict) -> dict:
+        """Claude fallback for 5-min when GPT-4o is down."""
         try:
             data['symbol'] = symbol
-            resp = requests.post(f"{AI_API_URL}/debate", json=data, headers=AI_HEADERS, timeout=AI_TIMEOUT)
+            resp = requests.post(
+                f"{CLAUDE_URL}/analyze",
+                json=data,
+                headers={'X-API-Key': CLAUDE_API_KEY, 'Content-Type': 'application/json'},
+                timeout=30,
+            )
             if resp.status_code == 200:
-                return resp.json()
-        except:
-            pass
+                result = resp.json()
+                result['ai_source'] = 'Claude Opus 4.7 (quick)'
+                result['scan_type'] = '5min_fallback'
+                return result
+        except Exception as e:
+            log.warning(f"Claude quick failed for {symbol}: {e}")
+        return self._deterministic_fallback(symbol, data)
+
+    # ══════════════════════════════════════════════════
+    # OTHER METHODS (bull/bear debate, briefing)
+    # ══════════════════════════════════════════════════
+
+    def bull_bear_debate(self, symbol: str, data: dict) -> dict:
+        """Full bull vs bear debate — uses Claude if available, else GPT-4o."""
+        if self._claude_available:
+            return self.deep_analyze(symbol, data)
+        elif self._gpt_available:
+            return self._gpt4o_analyze(symbol, data)
         return {'bull_case': '', 'bear_case': '', 'verdict': 'HOLD',
                 'bull_confidence': 50, 'bear_confidence': 50}
 
-    def morning_briefing(self, market_data: dict, positions: list,
-                          sentiment: dict) -> str:
-        if not self._available:
-            return "AI offline — deterministic mode"
-        try:
-            resp = requests.post(f"{AI_API_URL}/briefing", json={
-                'market': market_data, 'positions': positions, 'sentiment': sentiment
-            }, headers=AI_HEADERS, timeout=AI_TIMEOUT)
-            if resp.status_code == 200:
-                return resp.json().get('briefing', '')
-        except:
-            pass
+    def morning_briefing(self, market_data: dict, positions: list, sentiment: dict) -> str:
+        """Morning briefing — Claude deep analysis."""
+        if self._claude_available:
+            try:
+                resp = requests.post(
+                    f"{CLAUDE_URL}/briefing",
+                    json={'market': market_data, 'positions': positions, 'sentiment': sentiment},
+                    headers={'X-API-Key': CLAUDE_API_KEY, 'Content-Type': 'application/json'},
+                    timeout=45,
+                )
+                if resp.status_code == 200:
+                    return resp.json().get('briefing', '')
+            except:
+                pass
         return "AI briefing unavailable"
 
-    def earnings_play_analysis(self, symbol: str, data: dict) -> dict:
-        return self.analyze_stock(symbol, data)
+    def get_last_deep_briefing(self, symbol: str) -> dict:
+        """Get the cached Claude deep analysis for a symbol."""
+        return _last_deep_briefing.get(symbol, {})
 
-    def trade_journal_entry(self, trade: dict) -> str:
-        if not self._available:
-            pnl = trade.get('pnl', 0)
-            grade = 'A' if pnl > 50 else 'B' if pnl > 0 else 'C' if pnl > -10 else 'D'
-            return f"GRADE: {grade} — (AI offline)"
-        result = self.analyze_stock(trade.get('symbol', '?'), trade)
-        return result.get('reasoning', 'No analysis')
+    def get_deep_briefing_age_minutes(self) -> int:
+        """How old is the last deep briefing in minutes."""
+        if _last_deep_time:
+            return int((datetime.now() - _last_deep_time).total_seconds() / 60)
+        return 999
 
-    def explain_confidence(self, symbol, confidence_result) -> str:
-        if not self._available:
-            return f"{symbol}: {confidence_result.overall:.0f}%"
-        data = {'symbol': symbol, 'confidence': confidence_result.overall,
-                'action': confidence_result.action.value}
-        result = self.analyze_stock(symbol, data)
-        return result.get('reasoning', f"{symbol}: {confidence_result.overall:.0f}%")
-
-    def reconnect(self):
-        self._check_connection()
+    # ══════════════════════════════════════════════════
+    # DETERMINISTIC FALLBACK (no AI needed)
+    # ══════════════════════════════════════════════════
 
     def _deterministic_fallback(self, symbol: str, data: dict) -> dict:
-        """When AI is offline, use simple rules."""
+        """Rule-based fallback when both AIs are offline."""
         rsi = data.get('rsi', 50)
+        pnl = data.get('unrealized_pl', data.get('pnl', 0))
+        confluence = data.get('confluence', 5)
+        sentiment = data.get('sentiment', 0)
         holding = data.get('holding', False)
-        pl = data.get('unrealized_pl', 0)
 
-        if holding and pl < 0:
-            action, reason, conf = 'HOLD', f'Loss ${pl:+.2f}. Iron Law 1.', 70
-        elif rsi < 30:
-            action = 'BUY' if not holding else 'HOLD'
-            reason, conf = f'RSI {rsi} oversold — Akash Method', 65
-        elif rsi > 70:
-            action, reason, conf = 'HOLD', f'RSI {rsi} overbought', 40
-        else:
-            action, reason, conf = 'HOLD', f'RSI {rsi} neutral', 50
+        if holding and pnl > 0:
+            cost = data.get('entry', 1) * data.get('qty', 1)
+            pct = (pnl / cost * 100) if cost > 0 else 0
+            if pct >= 5:
+                return {'action': 'SELL', 'confidence': 80,
+                        'reasoning': f'Runner target +{pct:.1f}%. Take partial profits.',
+                        'ai_source': 'Deterministic', 'scan_type': 'fallback'}
+            elif pct >= 2:
+                return {'action': 'HOLD', 'confidence': 70,
+                        'reasoning': f'Approaching scalp target +{pct:.1f}%. Hold for +2% minimum.',
+                        'ai_source': 'Deterministic', 'scan_type': 'fallback'}
 
-        return {
-            'action': action, 'confidence': conf, 'strategy': 'NONE',
-            'position_type': 'NONE', 'entry_price': 0, 'scalp_target': 0,
-            'runner_target': 0, 'stop_price': 0,
-            'reasoning': f'[DETERMINISTIC] {reason}',
-            'risks': ['AI offline — rule-based fallback'],
-        }
+        if holding and pnl < 0:
+            return {'action': 'HOLD', 'confidence': 90,
+                    'reasoning': f'Iron Law 1: NEVER sell at loss. P&L ${pnl:+.2f}. Hold for recovery.',
+                    'ai_source': 'Deterministic', 'scan_type': 'fallback'}
+
+        if rsi < 30 and confluence >= 6:
+            return {'action': 'BUY', 'confidence': 65,
+                    'reasoning': f'RSI {rsi} oversold + confluence {confluence}/10. Akash Method dip buy.',
+                    'ai_source': 'Deterministic', 'scan_type': 'fallback'}
+
+        return {'action': 'HOLD', 'confidence': 50,
+                'reasoning': f'No clear signal. RSI {rsi}, confluence {confluence}/10.',
+                'ai_source': 'Deterministic', 'scan_type': 'fallback'}
+
+
+    def earnings_play_analysis(self, symbol: str, data: dict) -> dict:
+        return self.deep_analyze(symbol, data)
