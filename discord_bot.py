@@ -1286,17 +1286,23 @@ def _get_tv_indicators(symbol: str) -> dict:
         if not switched:
             log.debug(f"  TV: failed to switch to {symbol}")
             return {}
-        time.sleep(3)  # Wait for chart to load
+        time.sleep(5)  # Wait for chart + indicators to load
 
-        # Read study values
+        # Read study values — retry if only Volume shows up
         studies = _tv_client.get_study_values()
+        study_names = [s.get('name', '?') for s in (studies or [])]
+
+        # If we only got Volume, wait more and retry (indicators still loading)
+        if len(studies) <= 2:
+            time.sleep(3)
+            studies = _tv_client.get_study_values()
+            study_names = [s.get('name', '?') for s in (studies or [])]
+
         if not studies:
-            log.debug(f"  TV: no study values for {symbol} (after-hours?)")
+            log.debug(f"  TV: no study values for {symbol}")
             return {}
 
-        # Log raw study names for debugging
-        study_names = [s.get('name', '?') for s in studies]
-        log.info(f"  TV {symbol} raw studies: {study_names}")
+        log.info(f"  TV {symbol} raw studies ({len(studies)}): {study_names}")
 
         # Parse via TV analyst
         from tv_analyst import TradingViewAnalyst
