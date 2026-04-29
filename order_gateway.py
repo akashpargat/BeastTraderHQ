@@ -44,6 +44,7 @@ class OrderGateway:
         self._lock = threading.Lock()
         self.active_orders: dict[str, OrderRecord] = {}
         self.last_sell_times: dict[str, datetime] = {}
+        self.last_sell_prices: dict[str, float] = {}  # Anti-buyback-higher tracking
         self._exit_timers: dict[str, datetime] = {}  # Track Law 6 compliance
         log.info("🔒 OrderGateway initialized (single-writer mode)")
 
@@ -168,6 +169,40 @@ class OrderGateway:
                     error=str(e),
                 )
 
+    def quick_buy(self, symbol: str, qty: int, limit_price: float,
+                  reason: str = "dip buy") -> OrderRecord:
+        """Simplified buy for auto-dip-buy. Skips Iron Laws validation (quick entry)."""
+        with self._lock:
+            try:
+                # Anti-buyback-higher: refuse to buy if we sold this stock today at a lower price
+                sold_price = self.last_sell_prices.get(symbol)
+                if sold_price and limit_price > sold_price * 1.01:
+                    log.warning(
+                        f"⛔ ANTI-BUYBACK: {symbol} — refusing to buy @ ${limit_price:.2f}, "
+                        f"we sold today @ ${sold_price:.2f}. Would lose ${(limit_price - sold_price) * qty:.2f}"
+                    )
+                    return OrderRecord(symbol=symbol, side=OrderSide.BUY, state=OrderState.REJECTED,
+                                       error=f"Anti-buyback: sold today @ ${sold_price:.2f}")
+
+                client_id = f"beast-quickbuy-{uuid.uuid4().hex[:8]}"
+                order_req = LimitOrderRequest(
+                    symbol=symbol, qty=qty, side=AlpacaSide.BUY,
+                    time_in_force=TimeInForce.GTC, limit_price=limit_price,
+                    client_order_id=client_id,
+                )
+                raw_order = self.client.submit_order(order_req)
+                record = OrderRecord(
+                    id=str(raw_order.id), client_id=client_id, symbol=symbol,
+                    side=OrderSide.BUY, qty=qty, limit_price=limit_price,
+                    state=OrderState.SENT,
+                )
+                self.active_orders[record.id] = record
+                log.info(f"✅ QUICK BUY {qty}x {symbol} @ ${limit_price:.2f} ({reason})")
+                return record
+            except Exception as e:
+                log.error(f"❌ QUICK BUY failed for {symbol}: {e}")
+                return OrderRecord(symbol=symbol, side=OrderSide.BUY, state=OrderState.FAILED, error=str(e))
+
     def place_sell(self, symbol: str, qty: int, limit_price: float,
                    reason: str = "exit", time_in_force: str = "gtc",
                    entry_price: float = 0.0) -> OrderRecord:
@@ -236,8 +271,9 @@ class OrderGateway:
                 )
                 self.active_orders[record.id] = record
 
-                # Track cooldown (Iron Law 8)
+                # Track cooldown (Iron Law 8) + anti-buyback price
                 self.last_sell_times[symbol] = datetime.now()
+                self.last_sell_prices[symbol] = limit_price
 
                 log.info(f"✅ SELL {qty}x {symbol} @ ${limit_price:.2f} ({reason})")
                 return record

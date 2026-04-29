@@ -1288,15 +1288,18 @@ def _get_tv_indicators(symbol: str) -> dict:
             return {}
         time.sleep(5)  # Wait for chart + indicators to load
 
-        # Read study values — retry if only Volume shows up
+        # Read study values — retry if only Volume shows up or values look stale
         studies = _tv_client.get_study_values()
         study_names = [s.get('name', '?') for s in (studies or [])]
 
-        # If we only got Volume, wait more and retry (indicators still loading)
-        if len(studies) <= 2:
+        # Staleness check: if we only got Volume or less than 3 studies, wait and retry
+        retries = 0
+        while len(studies or []) <= 3 and retries < 2:
+            retries += 1
             time.sleep(3)
             studies = _tv_client.get_study_values()
             study_names = [s.get('name', '?') for s in (studies or [])]
+            log.debug(f"  TV {symbol} retry {retries}: {len(studies)} studies")
 
         if not studies:
             log.debug(f"  TV: no study values for {symbol}")
@@ -1403,6 +1406,34 @@ async def position_monitor():
         greens = sum(1 for p in positions if p.unrealized_pl >= 0)
         held_symbols = {p.symbol for p in positions}
 
+        # ── AUTO-PROTECT: place 3% trailing stop on any unprotected position ──
+        if _is_market_hours() and _cycle_count % 3 == 0:
+            try:
+                open_orders = await asyncio.to_thread(gateway.get_open_orders)
+                # Build set of symbols that already have trailing stops
+                protected = set()
+                for o in open_orders:
+                    if 'trailing' in str(o.get('type', '')).lower() or 'trail' in str(o.get('client_order_id', '')).lower():
+                        protected.add(o.get('symbol', ''))
+                for p in positions:
+                    if p.symbol not in protected and p.qty_available and p.qty_available > 0:
+                        try:
+                            trail_qty = p.qty_available
+                            gateway.place_trailing_stop(p.symbol, trail_qty, trail_percent=3.0,
+                                                        reason="Auto-protect (no trailing stop found)",
+                                                        entry_price=p.avg_entry)
+                            _log_trade("TRAILING STOP (Auto-Protect)", p.symbol, trail_qty, 0,
+                                       f"3% trail on {trail_qty} unprotected shares", "60s Monitor")
+                            if channel:
+                                await channel.send(
+                                    f"🛡️ **[60s] AUTO-PROTECT: {p.symbol}** — 3% trailing stop on {trail_qty} shares\n"
+                                    f"No existing trailing stop found. Protecting against downside.")
+                            log.info(f"  🛡️ Auto-protect: {p.symbol} {trail_qty} shares with 3% trail")
+                        except Exception as e:
+                            log.debug(f"Auto-protect {p.symbol}: {e}")
+            except Exception as e:
+                log.debug(f"Auto-protect scan: {e}")
+
         for p in positions:
             prev = _prev_prices.get(p.symbol, p.current_price)
             pct = _pct(p)
@@ -1487,7 +1518,7 @@ async def position_monitor():
                                 equity = float(acct.get('equity', 100000))
                                 qty = max(1, int(equity * 0.03 / price))
                                 buy_price = round(price * 0.998, 2)
-                                gateway.place_buy(sym, qty, buy_price,
+                                gateway.quick_buy(sym, qty, buy_price,
                                                   reason=f"Akash Method: {day_change:+.1f}% dip")
                                 _prev_prices[f"_dipbuy_{sym}"] = True
                                 _log_trade("LIMIT BUY (Akash Method)", sym, qty, buy_price,
@@ -1991,7 +2022,7 @@ async def full_scan():
 
 @tasks.loop(minutes=10)
 async def decision_report():
-    """Every 10 min: trading decisions with AI recommendations."""
+    """Every 10 min: trading decisions with AI, strategy breakdown, risk analysis."""
     try:
         channel = bot.get_channel(SCAN_CHANNEL_ID)
         if not channel:
@@ -2006,23 +2037,94 @@ async def decision_report():
         positions = gateway.get_positions()
         acct = gateway.get_account()
         equity = float(acct.get('equity', 0))
+        cash = float(acct.get('cash', 0))
         total_pl = sum(p.unrealized_pl for p in positions)
         greens = sum(1 for p in positions if p.unrealized_pl >= 0)
+        market_val = sum(p.market_value for p in positions) if positions else 0
 
-        embed = discord.Embed(title=f"📋 DECISION REPORT — {now.strftime('%I:%M %p ET')}", color=0x0099ff)
-        embed.add_field(name="Portfolio", value=f"${equity:,.0f} | P&L: ${total_pl:+.2f}\n{len(positions)} pos (G:{greens} R:{len(positions)-greens})", inline=False)
+        # Get open orders for protection analysis
+        open_orders = await asyncio.to_thread(gateway.get_open_orders)
+        trail_stops = [o for o in open_orders if 'trail' in str(o.get('type', '')).lower()]
+        limit_sells = [o for o in open_orders if o.get('side') == 'sell' and 'trail' not in str(o.get('type', '')).lower()]
+        limit_buys = [o for o in open_orders if o.get('side') == 'buy']
 
+        # Sector concentration analysis
+        sectors = {}
+        SECTOR_MAP = {
+            'AMD': 'Chips', 'NVDA': 'Chips', 'INTC': 'Chips', 'MU': 'Chips', 'TSM': 'Chips',
+            'GOOGL': 'Big Tech', 'META': 'Big Tech', 'AMZN': 'Big Tech', 'PLTR': 'AI/Defense',
+            'CRM': 'Cloud', 'LMT': 'Defense', 'DVN': 'Energy', 'NOK': 'Telecom', 'OXY': 'Energy',
+        }
+        for p in positions:
+            sec = SECTOR_MAP.get(p.symbol, 'Other')
+            sectors[sec] = sectors.get(sec, 0) + (p.market_value if hasattr(p, 'market_value') else p.current_price * p.qty)
+
+        # Build the report
+        embed = discord.Embed(
+            title=f"📋 DECISION REPORT — {now.strftime('%I:%M %p ET')}",
+            color=0x00ff00 if total_pl >= 0 else 0xff4444
+        )
+
+        # Portfolio summary
+        invested_pct = (market_val / equity * 100) if equity > 0 else 0
+        embed.add_field(
+            name="💰 Portfolio",
+            value=(
+                f"Equity: **${equity:,.0f}** | Cash: ${cash:,.0f}\n"
+                f"Invested: ${market_val:,.0f} ({invested_pct:.0f}%)\n"
+                f"P&L: **${total_pl:+.2f}** | {len(positions)} pos (G:{greens} R:{len(positions)-greens})"
+            ), inline=False
+        )
+
+        # Position table
+        pos_lines = []
         for p in sorted(positions, key=lambda x: x.unrealized_pl, reverse=True):
             pct = _pct(p)
-            embed.add_field(name=f"{'🟢' if pct>=0 else '🔴'} {p.symbol}", value=f"${p.unrealized_pl:+.2f} ({pct:+.1f}%)", inline=True)
+            icon = "🟢" if pct >= 0 else "🔴"
+            pos_lines.append(f"{icon} **{p.symbol}** ${p.unrealized_pl:+.2f} ({pct:+.1f}%) — {p.qty} shares")
+        embed.add_field(name="📊 Positions", value="\n".join(pos_lines[:8]) or "None", inline=False)
 
-        open_orders = gateway.get_open_orders()
-        if open_orders:
-            order_lines = [f"{'🟢' if o.get('side')=='buy' else '🔴'} {o.get('side','?').upper()} {o.get('symbol','?')} x{o.get('qty','?')} @ ${o.get('limit_price','?')}" for o in open_orders[:8]]
-            embed.add_field(name=f"📋 Open Orders ({len(open_orders)})", value="\n".join(order_lines), inline=False)
+        # Risk dashboard
+        unprotected = []
+        protected_syms = {o.get('symbol') for o in trail_stops}
+        for p in positions:
+            if p.symbol not in protected_syms:
+                unprotected.append(p.symbol)
+        risk_text = f"🛡️ Trailing Stops: **{len(trail_stops)}** | Limit Sells: **{len(limit_sells)}** | Buys: **{len(limit_buys)}**\n"
+        if unprotected:
+            risk_text += f"⚠️ **UNPROTECTED:** {', '.join(unprotected)}\n"
+        else:
+            risk_text += f"✅ All positions have trailing stop protection\n"
 
-        embed.set_footer(text="Beast V3 | Decisions every 10 min")
+        # Sector concentration
+        if sectors:
+            top_sector = max(sectors, key=sectors.get)
+            top_pct = sectors[top_sector] / market_val * 100 if market_val > 0 else 0
+            risk_text += f"📊 Top sector: **{top_sector}** ({top_pct:.0f}%)"
+            if top_pct > 40:
+                risk_text += " ⚠️ CONCENTRATED"
+        embed.add_field(name="⚡ Risk Dashboard", value=risk_text, inline=False)
+
+        # Recent trades
+        if _trade_log:
+            trade_text = ""
+            for t in _trade_log[-5:]:
+                trade_text += f"• {t['action']} {t['symbol']} x{t['qty']} @ ${t['price']} ({t['time']})\n"
+            embed.add_field(name=f"📋 Recent Trades ({len(_trade_log)})", value=trade_text[:1024], inline=False)
+
+        embed.set_footer(text="Beast V3 | AI-Powered | Decisions every 10 min")
         await channel.send(embed=embed)
+
+        # Telegram summary
+        tg = f"📋 10min Report {now.strftime('%I:%M %p')}\n"
+        tg += f"${equity:,.0f} | P&L: ${total_pl:+.2f}\n"
+        tg += f"Protected: {len(trail_stops)}/{len(positions)}\n"
+        if unprotected:
+            tg += f"⚠️ Unprotected: {','.join(unprotected)}\n"
+        for p in sorted(positions, key=lambda x: x.unrealized_pl, reverse=True)[:6]:
+            tg += f"{'🟢' if _pct(p)>=0 else '🔴'} {p.symbol} {_pct(p):+.1f}% ${p.unrealized_pl:+.0f}\n"
+        _tg(tg)
+
     except Exception as e:
         log.error(f"Decision report error: {e}")
 
