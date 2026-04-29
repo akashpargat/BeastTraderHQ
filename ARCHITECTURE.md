@@ -864,4 +864,110 @@ C:\beast-test2\
 
 ---
 
+## 19. Gap Analysis: Us vs Pro AI Trading Bots
+
+### What We Have ✅
+1. Multi-strategy engine (11 strategies A-K)
+2. Confidence scoring (0-100% with 11 strategies)
+3. Iron Laws (13 hardcoded safety rules)
+4. Split positions (scalp + runner)
+5. Pre-market/after-hours scanning
+6. Sector rotation scanning (10 sectors, 48 stocks)
+7. Reddit/Yahoo/Google News/Analyst sentiment (5 sources)
+8. Position monitoring (60s cadence)
+9. Auto-buy dips (Akash Method) + Auto-sell (scalp/runner)
+10. AI analysis (Claude Opus 4.7)
+11. Live dashboard (beast-trader.com)
+
+### Critical Gaps 🔴 (Priority Order)
+
+#### #1 TRAILING STOPS (Biggest Single Improvement)
+**Current**: Fixed limit sells ($540 for MU)
+**Pro**: Dynamic trailing stops that MOVE UP with price
+**Why**: If MU runs to $580, our $540 sell already filled and we missed $40/share. A 2% trail would sell at $568.
+**Implementation**: Alpaca has `trailing_stop` order type built-in. Change `place_sell()` in `order_gateway.py` to use `trail_percent=2.0`.
+**Impact**: 30-50% more profit on runners
+
+#### #2 BRACKET ORDERS (OCO)
+**Current**: Manually place buy, then separately place sells
+**Pro**: One-Cancels-Other: buy + stop + target = 1 order
+**Implementation**: Alpaca supports `order_class="bracket"` with `take_profit` and `stop_loss` params.
+**Impact**: Cleaner execution, no orphaned orders
+
+#### #3 DYNAMIC POSITION SIZING (ATR-based)
+**Current**: Fixed qty by price bracket
+**Pro**: Size based on ATR (volatility) + confidence + account risk
+**Implementation**: Calculate ATR from TV bars, size = (account_risk * equity) / (ATR * multiplier)
+**Impact**: Right-sized positions, less risk on volatile stocks
+
+#### #4 EARNINGS REACTION TRADING
+**Current**: Set sells before earnings, wait
+**Pro**: Buy MORE on beats in after-hours, cut on misses
+**Implementation**: Monitor AH price action, auto-buy if gap up >3% with volume
+**Impact**: Capture post-earnings momentum instead of missing it
+
+#### #5 OPTIONS FLOW / UNUSUAL ACTIVITY
+**Current**: Level 3 approved, never used
+**Pro**: Scan unusual call/put sweeps = institutional signals
+**Implementation**: Use Alpaca options API or Unusual Whales data
+**Impact**: Front-run institutional moves
+
+#### #6 SHORTING
+**Current**: Shorting enabled, never used (long-only)
+**Pro**: Short weak stocks on red days = profit from drops
+**Implementation**: Add short strategies to confidence engine, use `side='sell'` for short
+**Impact**: Profit on down days instead of just bleeding
+
+#### #7 REAL-TIME NEWS NLP
+**Current**: Yahoo/Reddit/Google RSS (batch, delayed)
+**Pro**: Streaming news with AI scoring (Benzinga Pro, Alpha Vantage)
+**Implementation**: WebSocket news feed + Claude analysis on breaking headlines
+**Impact**: Catch moves minutes faster
+
+#### #8 PORTFOLIO CORRELATION CHECK
+**Current**: 12 positions, mostly tech-correlated
+**Pro**: Beta/correlation matrix, ensure diversification
+**Implementation**: Calculate pairwise correlation from price history, block correlated entries
+**Impact**: Reduce portfolio drawdown by 30-50%
+
+#### #9 SHARPE RATIO / MAX DRAWDOWN
+**Current**: Track P&L only
+**Pro**: Risk-adjusted returns (Sharpe > 1.5 = good)
+**Implementation**: Calculate from equity_curve data in trade_db
+**Impact**: Know if we're actually good or just lucky
+
+#### #10 PAIRS TRADING
+**Current**: Long-only
+**Pro**: Long strong + short weak in same sector = market-neutral
+**Implementation**: Requires shorting (#6) first. Find relative strength pairs.
+**Impact**: Profit regardless of market direction
+
+### Iron Law 1 Controversy
+**Current**: NEVER sell at loss (absolute)
+**Pro bots**: Max 1-2% account risk per trade, stop at support
+**Our stance**: Keep Iron Law 1 for now. It has saved us (PLTR came back from -5% to green). But consider adding an **optional** "smart stop" that only triggers at technical breakdown levels, not arbitrary percentages. This would be Iron Law 1b — "soft stop at support breakdown" that requires AI + human approval.
+
+### Implementation Priority
+```
+Phase 1 (Quick wins — Alpaca native features):
+  #1 Trailing stops ← 30 min, biggest impact
+  #2 Bracket orders ← 30 min, cleaner execution
+
+Phase 2 (Sizing + risk):
+  #3 Dynamic sizing ← needs ATR calculation
+  #8 Correlation check ← needs price history
+  #9 Sharpe tracking ← needs equity curve math
+
+Phase 3 (New strategies):
+  #4 Earnings reaction ← needs AH monitoring
+  #6 Shorting ← needs short strategy logic
+  #10 Pairs trading ← needs shorting first
+
+Phase 4 (Data sources):
+  #5 Options flow ← needs data provider
+  #7 Real-time news ← needs streaming API
+```
+
+---
+
 *This document is the single source of truth for Beast Trader V3. Any new AI or developer should read this FIRST before making changes.*
