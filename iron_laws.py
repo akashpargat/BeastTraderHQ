@@ -122,10 +122,29 @@ def check_position_max_loss(position: Position) -> LawResult:
 
 # ── PRIORITY 2: IRON LAWS ─────────────────────────────
 
-def law_1_never_sell_at_loss(position: Position, side: OrderSide) -> LawResult:
+def law_1_never_sell_at_loss(position: Position, side: OrderSide,
+                            earnings_miss: bool = False, drop_pct: float = 0) -> LawResult:
     """LAW 1: Never sell a position at a loss. Hold until green.
-    Exception: Overridden by P3 RISK_CAP if loss > $200."""
+    
+    Exceptions:
+    - P3 RISK_CAP overrides if loss > $200
+    - EARNINGS MISS: if stock drops >10% on earnings AND it's NOT a blue chip,
+      allow selling to prevent further collapse. Blue chips (AAPL, MSFT, GOOGL, 
+      AMZN, META, NVDA, TSLA) always recover — HOLD them no matter what.
+    """
+    BLUE_CHIPS = {'AAPL', 'MSFT', 'GOOGL', 'GOOG', 'AMZN', 'META', 'NVDA', 'TSLA',
+                  'BRK.B', 'JPM', 'V', 'MA', 'JNJ', 'UNH', 'WMT', 'PG', 'HD',
+                  'DIS', 'NFLX', 'ADBE', 'CRM', 'ORCL', 'COST', 'PEP', 'KO'}
+
     if side == OrderSide.SELL and position.is_red:
+        # Earnings miss exception (non-blue-chips only)
+        if earnings_miss and abs(drop_pct) >= 10 and position.symbol not in BLUE_CHIPS:
+            return LawResult(
+                True,  # APPROVED — earnings miss override
+                f"⚠️ Iron Law 1 OVERRIDE: {position.symbol} earnings miss with {drop_pct:.1f}% drop. "
+                f"Non-blue-chip — allowing loss exit to prevent further collapse.",
+                "LAW_1_EARNINGS_OVERRIDE"
+            )
         return LawResult(
             False,
             f"⛔ Iron Law 1: {position.symbol} is RED (${position.unrealized_pl:.2f}). "

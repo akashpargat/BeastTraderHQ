@@ -497,14 +497,25 @@ class OrderGateway:
             return {}
 
     def get_open_orders(self) -> list:
-        """Get all open orders from Alpaca."""
+        """Get all open orders from Alpaca with type info for trailing stop detection."""
         try:
             req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
             orders = self.client.get_orders(req)
-            return [{'symbol': o.symbol, 'side': o.side.value, 'qty': str(o.qty),
-                     'limit_price': str(o.limit_price) if o.limit_price else '?',
-                     'status': o.status.value, 'id': str(o.id)}
-                    for o in orders]
+            result = []
+            for o in orders:
+                entry = {
+                    'symbol': o.symbol,
+                    'side': o.side.value,
+                    'qty': str(o.qty),
+                    'limit_price': str(o.limit_price) if o.limit_price else '?',
+                    'type': str(o.type.value) if o.type else 'unknown',
+                    'trail_percent': str(o.trail_percent) if o.trail_percent else None,
+                    'client_order_id': str(o.client_order_id or ''),
+                    'status': o.status.value,
+                    'id': str(o.id),
+                }
+                result.append(entry)
+            return result
         except Exception as e:
             log.error(f"Open orders fetch failed: {e}")
             return []

@@ -116,10 +116,17 @@ class TradingViewAnalyst:
 
             elif 'exponential' in name or 'ema' in name:
                 ma = self._parse_float(values.get('MA', '0'))
-                if signals.ema_9 == 0:
-                    signals.ema_9 = ma
-                else:
-                    signals.ema_21 = ma
+                if ma > 0:
+                    # Try to determine period from study inputs or position
+                    # EMA studies appear in order they were added — typically 9, 21, 50, 200
+                    if signals.ema_9 == 0:
+                        signals.ema_9 = ma
+                    elif signals.ema_21 == 0:
+                        signals.ema_21 = ma
+                    elif not hasattr(signals, 'ema_50') or signals.ema_50 == 0:
+                        signals.ema_50 = ma
+                    else:
+                        signals.ema_200 = ma
 
             elif 'moving average' in name and 'exponential' not in name:
                 signals.sma_20 = self._parse_float(values.get('MA', '0'))
@@ -233,49 +240,70 @@ class TradingViewAnalyst:
     def _calculate_tv_confluence(self, signals: TechnicalSignals, price: float,
                                   strategy_signals: dict, table_data: dict) -> int:
         """Calculate confluence score using TradingView data.
-        Much more accurate than Alpaca-only calculation."""
+        Scores 0-10 based on available indicators (not Pine labels)."""
         score = 0
+        max_possible = 0
 
-        # Above VWAP
-        if signals.price_vs_vwap > 0:
-            score += 2
+        # 1. VWAP position (+2)
+        if signals.vwap > 0:
+            max_possible += 2
+            if signals.price_vs_vwap > 0:
+                score += 2
 
-        # RSI in sweet spot
-        if 30 <= signals.rsi <= 70:
-            score += 1
-        if signals.rsi < 30:
-            score += 2  # Oversold = strong bounce signal
+        # 2. RSI zone (+2)
+        max_possible += 2
+        if signals.rsi > 0:
+            if 40 <= signals.rsi <= 60:
+                score += 1  # neutral
+            elif signals.rsi < 30:
+                score += 2  # oversold bounce
+            elif signals.rsi > 70:
+                score += 0  # overbought risk
+            else:
+                score += 1  # mild bull/bear
 
-        # MACD positive
+        # 3. MACD momentum (+2)
+        max_possible += 2
         if signals.macd_histogram > 0:
-            score += 1
+            score += 2  # bullish momentum
+        elif signals.macd_histogram > -0.5:
+            score += 1  # mild
 
-        # Above Bollinger mid
-        if price and signals.bb_mid > 0 and price > signals.bb_mid:
-            score += 1
-
-        # EMA alignment (9 > 21 = uptrend)
-        if signals.ema_9 > signals.ema_21 > 0:
-            score += 1
-
-        # FVG signals from Pine (strategy F)
-        if strategy_signals.get('fvg_count', 0) > 0:
-            score += 1
-
-        # R2G signals from Pine (strategy G)
-        if strategy_signals.get('r2g_count', 0) > 0:
-            score += 1
-
-        # Long signals from Pine (direct entry)
-        if strategy_signals.get('long_signals'):
-            score += 2
-
-        # VWAP band position
-        if table_data.get('vwap_band_low', 0) > 0:
-            if price and price > table_data['vwap_band_low']:
+        # 4. Bollinger position (+1)
+        if signals.bb_mid > 0:
+            max_possible += 1
+            if price > signals.bb_mid:
                 score += 1
 
-        return min(score, 15)  # Cap at 15
+        # 5. EMA alignment (+2): 9 > 21 = uptrend
+        if signals.ema_9 > 0 and signals.ema_21 > 0:
+            max_possible += 2
+            if signals.ema_9 > signals.ema_21:
+                score += 2  # golden alignment
+            elif abs(signals.ema_9 - signals.ema_21) / signals.ema_21 < 0.005:
+                score += 1  # close (consolidating)
+
+        # 6. Price vs EMA (+1): price above short EMA = bullish
+        if signals.ema_9 > 0 and price > 0:
+            max_possible += 1
+            if price > signals.ema_9:
+                score += 1
+
+        # 7. Pine strategy signals (bonus, if available)
+        if strategy_signals.get('fvg_count', 0) > 0:
+            score += 1
+        if strategy_signals.get('r2g_count', 0) > 0:
+            score += 1
+        if strategy_signals.get('long_signals'):
+            score += 1
+
+        # Normalize to 0-10 scale based on available indicators
+        if max_possible > 0:
+            normalized = int(round(score / max_possible * 10))
+        else:
+            normalized = 5  # no data = neutral
+
+        return min(normalized, 10)
 
     def _parse_float(self, value) -> float:
         """Safely parse a float from TV output."""
