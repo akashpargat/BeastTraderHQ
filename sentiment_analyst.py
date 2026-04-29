@@ -122,14 +122,31 @@ class SentimentAnalyst:
         try:
             stock = yf.Ticker(symbol)
             news = stock.news
+
+            # yfinance v2+ returns list of dicts with 'content' key
             if not news:
+                self._set_cache(cache_key, 0)
                 return 0
 
             score = 0
-            for article in news[:10]:
-                title = article.get('title', '').lower()
-                summary = article.get('summary', '').lower()
-                text = f"{title} {summary}"
+            for article in news[:15]:
+                # Handle both old format (title/summary) and new format (content.title)
+                if isinstance(article, dict):
+                    title = ''
+                    summary = ''
+                    if 'content' in article:
+                        content = article['content']
+                        title = content.get('title', '') if isinstance(content, dict) else ''
+                        summary = content.get('summary', '') if isinstance(content, dict) else ''
+                    else:
+                        title = article.get('title', '')
+                        summary = article.get('summary', '') or article.get('description', '')
+                    text = f"{title} {summary}".lower()
+                else:
+                    continue
+
+                if not text.strip():
+                    continue
 
                 # Check panic keywords
                 for panic in PANIC:
@@ -149,13 +166,14 @@ class SentimentAnalyst:
             # Clamp to -5 to +5
             score = max(-5, min(5, score))
             self._set_cache(cache_key, score)
+            log.debug(f"  Yahoo {symbol}: {score:+d} from {len(news)} articles")
             return score
 
         except Exception as e:
             log.warning(f"Yahoo sentiment failed for {symbol}: {e}")
             return 0
 
-    # ── Reddit ─────────────────────────────────────────
+    # ── Reddit (WSB + stocks + investing + options) ────
 
     def _reddit_sentiment(self, symbol: str) -> int:
         cache_key = f"reddit:{symbol}"
@@ -164,29 +182,62 @@ class SentimentAnalyst:
 
         try:
             score = 0
-            headers = {'User-Agent': 'BeastBot/2.0'}
+            mentions = 0
+            # Rotate user agents to avoid blocks
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
 
-            # Check WSB daily thread
-            for sub in ['wallstreetbets', 'stocks']:
+            for sub in ['wallstreetbets', 'stocks', 'investing', 'options']:
                 try:
-                    url = f"https://www.reddit.com/r/{sub}/hot.json?limit=25"
+                    url = f"https://www.reddit.com/r/{sub}/hot.json?limit=50"
                     resp = requests.get(url, headers=headers, timeout=10)
                     if resp.status_code == 200:
                         data = resp.json()
                         posts = data.get('data', {}).get('children', [])
                         for post in posts:
-                            title = post.get('data', {}).get('title', '').upper()
-                            if symbol.upper() in title:
-                                # Check sentiment of the mention
-                                text = title.lower()
+                            pd = post.get('data', {})
+                            title = pd.get('title', '')
+                            selftext = pd.get('selftext', '')[:200]
+                            ups = pd.get('ups', 0)
+                            full_text = f"{title} {selftext}".upper()
+
+                            # Check for symbol mention (with word boundary awareness)
+                            sym_upper = symbol.upper()
+                            if sym_upper in full_text and (
+                                f"${sym_upper}" in full_text or
+                                f" {sym_upper} " in full_text or
+                                full_text.startswith(f"{sym_upper} ") or
+                                full_text.endswith(f" {sym_upper}")
+                            ):
+                                mentions += 1
+                                text = full_text.lower()
+                                # Weight by upvotes
+                                weight = 1 if ups < 100 else 2 if ups < 1000 else 3
                                 for kw, pts in BULLISH.items():
                                     if kw in text:
-                                        score += 1
+                                        score += weight
                                 for kw, pts in BEARISH.items():
                                     if kw in text:
-                                        score -= 1
+                                        score -= weight
+                                # Mention itself is slightly bullish (hype)
+                                if score == 0:
+                                    score += 1
+                    elif resp.status_code == 429:
+                        log.debug(f"  Reddit rate limited on r/{sub}")
+                        break
                 except Exception:
                     pass
+
+            score = max(-5, min(5, score))
+            self._set_cache(cache_key, score)
+            if mentions > 0:
+                log.debug(f"  Reddit {symbol}: {score:+d} ({mentions} mentions)")
+            return score
+
+        except Exception as e:
+            log.warning(f"Reddit sentiment failed for {symbol}: {e}")
+            return 0
 
             score = max(-5, min(5, score))
             self._set_cache(cache_key, score)
@@ -254,7 +305,7 @@ class SentimentAnalyst:
 
     def _google_news_sentiment(self, query: str) -> tuple[int, list[str]]:
         """Scan Google News RSS for breaking news. No API key needed.
-        Returns (score, headlines)."""
+        Returns (score, headlines). Only counts articles from last 24 hours."""
         cache_key = f"gnews:{query}"
         if self._is_fresh(cache_key, NEWS_TTL):
             cached = self._get_cache(cache_key)
@@ -262,12 +313,24 @@ class SentimentAnalyst:
 
         try:
             import feedparser
+            from datetime import timezone, timedelta
             url = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
             feed = feedparser.parse(url)
 
             score = 0
             headlines = []
-            for entry in feed.entries[:10]:
+            now = datetime.now(timezone.utc)
+            cutoff = now - timedelta(hours=24)
+
+            for entry in feed.entries[:15]:
+                # Filter out stale articles (>24 hours old)
+                pub_date = entry.get('published_parsed')
+                if pub_date:
+                    from time import mktime
+                    entry_time = datetime.fromtimestamp(mktime(pub_date), tz=timezone.utc)
+                    if entry_time < cutoff:
+                        continue  # Skip old articles
+
                 title = entry.get('title', '').lower()
                 headlines.append(entry.get('title', ''))
 
@@ -283,8 +346,8 @@ class SentimentAnalyst:
                         break
 
             score = max(-5, min(5, score))
-            self._set_cache(cache_key, (score, headlines))
-            return score, headlines
+            self._set_cache(cache_key, (score, headlines[:5]))
+            return score, headlines[:5]
 
         except ImportError:
             log.warning("feedparser not installed. Run: pip install feedparser")

@@ -1670,11 +1670,15 @@ async def full_scan():
                 pos = next((p for p in positions if p.symbol == sym), None)
                 price = pos.current_price if pos else 0
                 # Build TechnicalSignals from TV data
+                # VWAP is meaningless outside market hours — default to neutral
+                vwap_val = 0.0  # neutral default for extended hours
+                if _is_market_hours() and tv.get('vwap_above') is not None:
+                    vwap_val = 1.0 if tv.get('vwap_above') else -1.0
                 tech = TechnicalSignals(
                     symbol=sym,
                     rsi=tv.get('rsi', 50),
                     macd_histogram=tv.get('macd_hist', 0),
-                    price_vs_vwap=1.0 if tv.get('vwap_above') else -1.0,
+                    price_vs_vwap=vwap_val,
                     volume_ratio=tv.get('volume_ratio', 1.0),
                     ema_9=tv.get('ema_9', 0),
                     ema_21=tv.get('ema_21', 0),
@@ -1746,231 +1750,82 @@ async def full_scan():
         market_status = "MARKET" if _is_market_hours() else ("EXTENDED" if _is_extended_hours() else "CLOSED")
 
         # ══════════════════════════════════════════════════
-        # BUILD RICH DISCORD REPORT (Multiple Embeds)
-        # Elaborative, detailed, explains WHY for each stock
+        # COMPACT DISCORD REPORT (2 embeds, not 8+)
+        # Clean, scannable, professional trader format
         # ══════════════════════════════════════════════════
 
-        # ── EMBED 1: Portfolio Overview ──
+        # ── EMBED 1: Dashboard + Position Table ──
         embed1 = discord.Embed(
             title=f"🦍 BEAST SCAN — {now.strftime('%I:%M %p ET')} [{market_status}]",
-            description=(
-                f"```\n"
-                f"{'═' * 45}\n"
-                f"  Portfolio: ${equity:,.0f}  │  Day P&L: ${total_pl:+.2f}\n"
-                f"  Regime:    {regime.value.upper():10s}  │  SPY:     {spy_change:+.2%}\n"
-                f"  Positions: {len(positions):3d}          │  Orders:  {len(open_orders)}\n"
-                f"  Trump:     {trump_score:+d}            │  Market:  {market_status}\n"
-                f"{'═' * 45}\n"
-                f"  Pipeline: TV:{len(tv_data)} Sent:{len(sentiments)} Conf:{len(confidence_results)} AI:{len(ai_verdicts)}\n"
-                f"```"
-            ),
             color=0x00ff00 if total_pl >= 0 else 0xff4444
         )
-        await channel.send(embed=embed1)
+        embed1.add_field(
+            name="💰 Portfolio",
+            value=(
+                f"**${equity:,.0f}** | P&L: **${total_pl:+.2f}** | "
+                f"Regime: {regime.value.upper()} | SPY: {spy_change:+.2%}\n"
+                f"{len(positions)} pos (G:{greens} R:{len(positions)-greens}) | "
+                f"Orders: {len(open_orders)} | Trump: {trump_score:+d}"
+            ), inline=False
+        )
 
-        # ── EMBED 2: Position Table (pure ASCII, perfectly aligned) ──
-        # Discord uses monospace in code blocks — ASCII chars only for alignment
-        hdr  = "+--------+----------+-----------+-------+-----+------+------+------+-----------+\n"
-        hdr += "| STOCK  |    PRICE |       P&L |     % | RSI | VWAP | SENT | CONF | VERDICT   |\n"
-        hdr += "+--------+----------+-----------+-------+-----+------+------+------+-----------+\n"
-        rows = []
+        pos_lines = []
         for p in sorted(positions, key=lambda x: x.unrealized_pl, reverse=True):
             pct = _pct(p)
             tv = tv_data.get(p.symbol, {})
-            rsi = f"{tv['rsi']:3.0f}" if 'rsi' in tv else " -- "
-            vwap = " UP " if tv.get('vwap_above') else " DN " if tv else " -- "
             sent = sentiments.get(p.symbol)
-            sent_v = f"{sent.total_score:+3d} " if sent else " -- "
-            cr = confidence_results.get(p.symbol)
-            conf_v = f" {cr.overall_confidence:3.0%}" if cr else " -- "
             ai_v = ai_verdicts.get(p.symbol, {})
-            verdict = ai_v.get('action', 'HOLD')
-
-            if pct >= 5:    vd = ">> RUNNER"
-            elif pct >= 2:  vd = "-> SCALP "
-            elif verdict == 'SELL': vd = "!! SELL  "
-            elif verdict == 'BUY':  vd = "++ ADD   "
-            elif pct >= 0:  vd = "   HOLD  "
-            elif pct > -5:  vd = ".. HOLD  "
-            else:           vd = "** DEEP  "
-
-            tag = "+" if pct >= 0 else "-"
-            rows.append(
-                f"| {tag}{p.symbol:5s} | ${p.current_price:7.2f} | ${p.unrealized_pl:+8.2f} | {pct:+5.1f}% | {rsi:>3s} | {vwap:>4s} | {sent_v:>4s} | {conf_v:>4s} | {vd:9s} |"
-            )
-
-        footer = "+--------+----------+-----------+-------+-----+------+------+------+-----------+"
-        table_str = f"```\n{hdr}" + "\n".join(rows) + f"\n{footer}\n```"
-
-        embed2 = discord.Embed(
-            title="📊 Position Dashboard",
-            description=table_str,
-            color=0x2b2d31
-        )
-        # Add legend below table
-        embed2.set_footer(text=">> RUNNER (+5%) | -> SCALP (+2%) | ++ ADD (AI buy) | !! SELL (AI sell) | ** DEEP RED | UP/DN = VWAP")
-        await channel.send(embed=embed2)
-
-        # ── EMBED 3: Per-Stock Analysis with CLEAR SOURCE LABELS ──
-        # Each stock gets its own embed with labeled data sources
-        for p in sorted(positions, key=lambda x: abs(x.unrealized_pl), reverse=True)[:6]:
-            pct = _pct(p)
-            tv = tv_data.get(p.symbol, {})
-            sent = sentiments.get(p.symbol)
             cr = confidence_results.get(p.symbol)
-            ai_v = ai_verdicts.get(p.symbol, {})
-
-            if pct >= 2: color = 0x57f287
-            elif pct >= 0: color = 0xfee75c
-            elif pct > -3: color = 0xed4245
-            else: color = 0x992d22
-
-            ai_action = ai_v.get('action', 'HOLD')
-            ai_conf = ai_v.get('confidence', 0)
-
-            stock_embed = discord.Embed(
-                title=f"{'🟢' if pct>=0 else '🔴'} {p.symbol} — {ai_action} ({ai_conf}%)",
-                description=f"**${p.current_price:.2f}** │ Entry: ${p.avg_entry:.2f} │ {p.qty} shares │ P&L: **${p.unrealized_pl:+.2f}** ({pct:+.1f}%)",
-                color=color
+            icon = "🟢" if pct >= 0 else "🔴"
+            rsi_s = f"RSI:{tv.get('rsi',0):.0f}" if tv.get('rsi') else ""
+            vwap_s = "↑V" if tv.get('vwap_above') else "↓V" if tv else ""
+            sent_s = f"S:{sent.total_score:+d}" if sent else ""
+            conf_s = f"C:{cr.overall_confidence:.0%}" if cr else ""
+            ai_s = ai_v.get('action', '') if ai_v else ""
+            verdict = ai_s or ("RUNNER" if pct >= 5 else "SCALP" if pct >= 2 else "HOLD")
+            pos_lines.append(
+                f"{icon} **{p.symbol}** ${p.unrealized_pl:+.0f} ({pct:+.1f}%) "
+                f"{rsi_s} {vwap_s} {sent_s} {conf_s} → **{verdict}**"
             )
+        embed1.add_field(name="📊 Positions", value="\n".join(pos_lines[:10]) or "None", inline=False)
+        embed1.set_footer(text=f"TV:{len(tv_data)} Sent:{len(sentiments)} Conf:{len(confidence_results)} AI:{len(ai_verdicts)}")
+        await channel.send(embed=embed1)
 
-            # ── SOURCE 1: TradingView (CDP) ──
-            tv_text = ""
-            if tv:
-                tv_text = f"📺 **Source: TradingView Premium (CDP port 9222)**\n"
-                rsi = tv.get('rsi', 0)
-                if rsi > 70: tv_text += f"• RSI **{rsi:.0f}** — ⚠️ OVERBOUGHT\n"
-                elif rsi < 30: tv_text += f"• RSI **{rsi:.0f}** — 🔥 OVERSOLD (dip buy zone)\n"
-                else: tv_text += f"• RSI **{rsi:.0f}** — neutral\n"
-                tv_text += f"• VWAP: **{'ABOVE ✅' if tv.get('vwap_above') else 'BELOW ⚠️'}**\n"
-                tv_text += f"• Bollinger: **{tv.get('bb_position', 'mid').upper()}**\n"
-                tv_text += f"• Confluence: **{tv.get('confluence', 0)}/10**\n"
-                tv_text += f"• EMA 9/21: {tv.get('ema_9', 0):.0f} / {tv.get('ema_21', 0):.0f}"
-            else:
-                tv_text = "📺 **Source: TradingView** — ⏸️ No data (after hours)"
-            stock_embed.add_field(name="📺 Technical (TradingView)", value=tv_text, inline=False)
+        # ── EMBED 2: Signals + News (only if actionable) ──
+        has_signals = False
+        embed2 = discord.Embed(title="📡 Signals & Intel", color=0x2b2d31)
 
-            # ── SOURCE 2: Sentiment (Yahoo + Reddit + Analyst) ──
-            if sent:
-                sent_text = f"📰 **Source: Yahoo Finance + Reddit + Wall St Analysts**\n"
-                sent_text += f"• Yahoo News: **{sent.yahoo_score:+d}** {'📈' if sent.yahoo_score > 0 else '📉' if sent.yahoo_score < 0 else '➡️'}\n"
-                sent_text += f"• Reddit/WSB: **{sent.reddit_score:+d}** {'🐒↑' if sent.reddit_score > 0 else '🐒↓' if sent.reddit_score < 0 else '🐒→'}\n"
-                sent_text += f"• Analysts: **{sent.analyst_score:+d}** {'🏦↑' if sent.analyst_score > 0 else '🏦↓' if sent.analyst_score < 0 else '🏦→'}\n"
-                total_icon = "🟢 BULLISH" if sent.total_score >= 3 else ("🔴 BEARISH" if sent.total_score <= -3 else "⚪ NEUTRAL")
-                sent_text += f"• **Overall: {sent.total_score:+d} → {total_icon}**"
-            else:
-                sent_text = "📰 **Source: Sentiment** — No data available"
-            stock_embed.add_field(name="📰 Sentiment (3 Sources)", value=sent_text, inline=False)
+        ai_actions = [(sym, v) for sym, v in ai_verdicts.items() if v.get('action', 'HOLD') != 'HOLD']
+        if ai_actions:
+            ai_text = "\n".join(
+                f"{'🟢' if v.get('action')=='BUY' else '🔴'} **{sym}** {v['action']} ({v.get('confidence',0)}%) — {v.get('reasoning','')[:80]}"
+                for sym, v in ai_actions[:6]
+            )
+            embed2.add_field(name="🧠 AI Recommendations", value=ai_text, inline=False)
+            has_signals = True
 
-            # ── SOURCE 3: Confidence Engine (11 Strategies) ──
-            if cr:
-                conf_text = f"🎯 **Source: Confidence Engine (11 strategies scored)**\n"
-                conf_text += f"• Overall: **{cr.overall_confidence:.0%}**\n"
-                conf_text += f"• Signal: **{cr.signal.value.upper()}**\n"
-                if cr.best_strategy:
-                    conf_text += f"• Best Strategy: **{cr.best_strategy.value}**\n"
-                if cr.strategy_scores:
-                    top3 = sorted(cr.strategy_scores, key=lambda s: s.score, reverse=True)[:3]
-                    for ss in top3:
-                        bar = "█" * int(ss.score * 10)
-                        conf_text += f"  {ss.strategy.value}: {bar} {ss.score:.0%}\n"
-            else:
-                conf_text = "🎯 **Source: Confidence Engine** — No TV data to score"
-            stock_embed.add_field(name="🎯 Confidence (Engine)", value=conf_text[:1024], inline=False)
+        sent_lines = [
+            f"{'📈' if s.total_score>0 else '📉'} {sym}: Y:{s.yahoo_score:+d} R:{s.reddit_score:+d} A:{s.analyst_score:+d} = **{s.total_score:+d}**"
+            for sym in [p.symbol for p in positions][:8
+            ] if (s := sentiments.get(sym)) and s.total_score != 0
+        ]
+        if sent_lines:
+            embed2.add_field(name="📰 Sentiment", value="\n".join(sent_lines), inline=False)
+            has_signals = True
 
-            # ── SOURCE 4: AI Brain (Claude Opus 4.7) ──
-            ai_reason = ai_v.get('reasoning', '')
-            if ai_reason:
-                ai_text = f"🧠 **Source: Claude Opus 4.7 via ai.beast-trader.com**\n"
-                ai_text += f"• Verdict: **{ai_action}** ({ai_conf}% confidence)\n"
-                ai_text += f"• Analysis: {ai_reason[:300]}"
-            else:
-                ai_text = "🧠 **Source: AI Brain** — ⏸️ AI offline or skipped this stock"
-            stock_embed.add_field(name="🧠 AI Analysis (Claude Opus 4.7)", value=ai_text[:1024], inline=False)
+        if trump_score != 0 and trump_headlines:
+            embed2.add_field(name="🏛️ Geo", value=f"**{trump_score:+d}** — " + " | ".join(h[:50] for h in trump_headlines[:2]), inline=False)
+            has_signals = True
 
-            # ── SOURCE 5: Trump/Geopolitical (Google News RSS) ──
-            if p.symbol in ['OXY', 'DVN', 'XOM', 'LMT', 'CAT'] and trump_score != 0:
-                geo_text = f"🏛️ **Source: Google News RSS (Trump/tariff/Hormuz keywords)**\n"
-                geo_text += f"• Score: **{trump_score:+d}/5**\n"
-                if trump_headlines:
-                    geo_text += f"• Latest: {trump_headlines[0][:80]}"
-                stock_embed.add_field(name="🏛️ Geopolitical (Google News)", value=geo_text, inline=False)
+        if _trade_log:
+            recent = _trade_log[-3:]
+            embed2.add_field(name=f"📋 Trades ({len(_trade_log)})", value="\n".join(
+                f"• {t['action']} {t['symbol']} x{t['qty']} @ ${t['price']} ({t['time']})" for t in recent
+            ), inline=False)
+            has_signals = True
 
-            # ── RECOMMENDATION ──
-            if pct >= 5:
-                rec = f"🏃 **SELL HALF (Runner)** — +{pct:.1f}% exceeds 5% runner target. Lock profits on half, trail stop the rest."
-            elif pct >= 2:
-                rec = f"🎯 **SELL HALF (Scalp)** — +{pct:.1f}% hit 2% scalp target. Take profit, keep runner."
-            elif pct >= 0:
-                rec = f"✅ **HOLD** — Green but below target. Wait for +2%."
-            elif pct > -3:
-                rec = f"🔒 **HOLD** — Iron Law 1: never sell at loss. {pct:.1f}% is manageable."
-            else:
-                rec = f"⚠️ **HOLD** — Deep red {pct:.1f}%. Iron Law 1: HOLD. Selling locks the loss."
-            stock_embed.add_field(name="📋 RECOMMENDATION", value=rec, inline=False)
-
-            stock_embed.set_footer(text=f"Data: TV={'✅' if tv else '❌'} Sent={'✅' if sent else '❌'} Conf={'✅' if cr else '❌'} AI={'✅' if ai_reason else '❌'}")
-            await channel.send(embed=stock_embed)
-
-        # ── EMBED 4: Sentiment & Geopolitical ──
-        embed4 = discord.Embed(title="📰 Sentiment & Geopolitical Intel", color=0xf0b232)
-
-        # Trump/Geopolitical
-        if trump_headlines:
-            trump_text = f"**Score: {trump_score:+d}** {'🟢 Bullish' if trump_score > 0 else '🔴 Bearish' if trump_score < 0 else '⚪ Neutral'}\n"
-            for h in trump_headlines[:4]:
-                trump_text += f"• {h[:80]}\n"
-            embed4.add_field(name="🏛️ Trump / Tariffs / Geopolitics", value=trump_text, inline=False)
-
-        # Per-stock sentiment table
-        sent_table = "```\n"
-        sent_table += f"{'STOCK':6s} {'YAHOO':>6s} {'REDDIT':>7s} {'ANALYST':>8s} {'TOTAL':>6s} │ {'VERDICT':8s}\n"
-        sent_table += f"{'─'*50}\n"
-        for sym in held[:10]:
-            s = sentiments.get(sym)
-            if s:
-                verdict = "BULLISH" if s.total_score >= 3 else ("BEARISH" if s.total_score <= -3 else "NEUTRAL")
-                sent_table += f"{sym:6s} {s.yahoo_score:>+6d} {s.reddit_score:>+7d} {s.analyst_score:>+8d} {s.total_score:>+6d} │ {verdict:8s}\n"
-        sent_table += "```"
-        embed4.add_field(name="📊 Sentiment Breakdown (5 Sources)", value=sent_table, inline=False)
-
-        await channel.send(embed=embed4)
-
-        # ── EMBED 5: Buy Signals & Opportunities ──
-        buy_signals = []
-        for sym, cr in confidence_results.items():
-            if cr.overall_confidence >= 0.60:
-                is_new = sym not in {p.symbol for p in positions}
-                strat = cr.best_strategy.value if cr.best_strategy else '?'
-                tag = "NEW BUY" if is_new else "ADD MORE"
-                buy_signals.append((sym, cr.overall_confidence, strat, cr.signal.value, tag))
-
-        if buy_signals or ai_verdicts:
-            embed5 = discord.Embed(title="🔥 Opportunities & Signals", color=0x57f287)
-
-            if buy_signals:
-                buy_text = ""
-                for sym, conf, strat, sig, tag in sorted(buy_signals, key=lambda x: -x[1])[:6]:
-                    buy_text += f"🎯 **{sym}** — {conf:.0%} confidence [{strat}] → {tag}\n"
-                embed5.add_field(name="📈 Confidence Engine Signals (≥60%)", value=buy_text, inline=False)
-
-            # AI buy recommendations
-            ai_buys = [(sym, v) for sym, v in ai_verdicts.items() if v.get('action') == 'BUY' and v.get('confidence', 0) >= 60]
-            if ai_buys:
-                ai_buy_text = ""
-                for sym, v in sorted(ai_buys, key=lambda x: -x[1].get('confidence', 0)):
-                    ai_buy_text += f"🧠 **{sym}** — BUY ({v['confidence']}%) {v.get('reasoning', '')[:70]}\n"
-                embed5.add_field(name="🧠 AI Buy Recommendations", value=ai_buy_text, inline=False)
-
-            # AI sell recommendations
-            ai_sells = [(sym, v) for sym, v in ai_verdicts.items() if v.get('action') == 'SELL']
-            if ai_sells:
-                ai_sell_text = ""
-                for sym, v in ai_sells:
-                    ai_sell_text += f"🔴 **{sym}** — SELL ({v.get('confidence', 0)}%) {v.get('reasoning', '')[:70]}\n"
-                embed5.add_field(name="⚠️ AI Sell Recommendations", value=ai_sell_text, inline=False)
-
-            await channel.send(embed=embed5)
+        if has_signals:
+            await channel.send(embed=embed2)
 
         # ── TELEGRAM SUMMARY (condensed version of full scan) ──
         tg_report = f"🦍 BEAST SCAN [{market_status}] {now.strftime('%I:%M %p')}\n"
