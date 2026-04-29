@@ -1585,6 +1585,7 @@ async def full_scan():
         acct = gateway.get_account()
         equity = float(acct.get('equity', 100000))
         total_pl = sum(p.unrealized_pl for p in positions)
+        greens = sum(1 for p in positions if p.unrealized_pl >= 0)
         held = [p.symbol for p in positions]
 
         # ── REGIME ──
