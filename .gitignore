@@ -1,5 +1,61 @@
+# Secrets
 .env
+*.env.*
+
+# Python
 *.pyc
 __pycache__/
-beast.log
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Logs
+*.log
+bot_out.log
+bot_stderr.log
+
+# Database
 *.db
+*.sqlite
+*.sqlite3
+
+# Node
+node_modules/
+.next/
+out/
+.vercel/
+
+# Windows
+*.dll
+*.exe
+*.msi
+Thumbs.db
+Desktop.ini
+*.lnk
+
+# Temp files
+_*.txt
+_*.py
+*.tmp
+*.bak
+*.swp
+*~
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+*.suo
+*.user
+
+# Cloudflare
+cloudflared.msi
+
+# Build artifacts
+*.standalone/
+.turbo/
