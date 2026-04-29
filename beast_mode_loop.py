@@ -309,17 +309,17 @@ class BeastModeLoop:
         if is_weekday and hour == 9 and minute == 30 and self.cycle_count % 60 == 0:
             self._market_open_scan(now)
 
-        # ── NEW PRO FEATURES (run every 5 min during market + AH) ──
-        if (is_market or is_afterhours) and self.cycle_count % 5 == 0:
+        # ── NEW PRO FEATURES ──
+        # Earnings reaction — EVERY CYCLE during AH (earnings move FAST)
+        if is_afterhours:
             positions = self.gateway.get_positions()
-            # Portfolio risk check
+            self._check_earnings_reaction(positions, now)
+        
+        # Portfolio risk + shorting — every 5 cycles during market
+        if is_market and self.cycle_count % 5 == 0:
+            positions = self.gateway.get_positions()
             risk = self._check_portfolio_risk(positions)
-            # Earnings reaction trading (AH only)
-            if is_afterhours:
-                self._check_earnings_reaction(positions, now)
-            # Short weak stocks on red days (market hours only)
-            if is_market:
-                self._scan_short_candidates(positions, now)
+            self._scan_short_candidates(positions, now)
 
         # Macro news scan every 10 min (catches war/Trump/Fed headlines)
         if (is_market or is_premarket) and self.cycle_count % 10 == 0:
@@ -888,17 +888,21 @@ class BeastModeLoop:
         
         for p in positions:
             sym = p.symbol
-            pct = (p.current_price - p.avg_entry) / p.avg_entry * 100 if p.avg_entry > 0 else 0
             
-            # Check if stock is gapping up >3% after hours (earnings beat signal)
-            prev_price = self._previous_prices.get(sym, p.avg_entry)
-            if prev_price > 0:
-                ah_change = (p.current_price - prev_price) / prev_price * 100
-            else:
-                ah_change = 0
+            # Compare current AH price to TODAY'S CLOSE (lastday_price won't work, 
+            # use the day bar close which is today's regular session close)
+            # p.current_price = live AH price from Alpaca
+            # We need today's closing price — use lastday_price as approximation
+            # since Alpaca positions update current_price in AH
+            close_price = getattr(p, 'lastday_price', 0) or self._previous_prices.get(sym, p.avg_entry)
+            if close_price <= 0:
+                close_price = p.avg_entry
+            
+            ah_change = (p.current_price - close_price) / close_price * 100 if close_price > 0 else 0
+            pct_from_entry = (p.current_price - p.avg_entry) / p.avg_entry * 100 if p.avg_entry > 0 else 0
             
             # Gap up >3% in AH = earnings beat → buy more
-            if ah_change > 3.0 and pct > 0:
+            if ah_change > 3.0 and pct_from_entry > 0:
                 alert_key = f"earnings_add_{sym}_{now.strftime('%Y%m%d')}"
                 if alert_key not in self._runner_alerts:
                     self._runner_alerts[alert_key] = True

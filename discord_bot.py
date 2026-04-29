@@ -1987,6 +1987,100 @@ async def decision_report():
         log.error(f"Decision report error: {e}")
 
 
+@tasks.loop(minutes=30)
+async def claude_deep_scan():
+    """Every 30 min: Claude Opus 4.7 ULTRA DEEP analysis on top positions.
+    Produces Deep Intel Briefing that GPT-4o references in 5-min scans."""
+    try:
+        channel = bot.get_channel(SCAN_CHANNEL_ID)
+        if not channel:
+            return
+
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+        if now.hour < 4 or now.hour >= 20:
+            return
+
+        if not brain or not brain.is_available:
+            return
+
+        positions = gateway.get_positions()
+        if not positions:
+            return
+
+        # Pick top 5 positions by absolute P&L (most impactful)
+        top = sorted(positions, key=lambda x: abs(x.unrealized_pl), reverse=True)[:5]
+
+        # Gather data for Claude
+        sentiments_data = {}
+        def _get_sentiment_batch(syms):
+            sa = SentimentAnalyst()
+            for sym in syms:
+                try:
+                    sentiments_data[sym] = sa.full_stock_intel(sym)
+                except:
+                    pass
+        await asyncio.to_thread(_get_sentiment_batch, [p.symbol for p in top])
+
+        # Run Claude deep analysis
+        deep_results = {}
+        def _run_claude_deep(pos_list):
+            for pos in pos_list:
+                try:
+                    sym = pos.symbol
+                    intel = sentiments_data.get(sym, {})
+                    data = {
+                        'price': pos.current_price, 'entry': pos.avg_entry,
+                        'pnl': pos.unrealized_pl, 'qty': pos.qty,
+                        'sentiment': intel.get('total_sentiment', 0),
+                        'earnings_days': intel.get('earnings_days', 999),
+                        'short_pct': intel.get('short_pct', 0),
+                        'squeeze_risk': intel.get('squeeze_risk', False),
+                        'holding': True, 'unrealized_pl': pos.unrealized_pl,
+                    }
+                    result = brain.deep_analysis(sym, data)
+                    if result:
+                        deep_results[sym] = result
+                except Exception as e:
+                    log.warning(f"Claude deep {pos.symbol}: {e}")
+        await asyncio.to_thread(_run_claude_deep, top)
+
+        if not deep_results:
+            log.info("Claude deep scan: no results (Claude may be offline)")
+            return
+
+        # Send compact report
+        embed = discord.Embed(
+            title=f"🧠 CLAUDE DEEP INTEL — {now.strftime('%I:%M %p ET')}",
+            description=f"Ultra-deep 30-min analysis on {len(deep_results)} positions",
+            color=0x9B59B6
+        )
+        for sym, r in deep_results.items():
+            action = r.get('action', 'HOLD')
+            conf = r.get('confidence', 0)
+            reasoning = r.get('reasoning', '')[:200]
+            icon = "🟢" if action == 'BUY' else "🔴" if action == 'SELL' else "⚪"
+            embed.add_field(
+                name=f"{icon} {sym} — {action} ({conf}%)",
+                value=reasoning or "No reasoning provided",
+                inline=False
+            )
+        embed.set_footer(text=f"Source: Claude Opus 4.7 via ai.beast-trader.com | Next: {(now.hour*60+now.minute+30)//60}:{(now.minute+30)%60:02d}")
+        await channel.send(embed=embed)
+
+        # Telegram
+        tg_msg = f"🧠 Claude Deep Intel {now.strftime('%I:%M %p')}\n"
+        for sym, r in deep_results.items():
+            tg_msg += f"{'🟢' if r.get('action')=='BUY' else '🔴' if r.get('action')=='SELL' else '⚪'} {sym}: {r.get('action')} ({r.get('confidence',0)}%)\n"
+        _tg(tg_msg)
+
+        log.info(f"Claude deep scan: {len(deep_results)} analyzed at {now.strftime('%H:%M')}")
+
+    except Exception as e:
+        log.error(f"Claude deep scan error: {e}\n{traceback.format_exc()}")
+
+
 @position_monitor.before_loop
 async def before_monitor():
     await bot.wait_until_ready()
@@ -2000,6 +2094,11 @@ async def before_scan():
 async def before_decision():
     await bot.wait_until_ready()
     await asyncio.sleep(30)
+
+@claude_deep_scan.before_loop
+async def before_claude():
+    await bot.wait_until_ready()
+    await asyncio.sleep(120)  # Wait 2 min — let first full_scan run first
 
 @bot.event
 async def on_ready():
@@ -2022,17 +2121,22 @@ async def on_ready():
     if not decision_report.is_running():
         decision_report.start()
         log.info("   ✅ Decision report: every 10 min")
+    if not claude_deep_scan.is_running():
+        claude_deep_scan.start()
+        log.info("   ✅ Claude deep scan: every 30 min")
 
     channel = bot.get_channel(SCAN_CHANNEL_ID)
     if channel:
         await channel.send(
             "🦍 **BEAST ENGINE V3 ONLINE**\n"
             f"• Position monitor: every 60s (auto-scalp/runner/dip-buy)\n"
-            f"• Full scan: every 5 min (TV + sentiment + AI)\n"
+            f"• Full scan: every 5 min (TV + sentiment + GPT-4o)\n"
             f"• Decision report: every 10 min\n"
-            f"• AI: {'Claude Opus 4.7 ✅' if brain and brain.is_available else 'Deterministic ❌'}\n"
+            f"• Claude deep scan: every 30 min\n"
+            f"• AI: {'GPT-4o ✅' if brain and brain._gpt_available else '❌'} + {'Claude ✅' if brain and brain._claude_available else 'Claude ❌'}\n"
             f"• TV: {'Connected ✅' if tv_ok else 'Offline ❌'}\n"
             f"• Iron Laws: HARDCODED ✅\n"
+            f"• Auto-protect: 3% trailing stops ✅\n"
             f"• Auto-buy dips: ENABLED (Akash Method)\n"
             f"• Pre/post market: ENABLED (4AM-8PM)"
         )
