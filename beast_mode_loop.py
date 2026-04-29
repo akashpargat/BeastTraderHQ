@@ -256,15 +256,16 @@ class BeastModeLoop:
             self.run_full_scan(now)
             self._last_full_scan = time.time()
 
-        # FAST RUNNER SCAN every 2 min during market hours
-        # This catches runners before the 5-min full scan
+        # FAST RUNNER SCAN every 2 min — DURING ALL SESSIONS (market + pre + after)
+        # Day 5: NOK ran +5% pre-market, we missed it. Day 7: NOK +9.6% pre-market.
+        # RUNNERS DON'T WAIT FOR 9:30. NEITHER DO WE.
         runner_elapsed = time.time() - self._last_runner_scan
-        if is_market and runner_elapsed >= RUNNER_SCAN_INTERVAL:
+        if (is_market or is_premarket or is_afterhours) and runner_elapsed >= RUNNER_SCAN_INTERVAL:
             self._fast_runner_scan(now)
             self._last_runner_scan = time.time()
 
-        # Extended hours scan — runners + earnings reactions (every 10 min)
-        elif is_premarket and elapsed >= EXTENDED_SCAN_INTERVAL:
+        # Extended hours full sector scan (every 10 min)
+        if is_premarket and elapsed >= EXTENDED_SCAN_INTERVAL:
             log.info(f"PRE-MARKET SCAN {now.strftime('%H:%M')}")
             self.run_extended_hours_scan(now, session='premarket')
             self._last_full_scan = time.time()
@@ -880,28 +881,56 @@ class BeastModeLoop:
                 strategy = None
                 confidence = 0.0
                 reason = ""
+                is_extended = now.hour < 9 or (now.hour == 9 and now.minute < 30) or now.hour >= 16
                 
-                # Strategy A: ORB Breakout (1-3% up in first hour with volume)
-                if 1.5 <= pct <= 4.0 and now.hour < 11:
-                    strategy = "ORB_BREAKOUT"
-                    confidence = 0.55 + (0.10 if is_past_winner else 0)
-                    reason = f"ORB Breakout +{pct:.1f}% (first hour)"
+                # ═══ PRE-MARKET / AFTER-HOURS STRATEGIES ═══
+                # Day 5: NOK ran +9.6% pre-market. By open it was gone.
+                # Day 7: Multiple runners in pre-market we missed completely.
+                # LESSON: If it's running pre-market with VOLUME, it runs MORE at open.
                 
-                # Akash Method: Past winner on movers (buy → limit sell → repeat)
-                if is_past_winner and 1.5 <= pct <= 4.0:
-                    strategy = "AKASH_METHOD"
-                    confidence = 0.70  # Past winners get high confidence
-                    reason = f"Akash Method: past winner +{pct:.1f}%"
+                if is_extended:
+                    # Pre-market runner: 2-5% up = early entry before open moon
+                    if is_past_winner and 1.5 <= pct <= 8.0:
+                        strategy = "PREMARKET_PAST_WINNER"
+                        confidence = 0.72  # Past winners in pre-market = HIGH priority
+                        reason = f"🌅 Pre-mkt PAST WINNER +{pct:.1f}% — catch before open!"
+                    elif 2.0 <= pct <= 4.5 and in_our_sectors:
+                        strategy = "PREMARKET_RUNNER"
+                        confidence = 0.62  # Sector stock running pre-market
+                        reason = f"🌅 Pre-mkt runner +{pct:.1f}% — early entry"
+                    elif 4.5 < pct <= 8.0 and in_our_sectors:
+                        strategy = "PREMARKET_MOMENTUM"
+                        confidence = 0.55  # Strong pre-market move, still catchable
+                        reason = f"🌅 Pre-mkt momentum +{pct:.1f}% — limit buy below current"
+                    elif pct > 8.0:
+                        strategy = "PREMARKET_EXTENDED"
+                        confidence = 0.40  # Too extended even for pre-market
+                        reason = f"⚠️ Pre-mkt +{pct:.1f}% — watch for open dip to buy"
                 
-                # Strategy C: Gap & Go (first 5 min only)
-                minutes_since_open = (now.hour - 9) * 60 + (now.minute - 30) if now.hour >= 9 else 0
-                if pct > 3.0 and minutes_since_open <= 5:
-                    strategy = "GAP_AND_GO"
-                    confidence = 0.60
-                    reason = f"Gap & Go +{pct:.1f}% (first 5 min)"
+                # ═══ REGULAR HOURS STRATEGIES ═══
+                else:
+                    # Strategy A: ORB Breakout (1-3% up in first hour with volume)
+                    if 1.5 <= pct <= 4.0 and now.hour < 11:
+                        strategy = "ORB_BREAKOUT"
+                        confidence = 0.55 + (0.10 if is_past_winner else 0)
+                        reason = f"ORB Breakout +{pct:.1f}% (first hour)"
+                    
+                    # Akash Method: Past winner on movers (buy → limit sell → repeat)
+                    if is_past_winner and 1.5 <= pct <= 4.0:
+                        strategy = "AKASH_METHOD"
+                        confidence = 0.70  # Past winners get high confidence
+                        reason = f"Akash Method: past winner +{pct:.1f}%"
+                    
+                    # Strategy C: Gap & Go (first 5 min only)
+                    minutes_since_open = (now.hour - 9) * 60 + (now.minute - 30) if now.hour >= 9 else 0
+                    if pct > 3.0 and minutes_since_open <= 5:
+                        strategy = "GAP_AND_GO"
+                        confidence = 0.60
+                        reason = f"Gap & Go +{pct:.1f}% (first 5 min)"
                 
-                # Rule 29: Don't chase >5% — force limit buy at lower price
-                if pct > 5.0:
+                # Rule 29: Don't chase >5% during market hours only
+                # Pre-market has its own limits above
+                if not is_extended and pct > 5.0:
                     strategy = "LIMIT_DIP_BUY"
                     confidence = 0.45  # Below auto-execute, will alert only
                     reason = f"⚠️ Up {pct:.1f}% — too extended, set limit at VWAP"

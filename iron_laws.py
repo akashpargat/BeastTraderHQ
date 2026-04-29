@@ -321,6 +321,31 @@ def law_30_momentum_rsi_override(rsi: float, has_catalyst: bool, sma_slope_up: b
     return LawResult(True, "RSI check OK", "LAW_30_RSI_MOMENTUM")
 
 
+def law_31_premarket_runners_first(is_premarket: bool, sym: str, pct_change: float,
+                                    is_past_winner: bool) -> LawResult:
+    """LAW 31: Pre-market runners get PRIORITY scanning and execution.
+    Day 5: NOK ran +5% pre-market, we found it 35 min AFTER open = chased at top.
+    Day 7: NOK +9.6% pre-market = gone by open. MU +4.5% pre-market.
+    LESSON: If it's running pre-market with volume, it RUNS MORE at open.
+    Buy the pre-market runner BEFORE the open crowd piles in."""
+    if is_premarket and pct_change >= 2.0:
+        if is_past_winner:
+            return LawResult(
+                True,
+                f"🌅 Law 31: {sym} is a PAST WINNER running +{pct_change:.1f}% pre-market. "
+                f"BUY NOW before open! Don't be Day 5 NOK again.",
+                "LAW_31_PREMARKET_RUNNER"
+            )
+        if pct_change <= 8.0:
+            return LawResult(
+                True,
+                f"🌅 Law 31: {sym} running +{pct_change:.1f}% pre-market. "
+                f"Catch it early before the 9:30 crowd.",
+                "LAW_31_PREMARKET_RUNNER"
+            )
+    return LawResult(True, "Pre-market check OK", "LAW_31_PREMARKET_RUNNER")
+
+
 def check_trading_window() -> LawResult:
     """Check if we're in the allowed trading window.
     Regular: 9:30 AM - 3:55 PM ET

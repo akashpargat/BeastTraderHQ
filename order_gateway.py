@@ -125,11 +125,13 @@ class OrderGateway:
             # Iron Law 2: LIMIT orders only (enforced here)
             try:
                 client_id = f"beast-{uuid.uuid4().hex[:8]}"
+                # Use GTC — GTC limit orders fill during ALL sessions (pre/post/regular)
+                # No need for extended_hours flag (that's only for DAY orders)
                 order_req = LimitOrderRequest(
                     symbol=proposal.symbol,
                     qty=proposal.qty,
                     side=AlpacaSide.BUY,
-                    time_in_force=TimeInForce.DAY,
+                    time_in_force=TimeInForce.GTC,
                     limit_price=proposal.limit_price,
                     client_order_id=client_id,
                 )
@@ -218,6 +220,7 @@ class OrderGateway:
                     time_in_force=tif,
                     limit_price=limit_price,
                     client_order_id=client_id,
+                    # GTC already fills during extended hours; no flag needed
                 )
                 raw_order = self.client.submit_order(order_req)
 
