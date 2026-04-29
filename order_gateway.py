@@ -18,7 +18,7 @@ from typing import Optional
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
-    LimitOrderRequest, GetOrdersRequest
+    LimitOrderRequest, GetOrdersRequest, TrailingStopOrderRequest
 )
 from alpaca.trading.enums import (
     OrderSide as AlpacaSide, TimeInForce, QueryOrderStatus
@@ -243,6 +243,73 @@ class OrderGateway:
 
             except Exception as e:
                 log.error(f"❌ SELL order failed for {symbol}: {e}")
+                return OrderRecord(
+                    symbol=symbol,
+                    side=OrderSide.SELL,
+                    state=OrderState.FAILED,
+                    error=str(e),
+                )
+
+    def place_trailing_stop(self, symbol: str, qty: int, trail_percent: float = 2.0,
+                            reason: str = "trailing runner",
+                            entry_price: float = 0.0) -> OrderRecord:
+        """Place a trailing stop sell order. The stop follows price UP by trail_percent.
+        
+        HOW IT WORKS:
+        - Buy MU at $524. Set 2% trailing stop.
+        - MU rises to $540 → stop is at $529.20 (540 × 0.98)
+        - MU rises to $560 → stop moves to $548.80 (560 × 0.98) 
+        - MU dips to $548 → SELLS at ~$548. Caught $24 more than fixed $540 target!
+        
+        Iron Law 17 enforced: trail_percent minimum 2% (don't give away profits).
+        
+        USE FOR: Runner halves. Scalp halves still use fixed limits for speed.
+        """
+        with self._lock:
+            # Iron Law 17: Minimum 2% trail
+            if trail_percent < 2.0:
+                log.warning(f"⛔ Law 17: Trail {trail_percent}% < 2% minimum. Setting to 2.0%")
+                trail_percent = 2.0
+
+            try:
+                client_id = f"beast-trail-{uuid.uuid4().hex[:8]}"
+                order_req = TrailingStopOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=AlpacaSide.SELL,
+                    time_in_force=TimeInForce.GTC,
+                    trail_percent=trail_percent,
+                    client_order_id=client_id,
+                )
+                raw_order = self.client.submit_order(order_req)
+
+                record = OrderRecord(
+                    id=str(raw_order.id),
+                    client_id=client_id,
+                    symbol=symbol,
+                    side=OrderSide.SELL,
+                    qty=qty,
+                    limit_price=0,  # No fixed price — trails dynamically
+                    state=OrderState.SENT,
+                )
+                self.active_orders[record.id] = record
+                self.last_sell_times[symbol] = datetime.now()
+
+                log.info(
+                    f"✅ TRAILING STOP {qty}x {symbol} trail={trail_percent}% "
+                    f"(entry ${entry_price:.2f}) ({reason})"
+                )
+                return record
+
+            except Exception as e:
+                log.error(f"❌ TRAILING STOP failed for {symbol}: {e}")
+                # Fallback: if trailing stop not supported, use fixed limit
+                fallback_price = round(entry_price * (1 + trail_percent * 2 / 100), 2) if entry_price else 0
+                if fallback_price > 0:
+                    log.info(f"  ↳ Fallback: fixed limit sell @ ${fallback_price:.2f}")
+                    return self.place_sell(symbol, qty, fallback_price,
+                                          reason=f"trail-fallback {reason}",
+                                          entry_price=entry_price)
                 return OrderRecord(
                     symbol=symbol,
                     side=OrderSide.SELL,

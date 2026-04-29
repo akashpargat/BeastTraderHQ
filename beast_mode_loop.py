@@ -25,6 +25,7 @@ import logging
 import time
 import sys
 import os
+import uuid
 import traceback
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -39,6 +40,8 @@ from models import (
     OrderSide, Strategy, Regime, SignalType
 )
 from order_gateway import OrderGateway
+from alpaca.trading.enums import OrderSide as AlpacaSide, TimeInForce
+from alpaca.trading.requests import LimitOrderRequest
 from iron_laws import validate_entry, validate_exit, is_approved, get_rejections
 from regime_detector import RegimeDetector
 from tv_analyst import TradingViewAnalyst
@@ -73,6 +76,14 @@ PREMARKET_END = 9               # 9:30 AM ET (regular opens)
 AFTERHOURS_START = 16           # 4 PM ET
 AFTERHOURS_END = 20             # 8 PM ET
 EXTENDED_SCAN_INTERVAL = 600    # 10 min scans during extended hours
+
+# ── RISK MANAGEMENT CONFIG ────────────────────────────
+MAX_PORTFOLIO_RISK_PCT = 0.05     # Max 5% of portfolio per position
+MAX_DAILY_LOSS = -2000            # Hard stop: halt trading if daily loss exceeds this
+MAX_CORRELATED_POSITIONS = 5      # Max positions in same sector
+TRAIL_PERCENT_RUNNER = 3.0        # 3% trailing stop on runners
+TRAIL_PERCENT_EARNINGS = 5.0      # 5% trail on earnings holds (more room for gaps)
+SHORT_ENABLED = True              # Enable shorting on weak stocks in red days
 
 # ── SECTOR WATCHLISTS (scan ALL of these, not just tech!) ──────
 
@@ -201,6 +212,7 @@ class BeastModeLoop:
         self._alerted_losses = set()
         self._last_notification = {}
         self._runner_alerts = {}     # Track which runners we already alerted
+        self._runner_entry_times = {}  # Track when runner buys happened (for chase protection)
 
         log.info("BEAST MODE LOOP initialized")
         log.info(f"  AI Brain: {'ONLINE' if self.ai and self.ai.is_available else 'OFFLINE (deterministic)'}")
@@ -283,6 +295,22 @@ class BeastModeLoop:
         if is_weekday and hour == 9 and minute == 30 and self.cycle_count % 60 == 0:
             self._market_open_scan(now)
 
+        # ── NEW PRO FEATURES (run every 5 min during market + AH) ──
+        if (is_market or is_afterhours) and self.cycle_count % 5 == 0:
+            positions = self.gateway.get_positions()
+            # Portfolio risk check
+            risk = self._check_portfolio_risk(positions)
+            # Earnings reaction trading (AH only)
+            if is_afterhours:
+                self._check_earnings_reaction(positions, now)
+            # Short weak stocks on red days (market hours only)
+            if is_market:
+                self._scan_short_candidates(positions, now)
+
+        # Macro news scan every 10 min (catches war/Trump/Fed headlines)
+        if (is_market or is_premarket) and self.cycle_count % 10 == 0:
+            self._scan_macro_news(now)
+
         # Hourly report during market hours
         if is_market and hour != self._last_hourly_report:
             self._hourly_report(now)
@@ -296,6 +324,11 @@ class BeastModeLoop:
         - Drop alerts (>2% sudden moves)
         - Target hit detection
         - Iron Law 1 alerts (loss > $500)
+        - CHASE PROTECTION (Iron Law 32): If a pre-market/runner buy drops
+          sharply (-3% from entry within first 10 min), emergency cut.
+          This is the edge case: we caught a runner but it reversed on us.
+          NOK Day 5: bought at $11.24, dropped to $10.98 = -2.3%.
+          Better to cut at -3% and re-enter at support than ride to -8%.
         """
         try:
             positions = self.gateway.get_positions()
@@ -312,6 +345,51 @@ class BeastModeLoop:
         for p in positions:
             sym = p.symbol
             pct = (p.unrealized_pl / p.cost_basis * 100) if p.cost_basis else 0
+
+            # ═══ IRON LAW 32: CHASE PROTECTION ═══════════════
+            # If we bought from a runner scan and it drops -3% from entry
+            # within the first 10 minutes, this was a bad chase — CUT IT.
+            # After 10 min, revert to normal Iron Law 1 (hold until green).
+            # This ONLY applies to runner/pre-market buys (tracked by entry time).
+            entry_time = self._runner_entry_times.get(sym)
+            if entry_time and pct <= -3.0:
+                minutes_held = (now - entry_time).total_seconds() / 60
+                if minutes_held <= 10:
+                    alert_key = f"chasecut_{sym}_{now.strftime('%Y%m%d_%H%M')}"
+                    if alert_key not in self._runner_alerts:
+                        self._runner_alerts[alert_key] = True
+                        log.warning(
+                            f"⚡ CHASE PROTECTION: {sym} dropped {pct:.1f}% from entry "
+                            f"in {minutes_held:.0f} min — EMERGENCY CUT"
+                        )
+                        try:
+                            # Cancel existing sell orders for this symbol first
+                            open_orders = self.gateway.get_orders(status='open')
+                            for o in open_orders:
+                                if o.get('symbol') == sym and o.get('side') == 'sell':
+                                    self.gateway.cancel_order(o['id'])
+                            # Market-like sell: limit at current bid (fast fill)
+                            cut_price = round(p.current_price * 0.998, 2)
+                            self.gateway.place_sell(
+                                sym, p.qty, cut_price,
+                                reason=f"Law 32 chase cut {pct:.1f}% in {minutes_held:.0f}min",
+                                time_in_force='gtc',
+                                entry_price=p.avg_entry
+                            )
+                            self.notify.send(
+                                f"🛑 CHASE PROTECTION: {sym}\n"
+                                f"Dropped {pct:.1f}% from ${p.avg_entry:.2f} in {minutes_held:.0f}min\n"
+                                f"Cut {p.qty}sh @ ${cut_price:.2f}\n"
+                                f"Loss: ${p.unrealized_pl:.2f}\n"
+                                f"Better to cut -3% than ride to -8%"
+                            )
+                            # Remove from runner tracking
+                            del self._runner_entry_times[sym]
+                        except Exception as e:
+                            log.error(f"Chase cut failed {sym}: {e}")
+                elif minutes_held > 10:
+                    # After 10 min, graduate to normal Iron Law 1 (hold)
+                    del self._runner_entry_times[sym]
 
             # Drop detection: >2% drop since last check
             prev_price = self._previous_prices.get(sym, p.current_price)
@@ -342,12 +420,533 @@ class BeastModeLoop:
 
             self._previous_prices[sym] = p.current_price
 
+        # ── DAILY LOSS CIRCUIT BREAKER ────────────────
+        if total_pl <= MAX_DAILY_LOSS and not self.halted:
+            self.halted = True
+            log.critical(f"🛑 CIRCUIT BREAKER: Daily P&L ${total_pl:.2f} <= ${MAX_DAILY_LOSS}. HALTING ALL TRADES.")
+            self.notify.send(f"🛑 CIRCUIT BREAKER TRIGGERED\nDaily loss: ${total_pl:.2f}\nAll trading HALTED until manual reset.")
+
         # Log summary every 5 cycles
         if self.cycle_count % 5 == 0:
             greens = sum(1 for p in positions if p.unrealized_pl > 0)
             reds = len(positions) - greens
             log.info(f"[#{self.cycle_count}] {len(positions)} pos | "
                     f"P&L: ${total_pl:+.2f} | G:{greens} R:{reds}")
+
+    # ── DYNAMIC POSITION SIZING (ATR-based) ───────────
+
+    def _calculate_position_size(self, symbol: str, price: float,
+                                  confidence: float, cash: float) -> int:
+        """Size positions by VOLATILITY (ATR) + confidence, not just price brackets.
+        
+        Pro bots size like this:
+        - High confidence (>70%) + low vol → bigger position (5% of portfolio)
+        - Low confidence (60%) + high vol → smaller position (2% of portfolio)
+        - Never risk more than MAX_PORTFOLIO_RISK_PCT per trade
+        
+        Uses 14-day ATR (Average True Range) to measure volatility.
+        High ATR = stock moves a lot = smaller position for same risk.
+        """
+        try:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.timeframe import TimeFrame
+            client = StockHistoricalDataClient(
+                os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY')
+            )
+            req = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Day,
+                limit=15,
+                feed='iex',
+            )
+            bars = client.get_stock_bars(req)
+            bar_list = bars[symbol] if symbol in bars else []
+            
+            if len(bar_list) >= 2:
+                # Calculate ATR (Average True Range)
+                trs = []
+                for i in range(1, len(bar_list)):
+                    high = float(bar_list[i].high)
+                    low = float(bar_list[i].low)
+                    prev_close = float(bar_list[i-1].close)
+                    tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+                    trs.append(tr)
+                atr = sum(trs) / len(trs) if trs else price * 0.02
+                
+                # ATR as % of price = volatility measure
+                atr_pct = atr / price if price > 0 else 0.02
+                
+                # Risk budget: confidence scales the allocation
+                # 60% conf → 2% of portfolio, 80% → 4%, 100% → 5%
+                risk_pct = min(MAX_PORTFOLIO_RISK_PCT, 0.02 + (confidence - 0.6) * 0.075)
+                risk_budget = cash * risk_pct
+                
+                # Position size = risk budget / ATR (volatile stocks = fewer shares)
+                # Cap single position at risk_budget
+                position_value = min(risk_budget, cash * MAX_PORTFOLIO_RISK_PCT)
+                qty = max(1, int(position_value / price))
+                
+                log.info(f"  📏 ATR sizing {symbol}: ATR=${atr:.2f} ({atr_pct:.1%}), "
+                        f"conf={confidence:.0%}, risk={risk_pct:.1%}, qty={qty}")
+                return qty
+        except Exception as e:
+            log.debug(f"ATR sizing failed for {symbol}: {e}")
+        
+        # Fallback: price-bracket sizing (original method)
+        if price > 500: return 3
+        elif price > 200: return 5
+        elif price > 100: return 10
+        elif price > 50: return 25
+        elif price > 20: return 50
+        else: return 200
+
+    # ── PORTFOLIO RISK CHECK ──────────────────────────
+
+    def _check_portfolio_risk(self, positions: list) -> dict:
+        """Check portfolio health: correlation, concentration, drawdown.
+        
+        Returns risk report with:
+        - sector_concentration: positions per sector
+        - max_position_pct: largest position as % of portfolio
+        - total_exposure: long vs short exposure
+        - correlation_warning: if too many same-sector positions
+        """
+        acct = self.gateway.get_account()
+        equity = float(acct.get('equity', 100000))
+        
+        # Sector concentration check
+        sector_counts = {}
+        for p in positions:
+            for sector_name, symbols in ALL_SECTORS.items():
+                if p.symbol in symbols:
+                    sector_counts[sector_name] = sector_counts.get(sector_name, 0) + 1
+        
+        # Largest position check
+        max_pos_pct = 0
+        max_pos_sym = ""
+        for p in positions:
+            pos_pct = p.market_value / equity * 100 if equity > 0 else 0
+            if pos_pct > max_pos_pct:
+                max_pos_pct = pos_pct
+                max_pos_sym = p.symbol
+        
+        # Warnings
+        warnings = []
+        for sector, count in sector_counts.items():
+            if count > MAX_CORRELATED_POSITIONS:
+                warnings.append(f"⚠️ {sector}: {count} positions (max {MAX_CORRELATED_POSITIONS})")
+        
+        if max_pos_pct > 10:
+            warnings.append(f"⚠️ {max_pos_sym} is {max_pos_pct:.1f}% of portfolio (>10%)")
+        
+        total_long = sum(p.market_value for p in positions if p.side == 'long')
+        total_short = sum(abs(p.market_value) for p in positions if p.side == 'short')
+        
+        report = {
+            'sector_counts': sector_counts,
+            'max_position': (max_pos_sym, max_pos_pct),
+            'long_exposure': total_long,
+            'short_exposure': total_short,
+            'net_exposure': total_long - total_short,
+            'warnings': warnings,
+        }
+        
+        if warnings:
+            for w in warnings:
+                log.warning(w)
+        
+        return report
+
+    # ── EARNINGS REACTION TRADING ─────────────────────
+
+    def _check_earnings_reaction(self, positions: list, now: datetime):
+        """After earnings report: if stock gaps up >3% AH, buy MORE.
+        If stock gaps down >5% AH, cut the position.
+        
+        Pro bots actively trade the after-hours reaction:
+        - Beat + gap up → add to position (momentum continues at open)
+        - Miss + gap down → cut remaining (damage control)
+        """
+        if now.hour < 16 or now.hour > 20:
+            return  # Only check during after-hours
+        
+        for p in positions:
+            sym = p.symbol
+            pct = (p.current_price - p.avg_entry) / p.avg_entry * 100 if p.avg_entry > 0 else 0
+            
+            # Check if stock is gapping up >3% after hours (earnings beat signal)
+            prev_price = self._previous_prices.get(sym, p.avg_entry)
+            if prev_price > 0:
+                ah_change = (p.current_price - prev_price) / prev_price * 100
+            else:
+                ah_change = 0
+            
+            # Gap up >3% in AH = earnings beat → buy more
+            if ah_change > 3.0 and pct > 0:
+                alert_key = f"earnings_add_{sym}_{now.strftime('%Y%m%d')}"
+                if alert_key not in self._runner_alerts:
+                    self._runner_alerts[alert_key] = True
+                    acct = self.gateway.get_account()
+                    cash = float(acct.get('cash', 0))
+                    add_qty = self._calculate_position_size(sym, p.current_price, 0.75, cash)
+                    add_qty = max(1, add_qty // 2)  # Half size for AH (less liquidity)
+                    
+                    try:
+                        from models import TradeProposal, Strategy as StratEnum
+                        proposal = TradeProposal(
+                            symbol=sym, qty=add_qty, side=OrderSide.BUY,
+                            limit_price=round(p.current_price * 1.002, 2),
+                            strategy=StratEnum.ORB_BREAKOUT,
+                            confidence=0.75,
+                        )
+                        self.gateway.place_buy(
+                            proposal, None, positions, self.daily_pnl,
+                            self.consecutive_losses, self.active_day_trades,
+                            self.last_sell_times, self.earnings_dates,
+                        )
+                        # Trail the add-on
+                        self.gateway.place_trailing_stop(sym, add_qty,
+                            trail_percent=TRAIL_PERCENT_EARNINGS,
+                            reason="Earnings beat add-on",
+                            entry_price=p.current_price)
+                        
+                        msg = (f"📈 EARNINGS BEAT ADD: {sym}\n"
+                              f"AH gap: +{ah_change:.1f}%\n"
+                              f"Adding {add_qty}sh @ ${p.current_price:.2f}\n"
+                              f"Trailing 5% stop on add-on")
+                        log.info(msg)
+                        self.notify.send(msg)
+                    except Exception as e:
+                        log.error(f"Earnings add failed {sym}: {e}")
+            
+            # Gap down >5% in AH = earnings miss → cut position
+            elif ah_change < -5.0:
+                alert_key = f"earnings_cut_{sym}_{now.strftime('%Y%m%d')}"
+                if alert_key not in self._runner_alerts:
+                    self._runner_alerts[alert_key] = True
+                    cut_qty = p.qty // 2  # Cut half, keep half for recovery
+                    if cut_qty > 0:
+                        cut_price = round(p.current_price * 0.998, 2)
+                        try:
+                            self.gateway.place_sell(sym, cut_qty, cut_price,
+                                reason=f"Earnings miss cut {ah_change:.1f}%",
+                                entry_price=p.avg_entry)
+                            msg = (f"📉 EARNINGS MISS CUT: {sym}\n"
+                                  f"AH gap: {ah_change:.1f}%\n"
+                                  f"Cutting {cut_qty}sh @ ${cut_price:.2f}\n"
+                                  f"Keeping {p.qty - cut_qty}sh for recovery")
+                            log.info(msg)
+                            self.notify.send(msg)
+                        except Exception as e:
+                            log.error(f"Earnings cut failed {sym}: {e}")
+
+    # ── SHORT SELLING (weak stocks on red days) ───────
+
+    def _scan_short_candidates(self, positions: list, now: datetime):
+        """Short weak stocks that are breaking down on red days.
+        
+        Criteria for shorting:
+        1. Market is RED (SPY down >0.5%)
+        2. Stock is down >2% today with increasing volume
+        3. Stock is NOT in our long positions (no hedging same stock)
+        4. RSI > 65 on daily (overbought + breaking = momentum short)
+        
+        Risk: Stop at +2% above entry (max loss 2%)
+        Target: -3% to -5% drop for cover
+        """
+        if not SHORT_ENABLED:
+            return
+        
+        spy_change = self._get_spy_change()
+        if spy_change > -0.005:  # SPY needs to be down >0.5%
+            return
+        
+        held_symbols = [p.symbol for p in positions]
+        movers = self._get_movers()
+        if not movers:
+            return
+        
+        losers = [m for m in movers.get('losers', [])
+                  if m.get('price', 0) > 10 
+                  and m.get('percent_change', 0) < -2.0
+                  and m.get('symbol', '') not in held_symbols]
+        
+        acct = self.gateway.get_account()
+        cash = float(acct.get('cash', 0))
+        
+        for m in losers[:3]:  # Max 3 shorts at a time
+            sym = m.get('symbol', '')
+            price = m.get('price', 0)
+            pct = m.get('percent_change', 0)
+            
+            # Check if it's in our sector universe
+            in_sectors = any(sym in stocks for stocks in ALL_SECTORS.values())
+            if not in_sectors:
+                continue
+            
+            alert_key = f"short_{sym}_{now.strftime('%Y%m%d')}"
+            if alert_key in self._runner_alerts:
+                continue
+            self._runner_alerts[alert_key] = True
+            
+            qty = self._calculate_position_size(sym, price, 0.55, cash)
+            qty = max(1, qty // 2)  # Half size for shorts (more risk)
+            
+            try:
+                from models import TradeProposal, Strategy as StratEnum
+                proposal = TradeProposal(
+                    symbol=sym, qty=qty, side=OrderSide.SELL,
+                    limit_price=round(price * 0.998, 2),  # Slight discount
+                    strategy=StratEnum.ORB_BREAKOUT,
+                    confidence=0.60,
+                    reason=f"Short: {sym} {pct:.1f}% on red day (SPY {spy_change:.1%})",
+                )
+                # Place short sell
+                client_id = f"beast-short-{uuid.uuid4().hex[:8]}"
+                from alpaca.trading.requests import LimitOrderRequest
+                order_req = LimitOrderRequest(
+                    symbol=sym, qty=qty, side=AlpacaSide.SELL,
+                    time_in_force=TimeInForce.GTC,
+                    limit_price=round(price * 0.998, 2),
+                    client_order_id=client_id,
+                )
+                raw_order = self.gateway.client.submit_order(order_req)
+                
+                # Set cover (buy to close) at -3% = profit target
+                cover_price = round(price * 0.97, 2)
+                cover_id = f"beast-cover-{uuid.uuid4().hex[:8]}"
+                cover_req = LimitOrderRequest(
+                    symbol=sym, qty=qty, side=AlpacaSide.BUY,
+                    time_in_force=TimeInForce.GTC,
+                    limit_price=cover_price,
+                    client_order_id=cover_id,
+                )
+                self.gateway.client.submit_order(cover_req)
+                
+                msg = (f"🩳 SHORT: {sym}\n"
+                      f"SELL {qty}sh @ ${price:.2f} ({pct:.1f}% today)\n"
+                      f"Cover target: ${cover_price:.2f} (-3%)\n"
+                      f"SPY: {spy_change:.1%} (red day)")
+                log.info(msg)
+                self.notify.send(msg)
+            except Exception as e:
+                log.error(f"Short failed {sym}: {e}")
+
+    # ── MACRO NEWS SCANNER (war/Trump/Fed/oil → sector rotation) ──
+
+    # Keyword → sector mapping: when these headlines appear, scan these sectors
+    MACRO_SECTOR_MAP = {
+        # War / Geopolitics
+        'war': ['defense', 'energy', 'commodities'],
+        'iran': ['energy', 'defense', 'commodities'],
+        'china': ['semi', 'defense', 'commodities'],
+        'taiwan': ['semi', 'defense'],
+        'russia': ['energy', 'defense', 'commodities'],
+        'ukraine': ['energy', 'defense', 'commodities'],
+        'missile': ['defense', 'space'],
+        'military': ['defense', 'space'],
+        'sanctions': ['energy', 'financials', 'commodities'],
+        'nato': ['defense'],
+        'strait': ['energy', 'commodities'],  # Strait of Hormuz = oil
+        'opec': ['energy'],
+        'middle east': ['energy', 'defense'],
+        'north korea': ['defense'],
+        'tariff': ['semi', 'consumer', 'commodities'],
+        
+        # Trump / Politics
+        'trump': ['energy', 'defense', 'financials', 'consumer'],
+        'executive order': ['energy', 'defense', 'cloud_it'],
+        'deregulation': ['financials', 'energy'],
+        'trade war': ['semi', 'consumer', 'commodities'],
+        'stimulus': ['financials', 'consumer', 'cloud_it'],
+        
+        # Fed / Economy
+        'fed': ['financials', 'cloud_it'],
+        'rate cut': ['financials', 'cloud_it', 'consumer'],
+        'rate hike': ['financials', 'commodities'],
+        'inflation': ['energy', 'commodities', 'financials'],
+        'recession': ['consumer', 'financials'],
+        'jobs report': ['financials', 'consumer'],
+        'gdp': ['financials', 'consumer'],
+        'cpi': ['energy', 'commodities', 'financials'],
+        
+        # Oil / Energy specific
+        'oil': ['energy'],
+        'crude': ['energy'],
+        'natural gas': ['energy'],
+        'pipeline': ['energy'],
+        'refinery': ['energy'],
+        'brent': ['energy'],
+        
+        # Tech specific
+        'ai ': ['semi', 'cloud_it', 'mag7'],
+        'artificial intelligence': ['semi', 'cloud_it', 'mag7'],
+        'chips act': ['semi'],
+        'semiconductor': ['semi'],
+        'data center': ['semi', 'cloud_it', 'energy'],
+        'openai': ['semi', 'cloud_it', 'mag7'],
+        'nvidia': ['semi'],
+        
+        # Sector events
+        'fda': ['medical'],
+        'drug approval': ['medical'],
+        'clinical trial': ['medical'],
+        'solar': ['solar'],
+        'renewable': ['solar'],
+        'ev ': ['consumer', 'energy'],
+        'electric vehicle': ['consumer'],
+        'crypto': ['financials'],
+        'bitcoin': ['financials'],
+        'space': ['space'],
+        'launch': ['space'],
+        '5g': ['telecom'],
+        'telecom': ['telecom'],
+    }
+
+    def _scan_macro_news(self, now: datetime):
+        """Scan financial news headlines for macro events that drive sector rotation.
+        
+        Day 6: Iran/oil → energy stocks ran +2.5% while tech tanked.
+        We didn't scan energy until Akash yelled. NEVER AGAIN.
+        
+        This auto-detects:
+        - War headlines → scan defense + energy
+        - Trump tariffs → scan semis + consumer
+        - Fed rate moves → scan financials
+        - Oil spikes → scan energy
+        - AI news → scan semis + cloud
+        
+        Uses Yahoo Finance + Google News RSS (no API key needed).
+        """
+        alert_key = f"macro_{now.strftime('%Y%m%d_%H')}"
+        if alert_key in self._runner_alerts:
+            return  # Already scanned this hour
+        
+        log.info("📰 Scanning macro news for sector rotation signals...")
+        
+        headlines = []
+        
+        # Source 1: Yahoo Finance RSS
+        try:
+            import urllib.request
+            import xml.etree.ElementTree as ET
+            url = "https://finance.yahoo.com/news/rssindex"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = resp.read().decode('utf-8', errors='ignore')
+                root = ET.fromstring(data)
+                for item in root.findall('.//item')[:20]:
+                    title = item.find('title')
+                    if title is not None and title.text:
+                        headlines.append(title.text.lower())
+        except Exception as e:
+            log.debug(f"Yahoo RSS failed: {e}")
+        
+        # Source 2: Google News RSS for finance
+        try:
+            import urllib.request
+            import xml.etree.ElementTree as ET
+            url = "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx6TVdZU0FtVnVHZ0pWVXlnQVAB"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = resp.read().decode('utf-8', errors='ignore')
+                root = ET.fromstring(data)
+                for item in root.findall('.//item')[:20]:
+                    title = item.find('title')
+                    if title is not None and title.text:
+                        headlines.append(title.text.lower())
+        except Exception as e:
+            log.debug(f"Google News RSS failed: {e}")
+        
+        # Source 3: Reddit hot headlines
+        try:
+            import urllib.request
+            import json
+            for sub in ['worldnews', 'economics', 'stocks']:
+                url = f"https://www.reddit.com/r/{sub}/hot.json?limit=10"
+                req = urllib.request.Request(url, headers={'User-Agent': 'BeastBot/1.0'})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read())
+                    for post in data.get('data', {}).get('children', []):
+                        title = post.get('data', {}).get('title', '').lower()
+                        if title:
+                            headlines.append(title)
+        except Exception as e:
+            log.debug(f"Reddit news failed: {e}")
+        
+        if not headlines:
+            log.info("  No headlines fetched")
+            return
+        
+        # Match headlines to sectors
+        triggered_sectors = {}  # sector → list of matching headlines
+        for headline in headlines:
+            for keyword, sectors in self.MACRO_SECTOR_MAP.items():
+                if keyword in headline:
+                    for sector in sectors:
+                        if sector not in triggered_sectors:
+                            triggered_sectors[sector] = []
+                        if headline not in triggered_sectors[sector]:
+                            triggered_sectors[sector].append(headline[:80])
+        
+        if not triggered_sectors:
+            log.info("  No macro triggers detected")
+            return
+        
+        self._runner_alerts[alert_key] = True
+        
+        # Log and alert
+        log.info(f"  🌍 MACRO TRIGGERS: {len(triggered_sectors)} sectors flagged")
+        alert_lines = ["🌍 MACRO NEWS ROTATION ALERT\n"]
+        priority_sectors = []
+        
+        for sector, matched in sorted(triggered_sectors.items(),
+                                       key=lambda x: len(x[1]), reverse=True):
+            count = len(matched)
+            sector_upper = sector.upper()
+            stocks = ALL_SECTORS.get(sector, [])[:5]
+            alert_lines.append(f"  {sector_upper} ({count} hits): {', '.join(stocks)}")
+            log.info(f"  📰 {sector_upper}: {count} headline matches")
+            for h in matched[:2]:
+                log.info(f"     → {h}")
+            
+            if count >= 2:  # Multiple headlines = strong signal
+                priority_sectors.append(sector)
+        
+        # Send alert
+        if priority_sectors:
+            alert_lines.append(f"\n🔥 PRIORITY SCAN: {', '.join(s.upper() for s in priority_sectors)}")
+            self.notify.send('\n'.join(alert_lines))
+            
+            # Auto-scan priority sectors for runners
+            for sector in priority_sectors:
+                symbols = ALL_SECTORS.get(sector, [])
+                if symbols:
+                    log.info(f"  🔍 Auto-scanning {sector}: {', '.join(symbols[:8])}")
+                    try:
+                        from alpaca.data.historical import StockHistoricalDataClient
+                        from alpaca.data.requests import StockSnapshotRequest
+                        client = StockHistoricalDataClient(
+                            os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY')
+                        )
+                        req = StockSnapshotRequest(
+                            symbol_or_symbols=symbols[:10], feed='iex'
+                        )
+                        snaps = client.get_stock_snapshot(req)
+                        
+                        for sym, s in snaps.items():
+                            try:
+                                prev = float(s.previous_daily_bar.close) if s.previous_daily_bar else 0
+                                curr = float(s.latest_trade.price) if s.latest_trade else 0
+                                if prev > 0 and curr > 0:
+                                    pct = (curr - prev) / prev * 100
+                                    if pct > 2.0:
+                                        log.info(f"     🔥 {sym} +{pct:.1f}% (macro catalyst!)")
+                            except:
+                                pass
+                    except Exception as e:
+                        log.debug(f"Macro sector scan failed for {sector}: {e}")
 
     # ── FULL SCAN (every 5 min) ────────────────────────
 
@@ -575,18 +1174,21 @@ class BeastModeLoop:
                                 self.last_sell_times, self.earnings_dates,
                             )
                             # Iron Law 6: set sells immediately
+                            # SCALP: fixed limit
                             self.gateway.place_sell(sym, half, scalp_target,
                                 reason=f"Scalp {c['strategy']}", time_in_force='gtc',
                                 entry_price=price)
-                            self.gateway.place_sell(sym, qty - half, runner_target,
-                                reason=f"Runner {c['strategy']}", time_in_force='gtc',
+                            # RUNNER: trailing stop!
+                            self.gateway.place_trailing_stop(sym, qty - half,
+                                trail_percent=3.0,
+                                reason=f"Runner {c['strategy']}",
                                 entry_price=price)
                             
                             msg = (f"🔥 AUTO-BUY: {sym}\n"
                                   f"Strategy: {c['strategy']} ({conf:.0%})\n"
                                   f"BUY {qty}sh @ ${price:.2f}\n"
-                                  f"Scalp: {half}sh @ ${scalp_target}\n"
-                                  f"Runner: {qty-half}sh @ ${runner_target}")
+                                  f"Scalp: {half}sh @ ${scalp_target} (fixed)\n"
+                                  f"Runner: {qty-half}sh trailing 3% 📈")
                             log.info(msg)
                             self.notify.send(msg)
                         else:
@@ -623,18 +1225,21 @@ class BeastModeLoop:
                                 self.consecutive_losses, self.active_day_trades,
                                 self.last_sell_times, self.earnings_dates,
                             )
+                            # SCALP: fixed limit
                             self.gateway.place_sell(sym, half, scalp_target,
                                 reason=f"Scalp {c['strategy']}", time_in_force='gtc',
                                 entry_price=price)
-                            self.gateway.place_sell(sym, qty - half, runner_target,
-                                reason=f"Runner {c['strategy']}", time_in_force='gtc',
+                            # RUNNER: trailing stop!
+                            self.gateway.place_trailing_stop(sym, qty - half,
+                                trail_percent=3.0,
+                                reason=f"Runner {c['strategy']}",
                                 entry_price=price)
                             
                             msg = (f"⚡ AUTO-BUY: {sym}\n"
                                   f"{c['strategy']} ({conf:.0%})\n"
                                   f"BUY {qty}sh @ ${price:.2f}\n"
-                                  f"Scalp {half}sh @ ${scalp_target}\n"
-                                  f"Runner {qty-half}sh @ ${runner_target}")
+                                  f"Scalp {half}sh @ ${scalp_target} (fixed)\n"
+                                  f"Runner {qty-half}sh trailing 3% 📈")
                             log.info(msg)
                             self.notify.send(msg)
                         else:
@@ -938,19 +1543,8 @@ class BeastModeLoop:
                 if not strategy:
                     continue
                 
-                # ── POSITION SIZING ────────────────────
-                if price > 500:
-                    qty = 3
-                elif price > 200:
-                    qty = 5
-                elif price > 100:
-                    qty = 10
-                elif price > 50:
-                    qty = 25
-                elif price > 20:
-                    qty = 50
-                else:
-                    qty = 200  # Cheap stocks (NOK territory) = big size for scalps
+                # ── POSITION SIZING (ATR-based, not fixed brackets) ────
+                qty = self._calculate_position_size(sym, price, confidence, cash)
                 
                 cost = qty * price
                 if cost > cash * 0.15:  # Max 15% of cash per trade
@@ -991,20 +1585,26 @@ class BeastModeLoop:
                                 self.active_day_trades, self.last_sell_times,
                                 self.earnings_dates,
                             )
+                            # Iron Law 32: Track entry time for chase protection
+                            self._runner_entry_times[sym] = now
                             # Iron Law 6: Set sells within 60 sec
+                            # SCALP half: fixed limit (want guaranteed fill at target)
                             self.gateway.place_sell(sym, scalp_qty, scalp_target,
                                 reason=f"Scalp {strategy}", time_in_force='gtc',
                                 entry_price=price)
-                            self.gateway.place_sell(sym, runner_qty, runner_target,
-                                reason=f"Runner {strategy}", time_in_force='gtc',
+                            # RUNNER half: TRAILING STOP (let winners run!)
+                            # 3% trail = if stock runs from $100→$120, stop moves to $116.40
+                            self.gateway.place_trailing_stop(sym, runner_qty,
+                                trail_percent=3.0,
+                                reason=f"Runner {strategy}",
                                 entry_price=price)
                             
                             msg = (
                                 f"🔥 AUTO-TRADE: {sym}\n"
                                 f"Strategy: {strategy}\n"
                                 f"BUY {qty}sh @ ${price:.2f} ({confidence:.0%})\n"
-                                f"Scalp: {scalp_qty}sh @ ${scalp_target:.2f}\n"
-                                f"Runner: {runner_qty}sh @ ${runner_target:.2f}\n"
+                                f"Scalp: {scalp_qty}sh @ ${scalp_target:.2f} (fixed)\n"
+                                f"Runner: {runner_qty}sh trailing 3% 📈\n"
                                 f"{reason}"
                             )
                             log.info(msg)
@@ -1045,18 +1645,23 @@ class BeastModeLoop:
                                 self.active_day_trades, self.last_sell_times,
                                 self.earnings_dates,
                             )
+                            # Iron Law 32: Track entry time for chase protection
+                            self._runner_entry_times[sym] = now
+                            # SCALP: fixed limit
                             self.gateway.place_sell(sym, scalp_qty, scalp_target,
                                 reason=f"Scalp {strategy}", time_in_force='gtc',
                                 entry_price=price)
-                            self.gateway.place_sell(sym, runner_qty, runner_target,
-                                reason=f"Runner {strategy}", time_in_force='gtc',
+                            # RUNNER: trailing stop (let winners run!)
+                            self.gateway.place_trailing_stop(sym, runner_qty,
+                                trail_percent=3.0,
+                                reason=f"Runner {strategy}",
                                 entry_price=price)
                             
                             msg = (f"⚡ AUTO-BUY (runner): {sym}\n"
                                   f"Strategy: {strategy} ({confidence:.0%})\n"
                                   f"BUY {qty}sh @ ${price:.2f}\n"
-                                  f"Scalp {scalp_qty}sh @ ${scalp_target}\n"
-                                  f"Runner {runner_qty}sh @ ${runner_target}")
+                                  f"Scalp {scalp_qty}sh @ ${scalp_target} (fixed)\n"
+                                  f"Runner {runner_qty}sh trailing 3% 📈")
                             log.info(msg)
                             self.notify.send(msg)
                         else:

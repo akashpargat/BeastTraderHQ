@@ -346,6 +346,26 @@ def law_31_premarket_runners_first(is_premarket: bool, sym: str, pct_change: flo
     return LawResult(True, "Pre-market check OK", "LAW_31_PREMARKET_RUNNER")
 
 
+def law_32_chase_protection(pct_from_entry: float, minutes_held: float) -> LawResult:
+    """LAW 32: Chase protection — emergency cut if runner buy reverses fast.
+    If a runner/pre-market buy drops -3% from entry within first 10 minutes,
+    the position monitor auto-sells. After 10 min, reverts to Iron Law 1 (hold).
+    
+    NOK Day 5: Bought at +5% (chasing), dropped to -2.3% = -$480.
+    If we had cut at -3% in first 10 min, loss would've been capped.
+    
+    This is an EDGE CASE safety net. Most runner buys work. But when they
+    don't, cutting fast at -3% beats riding to -8%."""
+    if minutes_held <= 10 and pct_from_entry <= -3.0:
+        return LawResult(
+            False,
+            f"🛑 Iron Law 32: Runner buy dropped {pct_from_entry:.1f}% in {minutes_held:.0f}min. "
+            f"EMERGENCY CUT — this was a bad chase. Re-enter at support.",
+            "LAW_32_CHASE_PROTECTION"
+        )
+    return LawResult(True, "Chase protection OK", "LAW_32_CHASE_PROTECTION")
+
+
 def check_trading_window() -> LawResult:
     """Check if we're in the allowed trading window.
     Regular: 9:30 AM - 3:55 PM ET
