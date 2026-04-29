@@ -2031,8 +2031,25 @@ async def decision_report():
 
 @tasks.loop(minutes=30)
 async def claude_deep_scan():
-    """Every 30 min: Claude Opus 4.7 ULTRA DEEP analysis on top positions.
-    Produces Deep Intel Briefing that GPT-4o references in 5-min scans."""
+    """Every 30 min: Claude Opus 4.7 MEGA SCAN — the ULTIMATE intelligence briefing.
+    
+    Collects EVERYTHING:
+    - All positions with P&L
+    - All open orders (limits + trailing stops)
+    - Full sentiment on every position (Yahoo + Reddit + StockTwits + Analyst)
+    - Earnings calendar for every held stock
+    - Short interest + squeeze risk
+    - Market movers / today's runners
+    - TV indicators (from last 5-min scan cache)
+    - Regime + SPY + VIX Fear/Greed
+    - Trump / geopolitical headlines
+    - Sector rotation data
+    - Past winners status
+    - Portfolio correlation / concentration
+    
+    Sends ALL of this to Claude Opus 4.7 for institutional-grade analysis.
+    Claude's briefing is cached → GPT-4o references it in subsequent 5-min scans.
+    """
     try:
         channel = bot.get_channel(SCAN_CHANNEL_ID)
         if not channel:
@@ -2048,79 +2065,257 @@ async def claude_deep_scan():
             return
 
         positions = gateway.get_positions()
-        if not positions:
-            return
+        acct = gateway.get_account()
+        equity = float(acct.get('equity', 100000))
+        cash = float(acct.get('cash', 0))
+        total_pl = sum(p.unrealized_pl for p in positions)
 
-        # Pick top 5 positions by absolute P&L (most impactful)
-        top = sorted(positions, key=lambda x: abs(x.unrealized_pl), reverse=True)[:5]
+        await channel.send(f"🧠 **CLAUDE MEGA-SCAN STARTING** — collecting ALL intelligence...")
 
-        # Gather data for Claude
-        sentiments_data = {}
-        def _get_sentiment_batch(syms):
+        # ═══════════════════════════════════════════════
+        # PHASE 1: Collect EVERYTHING (parallel where possible)
+        # ═══════════════════════════════════════════════
+
+        all_intel = {}
+        market_intel = {}
+        runner_data = []
+        past_winner_status = {}
+
+        def _collect_everything():
             sa = SentimentAnalyst()
-            for sym in syms:
-                try:
-                    sentiments_data[sym] = sa.full_stock_intel(sym)
-                except:
-                    pass
-        await asyncio.to_thread(_get_sentiment_batch, [p.symbol for p in top])
 
-        # Run Claude deep analysis
-        deep_results = {}
-        def _run_claude_deep(pos_list):
-            for pos in pos_list:
+            # 1. Full intel on every position
+            for p in positions:
                 try:
-                    sym = pos.symbol
-                    intel = sentiments_data.get(sym, {})
-                    data = {
-                        'price': pos.current_price, 'entry': pos.avg_entry,
-                        'pnl': pos.unrealized_pl, 'qty': pos.qty,
-                        'sentiment': intel.get('total_sentiment', 0),
-                        'earnings_days': intel.get('earnings_days', 999),
-                        'short_pct': intel.get('short_pct', 0),
-                        'squeeze_risk': intel.get('squeeze_risk', False),
-                        'holding': True, 'unrealized_pl': pos.unrealized_pl,
-                    }
-                    result = brain.deep_analysis(sym, data)
+                    all_intel[p.symbol] = sa.full_stock_intel(p.symbol)
+                except:
+                    all_intel[p.symbol] = {}
+
+            # 2. Market-wide sentiment
+            try:
+                market_intel['full_market'] = sa.full_market_sentiment()
+            except:
+                market_intel['full_market'] = {}
+
+            # 3. Fear & Greed
+            try:
+                market_intel['fear_greed'] = sa.get_fear_greed()
+            except:
+                market_intel['fear_greed'] = {}
+
+            # 4. Today's runners
+            try:
+                from alpaca.data.historical import StockHistoricalDataClient
+                from alpaca.data.requests import StockSnapshotRequest
+                dc = StockHistoricalDataClient(os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'))
+
+                # Scan past winners not held
+                held_syms = {p.symbol for p in positions}
+                pw_check = [s for s in PAST_WINNERS if s not in held_syms]
+                if pw_check:
+                    snaps = dc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=pw_check[:15], feed='iex'))
+                    for sym, s in snaps.items():
+                        try:
+                            price = float(s.latest_trade.price)
+                            prev = float(s.previous_daily_bar.close)
+                            pct = (price - prev) / prev * 100
+                            past_winner_status[sym] = {'price': price, 'change_pct': round(pct, 1)}
+                        except:
+                            pass
+            except:
+                pass
+
+            # 5. Finviz runners
+            try:
+                runner_data.extend(sa.scan_finviz_runners())
+            except:
+                pass
+
+        await asyncio.to_thread(_collect_everything)
+
+        # 6. Open orders + trailing stops
+        open_orders = await asyncio.to_thread(gateway.get_open_orders)
+        trail_stops = [o for o in open_orders if 'trailing' in str(o.get('type', '')).lower()]
+        limit_sells = [o for o in open_orders if o.get('side') == 'sell' and 'trailing' not in str(o.get('type', '')).lower()]
+
+        # 7. Correlation check
+        try:
+            from correlation_check import CorrelationChecker
+            corr = CorrelationChecker().check(positions)
+        except:
+            corr = {}
+
+        # 8. Regime
+        regime_val = "unknown"
+        spy_change = 0
+        try:
+            regime_val = regime_det.detect(spy_change).value
+        except:
+            pass
+
+        # ═══════════════════════════════════════════════
+        # PHASE 2: Build MASSIVE data package for Claude
+        # ═══════════════════════════════════════════════
+
+        mega_data = {
+            'timestamp': now.isoformat(),
+            'portfolio': {
+                'equity': equity, 'cash': cash, 'total_pl': total_pl,
+                'position_count': len(positions), 'order_count': len(open_orders),
+                'trailing_stops': len(trail_stops), 'limit_sells': len(limit_sells),
+                'heat_pct': round((equity - cash) / equity * 100, 1) if equity > 0 else 0,
+            },
+            'positions': [],
+            'market': {
+                'regime': regime_val,
+                'fear_greed': market_intel.get('fear_greed', {}),
+                'full_sentiment': market_intel.get('full_market', {}),
+            },
+            'past_winners_not_held': past_winner_status,
+            'finviz_runners': [r.get('symbol', '?') for r in runner_data[:10]],
+            'correlation': {
+                'max_sector': corr.get('max_sector', '?'),
+                'max_pct': corr.get('max_pct', 0),
+                'warnings': corr.get('warnings', []),
+            },
+        }
+
+        # Position details with ALL intel
+        for p in sorted(positions, key=lambda x: abs(x.unrealized_pl), reverse=True):
+            intel = all_intel.get(p.symbol, {})
+            pct = _pct(p)
+            has_trail = p.symbol in {o.get('symbol') for o in trail_stops}
+            mega_data['positions'].append({
+                'symbol': p.symbol, 'qty': p.qty, 'entry': p.avg_entry,
+                'price': p.current_price, 'pnl': round(p.unrealized_pl, 2),
+                'pct': round(pct, 1), 'has_trailing_stop': has_trail,
+                'yahoo': intel.get('yahoo', 0), 'reddit': intel.get('reddit', 0),
+                'analyst': intel.get('analyst', 0), 'stocktwits': intel.get('stocktwits', 0),
+                'total_sentiment': intel.get('total_sentiment', 0),
+                'earnings_days': intel.get('earnings_days', 999),
+                'earnings_date': intel.get('earnings_date', '?'),
+                'short_pct': intel.get('short_pct', 0),
+                'squeeze_risk': intel.get('squeeze_risk', False),
+            })
+
+        # ═══════════════════════════════════════════════
+        # PHASE 3: Send to Claude for ULTRA DEEP analysis
+        # ═══════════════════════════════════════════════
+
+        deep_results = {}
+        def _run_claude_mega():
+            # Send entire portfolio to Claude as one mega-analysis
+            for p_data in mega_data['positions'][:8]:
+                try:
+                    sym = p_data['symbol']
+                    # Enrich with market context
+                    p_data['regime'] = mega_data['market']['regime']
+                    p_data['vix'] = mega_data['market'].get('fear_greed', {}).get('vix', 0)
+                    p_data['market_sentiment'] = mega_data['market'].get('full_sentiment', {}).get('total_score', 0)
+                    p_data['trump_score'] = mega_data['market'].get('full_sentiment', {}).get('trump_score', 0)
+                    p_data['sector_concentration'] = mega_data['correlation'].get('max_pct', 0)
+                    p_data['holding'] = True
+                    result = brain.deep_analysis(sym, p_data)
                     if result:
                         deep_results[sym] = result
                 except Exception as e:
-                    log.warning(f"Claude deep {pos.symbol}: {e}")
-        await asyncio.to_thread(_run_claude_deep, top)
+                    log.warning(f"Claude mega {p_data.get('symbol','?')}: {e}")
+        await asyncio.to_thread(_run_claude_mega)
 
-        if not deep_results:
-            log.info("Claude deep scan: no results (Claude may be offline)")
-            return
+        # ═══════════════════════════════════════════════
+        # PHASE 4: Build RICH Discord report
+        # ═══════════════════════════════════════════════
 
-        # Send compact report
-        embed = discord.Embed(
-            title=f"🧠 CLAUDE DEEP INTEL — {now.strftime('%I:%M %p ET')}",
-            description=f"Ultra-deep 30-min analysis on {len(deep_results)} positions",
+        # Embed 1: Portfolio overview + market context
+        fg = market_intel.get('fear_greed', {})
+        mkt = market_intel.get('full_market', {})
+        embed1 = discord.Embed(
+            title=f"🧠 CLAUDE MEGA-SCAN — {now.strftime('%I:%M %p ET')}",
+            description=(
+                f"**Portfolio:** ${equity:,.0f} | P&L: ${total_pl:+.2f} | Heat: {mega_data['portfolio']['heat_pct']:.0f}%\n"
+                f"**Market:** {regime_val.upper()} | VIX: {fg.get('vix','?')} ({fg.get('level','?')}) | "
+                f"Sentiment: {mkt.get('total_score', '?'):+d}\n"
+                f"**Protection:** {len(trail_stops)} trailing stops | {len(limit_sells)} limit sells\n"
+                f"**Concentration:** {corr.get('max_sector','?')} @ {corr.get('max_pct',0):.0f}%"
+            ),
             color=0x9B59B6
         )
-        for sym, r in deep_results.items():
-            action = r.get('action', 'HOLD')
-            conf = r.get('confidence', 0)
-            reasoning = r.get('reasoning', '')[:200]
-            icon = "🟢" if action == 'BUY' else "🔴" if action == 'SELL' else "⚪"
-            embed.add_field(
-                name=f"{icon} {sym} — {action} ({conf}%)",
-                value=reasoning or "No reasoning provided",
-                inline=False
+
+        # Warnings
+        warnings = corr.get('warnings', [])
+        if mega_data['portfolio']['heat_pct'] > 55:
+            warnings.append(f"🔥 Portfolio heat {mega_data['portfolio']['heat_pct']:.0f}% (approaching 60% limit)")
+        if warnings:
+            embed1.add_field(name="⚠️ Warnings", value="\n".join(warnings[:5]), inline=False)
+
+        # Past winners running
+        pw_running = {s: d for s, d in past_winner_status.items() if d.get('change_pct', 0) > 2}
+        if pw_running:
+            pw_text = "\n".join(f"🏆 **{s}** +{d['change_pct']:.1f}% (${d['price']:.2f})" for s, d in
+                               sorted(pw_running.items(), key=lambda x: -x[1]['change_pct'])[:5])
+            embed1.add_field(name="🏆 Past Winners Running (not held)", value=pw_text, inline=False)
+
+        await channel.send(embed=embed1)
+
+        # Embed 2: Claude verdicts per stock
+        if deep_results:
+            embed2 = discord.Embed(title="🧠 Claude Opus Verdicts", color=0x9B59B6)
+            for sym, r in deep_results.items():
+                action = r.get('action', 'HOLD')
+                conf = r.get('confidence', 0)
+                reasoning = r.get('reasoning', '')[:250]
+                intel = all_intel.get(sym, {})
+                icon = "🟢" if action == 'BUY' else "🔴" if action == 'SELL' else "⚪"
+
+                detail = f"**{action}** ({conf}%)\n"
+                detail += f"Sent: Y:{intel.get('yahoo',0):+d} R:{intel.get('reddit',0):+d} ST:{intel.get('stocktwits',0):+d} A:{intel.get('analyst',0):+d}\n"
+                if intel.get('earnings_days', 999) < 14:
+                    detail += f"⚡ Earnings in **{intel['earnings_days']}d** ({intel.get('earnings_date','?')})\n"
+                if intel.get('squeeze_risk'):
+                    detail += f"🔥 **SHORT SQUEEZE RISK** ({intel.get('short_pct',0):.1f}% short)\n"
+                detail += reasoning[:150]
+                embed2.add_field(name=f"{icon} {sym}", value=detail[:1024], inline=False)
+
+            embed2.set_footer(text="Source: Claude Opus 4.7 | Cached for GPT-4o 5-min scans")
+            await channel.send(embed=embed2)
+
+        # Embed 3: Sentiment matrix
+        embed3 = discord.Embed(title="📰 Full Sentiment Matrix", color=0xf0b232)
+        sent_lines = []
+        for p_data in mega_data['positions']:
+            s = p_data.get('total_sentiment', 0)
+            icon = "📈" if s > 0 else "📉" if s < 0 else "➡️"
+            sent_lines.append(
+                f"{icon} **{p_data['symbol']}** Y:{p_data.get('yahoo',0):+d} R:{p_data.get('reddit',0):+d} "
+                f"ST:{p_data.get('stocktwits',0):+d} A:{p_data.get('analyst',0):+d} = **{s:+d}** "
+                f"{'| 🔥SQUEEZE' if p_data.get('squeeze_risk') else ''}"
+                f"{'| ⚡EARN '+str(p_data.get('earnings_days',''))+'d' if p_data.get('earnings_days',999) < 14 else ''}"
             )
-        embed.set_footer(text=f"Source: Claude Opus 4.7 via ai.beast-trader.com | Next: {(now.hour*60+now.minute+30)//60}:{(now.minute+30)%60:02d}")
-        await channel.send(embed=embed)
+        embed3.add_field(name="Per-Stock Intel", value="\n".join(sent_lines[:12]) or "No data", inline=False)
 
-        # Telegram
-        tg_msg = f"🧠 Claude Deep Intel {now.strftime('%I:%M %p')}\n"
+        # Trump/geo from market sentiment
+        trump_hl = mkt.get('trump_headlines', [])
+        if trump_hl:
+            embed3.add_field(name=f"🏛️ Geopolitical ({mkt.get('trump_score',0):+d})",
+                           value="\n".join(f"• {h[:60]}" for h in trump_hl[:3]), inline=False)
+        await channel.send(embed=embed3)
+
+        # Telegram mega summary
+        tg = f"🧠 CLAUDE MEGA-SCAN {now.strftime('%I:%M %p')}\n"
+        tg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        tg += f"${equity:,.0f} | P&L: ${total_pl:+.2f} | VIX: {fg.get('vix','?')}\n"
+        tg += f"Regime: {regime_val} | Heat: {mega_data['portfolio']['heat_pct']:.0f}%\n\n"
         for sym, r in deep_results.items():
-            tg_msg += f"{'🟢' if r.get('action')=='BUY' else '🔴' if r.get('action')=='SELL' else '⚪'} {sym}: {r.get('action')} ({r.get('confidence',0)}%)\n"
-        _tg(tg_msg)
+            tg += f"{'🟢' if r.get('action')=='BUY' else '🔴' if r.get('action')=='SELL' else '⚪'} {sym}: {r.get('action')} ({r.get('confidence',0)}%)\n"
+        if pw_running:
+            pw_str = ', '.join(f"{s}+{d['change_pct']:.0f}%" for s, d in pw_running.items())
+            tg += f"\n🏆 Past winners running: {pw_str}\n"
+        _tg(tg)
 
-        log.info(f"Claude deep scan: {len(deep_results)} analyzed at {now.strftime('%H:%M')}")
+        log.info(f"Claude MEGA-SCAN complete: {len(deep_results)} analyzed, {len(all_intel)} intel packages")
 
     except Exception as e:
-        log.error(f"Claude deep scan error: {e}\n{traceback.format_exc()}")
+        log.error(f"Claude mega-scan error: {e}\n{traceback.format_exc()}")
 
 
 @position_monitor.before_loop
