@@ -62,8 +62,8 @@ logging.basicConfig(
 POSITION_INTERVAL = 60     # seconds - position monitoring
 FULL_SCAN_INTERVAL = 300   # seconds - full scan with TV + sentiment + AI
 RUNNER_SCAN_INTERVAL = 120 # seconds - FAST runner/movers check (every 2 min!)
-AUTO_EXECUTE_THRESHOLD = 0.80  # 80%+ confidence = auto-execute
-ASK_THRESHOLD = 0.60           # 60-80% = ask Discord for approval
+AUTO_EXECUTE_THRESHOLD = 0.60  # 60%+ confidence = AUTO-BUY. Matches our Confidence Engine "Strong Buy" threshold.
+ASK_THRESHOLD = 0.60           # Same — we're fully autonomous. Below 60% = no trade (Iron Law 10: when in doubt, do nothing)
 
 # ── EXTENDED HOURS CONFIG ──────────────────────────────
 ENABLE_PREMARKET = True        # Trade pre-market 4:00-9:30 AM ET
@@ -473,6 +473,175 @@ class BeastModeLoop:
             action_table.append(line)
             log.info(f"  {line}")
 
+        # ── PHASE 7B: NEW BUY OPPORTUNITIES ───────────
+        log.info("Phase 7B: Scanning for NEW buys...")
+        if not self.halted and len(positions) < 15:
+            # Check movers for buy opportunities
+            buy_candidates = []
+            all_movers = []
+            if movers:
+                all_movers = [m for m in movers.get('gainers', [])
+                             if m.get('price', 0) > 5 and m.get('percent_change', 0) > 1.5
+                             and m.get('percent_change', 0) < 8  # Rule 29: don't chase >8%
+                             and m.get('symbol', '') not in held_symbols]
+
+            for m in all_movers[:10]:
+                sym = m.get('symbol', '')
+                pct_move = m.get('percent_change', 0)
+                price = m.get('price', 0)
+                
+                is_past_winner = sym in PAST_WINNERS
+                in_sectors = any(sym in stocks for stocks in ALL_SECTORS.values())
+                
+                if not is_past_winner and not in_sectors:
+                    continue
+                
+                # Score it
+                confidence = 0.50  # Base
+                strategy_name = "SECTOR_MOMENTUM"
+                
+                if is_past_winner:
+                    confidence += 0.15  # Past winners get big boost
+                    strategy_name = "PAST_WINNER"
+                if 1.5 <= pct_move <= 3.5:
+                    confidence += 0.10  # Sweet spot, not chasing
+                if pct_move > 5:
+                    confidence -= 0.15  # Extended, risky
+                    strategy_name = "EXTENDED_CAUTION"
+                
+                # Sentiment boost if available
+                sent = sentiments.get(sym)
+                if sent and hasattr(sent, 'overall_score') and sent.overall_score > 60:
+                    confidence += 0.05
+                
+                buy_candidates.append({
+                    'symbol': sym, 'price': price, 'pct': pct_move,
+                    'confidence': min(confidence, 0.95),
+                    'strategy': strategy_name,
+                    'is_past_winner': is_past_winner,
+                })
+            
+            # Sort by confidence
+            buy_candidates.sort(key=lambda x: x['confidence'], reverse=True)
+            
+            for c in buy_candidates[:3]:  # Top 3 candidates
+                sym = c['symbol']
+                conf = c['confidence']
+                price = c['price']
+                
+                # Size it
+                if price > 500: qty = 3
+                elif price > 200: qty = 5
+                elif price > 100: qty = 10
+                elif price > 50: qty = 25
+                elif price > 20: qty = 50
+                else: qty = 200
+                
+                cost = qty * price
+                cash = float(acct.get('cash', 0))
+                if cost > cash * 0.15:
+                    qty = max(1, int(cash * 0.15 / price))
+                
+                flag = "🔥 PAST WINNER" if c['is_past_winner'] else "📊"
+                log.info(f"  {flag} BUY CANDIDATE: {sym} ${price:.2f} "
+                        f"+{c['pct']:.1f}% conf={conf:.0%} strategy={c['strategy']}")
+                
+                if conf >= AUTO_EXECUTE_THRESHOLD:
+                    # AUTO-BUY!
+                    scalp_target = round(price * 1.025, 2)
+                    runner_target = round(price * 1.06, 2)
+                    
+                    try:
+                        from models import TradeProposal, Strategy as StratEnum
+                        proposal = TradeProposal(
+                            symbol=sym, qty=qty,
+                            side=OrderSide.BUY,
+                            limit_price=round(price * 1.002, 2),
+                            strategy=StratEnum.ORB_BREAKOUT,
+                            confidence=conf,
+                        )
+                        results = validate_entry(
+                            proposal, None, positions, total_pl,
+                            self.consecutive_losses, self.active_day_trades,
+                            self.last_sell_times, self.earnings_dates,
+                            has_technicals=True, has_sentiment=True,
+                        )
+                        if is_approved(results):
+                            half = qty // 2
+                            self.gateway.place_buy(
+                                proposal, None, positions, total_pl,
+                                self.consecutive_losses, self.active_day_trades,
+                                self.last_sell_times, self.earnings_dates,
+                            )
+                            # Iron Law 6: set sells immediately
+                            self.gateway.place_sell(sym, half, scalp_target,
+                                reason=f"Scalp {c['strategy']}", time_in_force='gtc',
+                                entry_price=price)
+                            self.gateway.place_sell(sym, qty - half, runner_target,
+                                reason=f"Runner {c['strategy']}", time_in_force='gtc',
+                                entry_price=price)
+                            
+                            msg = (f"🔥 AUTO-BUY: {sym}\n"
+                                  f"Strategy: {c['strategy']} ({conf:.0%})\n"
+                                  f"BUY {qty}sh @ ${price:.2f}\n"
+                                  f"Scalp: {half}sh @ ${scalp_target}\n"
+                                  f"Runner: {qty-half}sh @ ${runner_target}")
+                            log.info(msg)
+                            self.notify.send(msg)
+                        else:
+                            rejections = get_rejections(results)
+                            log.info(f"    BLOCKED: {rejections[0].reason}")
+                    except Exception as e:
+                        log.error(f"    Auto-buy failed {sym}: {e}")
+                        
+                elif conf >= ASK_THRESHOLD:
+                    # AUTO-BUY even at lower confidence — WE ARE FULLY AUTONOMOUS
+                    # Past winners get auto-bought at any confidence above threshold
+                    scalp_target = round(price * 1.025, 2)
+                    runner_target = round(price * 1.06, 2)
+                    
+                    try:
+                        from models import TradeProposal, Strategy as StratEnum
+                        proposal = TradeProposal(
+                            symbol=sym, qty=qty,
+                            side=OrderSide.BUY,
+                            limit_price=round(price * 1.002, 2),
+                            strategy=StratEnum.ORB_BREAKOUT,
+                            confidence=conf,
+                        )
+                        results = validate_entry(
+                            proposal, None, positions, total_pl,
+                            self.consecutive_losses, self.active_day_trades,
+                            self.last_sell_times, self.earnings_dates,
+                            has_technicals=True, has_sentiment=True,
+                        )
+                        if is_approved(results):
+                            half = qty // 2
+                            self.gateway.place_buy(
+                                proposal, None, positions, total_pl,
+                                self.consecutive_losses, self.active_day_trades,
+                                self.last_sell_times, self.earnings_dates,
+                            )
+                            self.gateway.place_sell(sym, half, scalp_target,
+                                reason=f"Scalp {c['strategy']}", time_in_force='gtc',
+                                entry_price=price)
+                            self.gateway.place_sell(sym, qty - half, runner_target,
+                                reason=f"Runner {c['strategy']}", time_in_force='gtc',
+                                entry_price=price)
+                            
+                            msg = (f"⚡ AUTO-BUY: {sym}\n"
+                                  f"{c['strategy']} ({conf:.0%})\n"
+                                  f"BUY {qty}sh @ ${price:.2f}\n"
+                                  f"Scalp {half}sh @ ${scalp_target}\n"
+                                  f"Runner {qty-half}sh @ ${runner_target}")
+                            log.info(msg)
+                            self.notify.send(msg)
+                        else:
+                            rejections = get_rejections(results)
+                            log.info(f"    BLOCKED: {rejections[0].reason}")
+                    except Exception as e:
+                        log.error(f"    Auto-buy failed {sym}: {e}")
+
         # ── PHASE 8: RISK CHECK ────────────────────────
         log.info("Phase 8: Risk check...")
         self._risk_check(positions, total_pl)
@@ -640,10 +809,10 @@ class BeastModeLoop:
         - Stock at VWAP with momentum → Strategy B (VWAP Bounce)
         - Gap up first 5 min → Strategy C (Gap & Go)
         
-        EXECUTION:
-        - >80% confidence → AUTO-BUY + set split sells in 60 sec
-        - 60-80% → Alert Discord, wait for approval
-        - <60% → Alert only, no trade
+        EXECUTION — FULLY AUTONOMOUS:
+        - >45% confidence → AUTO-BUY + set split sells in 60 sec
+        - Iron Laws still enforced (can't override safety)
+        - No waiting for Discord approval. Bot BUYS.
         
         Day 5: NOK ran +5% in 15 min. We found it 35 min late.
         Day 6: Oil ran +2.5% and we didn't scan until asked.
@@ -818,16 +987,54 @@ class BeastModeLoop:
                         log.error(f"Auto-trade failed {sym}: {e}")
                     
                 elif confidence >= ASK_THRESHOLD:
-                    # ALERT: 60-80% — ask for approval
-                    msg = (
-                        f"📊 RUNNER FOUND: {sym}\n"
-                        f"Strategy: {strategy} ({confidence:.0%})\n"
-                        f"Price: ${price:.2f} (+{pct:.1f}%)\n"
-                        f"{reason}\n"
-                        f"Suggested: {qty}sh = ${cost:,.0f}"
-                    )
-                    log.info(f"  RUNNER: {sym} {pct:+.1f}% conf={confidence:.0%}")
-                    self.notify.send(msg)
+                    # FULLY AUTONOMOUS — AUTO-BUY at lower confidence too
+                    scalp_qty = qty // 2
+                    runner_qty = qty - scalp_qty
+                    scalp_target = round(price * 1.025, 2)
+                    runner_target = round(price * 1.06, 2)
+                    
+                    try:
+                        from models import TradeProposal, Strategy as StratEnum
+                        proposal = TradeProposal(
+                            symbol=sym, qty=qty,
+                            side=OrderSide.BUY,
+                            limit_price=round(price * 1.002, 2),
+                            strategy=StratEnum.ORB_BREAKOUT,
+                            confidence=confidence,
+                        )
+                        results = validate_entry(
+                            proposal, None, list(held.values()),
+                            self.daily_pnl, self.consecutive_losses,
+                            self.active_day_trades, self.last_sell_times,
+                            self.earnings_dates,
+                            has_technicals=True, has_sentiment=True,
+                        )
+                        if is_approved(results):
+                            self.gateway.place_buy(
+                                proposal, None, list(held.values()),
+                                self.daily_pnl, self.consecutive_losses,
+                                self.active_day_trades, self.last_sell_times,
+                                self.earnings_dates,
+                            )
+                            self.gateway.place_sell(sym, scalp_qty, scalp_target,
+                                reason=f"Scalp {strategy}", time_in_force='gtc',
+                                entry_price=price)
+                            self.gateway.place_sell(sym, runner_qty, runner_target,
+                                reason=f"Runner {strategy}", time_in_force='gtc',
+                                entry_price=price)
+                            
+                            msg = (f"⚡ AUTO-BUY (runner): {sym}\n"
+                                  f"Strategy: {strategy} ({confidence:.0%})\n"
+                                  f"BUY {qty}sh @ ${price:.2f}\n"
+                                  f"Scalp {scalp_qty}sh @ ${scalp_target}\n"
+                                  f"Runner {runner_qty}sh @ ${runner_target}")
+                            log.info(msg)
+                            self.notify.send(msg)
+                        else:
+                            rejections = get_rejections(results)
+                            log.info(f"  BLOCKED: {rejections[0].reason}")
+                    except Exception as e:
+                        log.error(f"Auto-buy runner failed {sym}: {e}")
                 
                 else:
                     # LOG ONLY: <60%
