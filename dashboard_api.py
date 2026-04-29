@@ -302,7 +302,8 @@ def index():
             '/api/scans', '/api/equity', '/api/analytics',
             '/api/system', '/api/debug', '/api/alerts', '/api/health',
             '/api/intraday', '/api/actions', '/api/sentiment',
-            '/api/runners', '/api/sectors', '/api/trailing-stops', '/api/news'
+            '/api/runners', '/api/sectors', '/api/trailing-stops', '/api/news',
+            '/api/sharpe', '/api/correlation', '/api/daily-pnl',
         ]
     })
 
@@ -493,6 +494,45 @@ def news_feed():
         })
     except Exception as e:
         return jsonify({'error': str(e)})
+
+
+# ── SHARPE + DRAWDOWN ─────────────────────────────────
+
+@app.route('/api/sharpe')
+def sharpe_ratio():
+    """Sharpe ratio and max drawdown."""
+    db = _get_db()
+    if not db:
+        return jsonify({'error': 'no db'})
+    sharpe = db.calculate_sharpe()
+    drawdown = db.calculate_max_drawdown()
+    db.close()
+    return jsonify({**sharpe, **drawdown})
+
+
+# ── CORRELATION CHECK ─────────────────────────────────
+
+@app.route('/api/correlation')
+def correlation():
+    """Portfolio correlation check."""
+    from correlation_check import CorrelationChecker
+    gw = _get_gateway()
+    positions = gw.get_positions()
+    checker = CorrelationChecker()
+    return jsonify(checker.check(positions))
+
+
+# ── DAILY P&L ─────────────────────────────────────────
+
+@app.route('/api/daily-pnl')
+def daily_pnl_api():
+    """Today's P&L."""
+    db = _get_db()
+    if not db:
+        return jsonify({'error': 'no db'})
+    result = db.get_daily_pnl()
+    db.close()
+    return jsonify(result)
 
 
 if __name__ == '__main__':

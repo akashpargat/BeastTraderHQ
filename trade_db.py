@@ -477,5 +477,126 @@ class TradeDB:
         """)
         self.conn.commit()
 
+    # ── Sharpe Ratio & Drawdown ─────────────────────────
+
+    def calculate_sharpe(self, days: int = 30) -> dict:
+        """Calculate Sharpe ratio from equity_curve table.
+        Sharpe = (avg_daily_return - risk_free) / std_daily_return
+        Risk-free rate ~ 5% annual = 0.0137% daily"""
+        rows = self.conn.execute("""
+            SELECT equity, timestamp FROM equity_curve
+            WHERE timestamp >= datetime('now', ?)
+            ORDER BY timestamp ASC
+        """, (f'-{days} days',)).fetchall()
+
+        if len(rows) < 2:
+            return {'sharpe': 0.0, 'avg_return': 0.0, 'volatility': 0.0, 'max_drawdown': 0.0}
+
+        equities = [float(r['equity']) for r in rows if r['equity']]
+        if len(equities) < 2:
+            return {'sharpe': 0.0, 'avg_return': 0.0, 'volatility': 0.0, 'max_drawdown': 0.0}
+
+        # Daily returns
+        daily_returns = []
+        for i in range(1, len(equities)):
+            if equities[i - 1] > 0:
+                daily_returns.append((equities[i] - equities[i - 1]) / equities[i - 1])
+
+        if not daily_returns:
+            return {'sharpe': 0.0, 'avg_return': 0.0, 'volatility': 0.0, 'max_drawdown': 0.0}
+
+        avg_ret = sum(daily_returns) / len(daily_returns)
+        variance = sum((r - avg_ret) ** 2 for r in daily_returns) / len(daily_returns)
+        std_ret = variance ** 0.5
+        risk_free_daily = 0.05 / 365  # ~0.0137% daily
+
+        sharpe = ((avg_ret - risk_free_daily) / std_ret * (252 ** 0.5)) if std_ret > 0 else 0.0
+
+        # Max drawdown inline
+        peak = equities[0]
+        max_dd = 0.0
+        for eq in equities:
+            if eq > peak:
+                peak = eq
+            dd = (peak - eq) / peak if peak > 0 else 0
+            if dd > max_dd:
+                max_dd = dd
+
+        return {
+            'sharpe': round(sharpe, 2),
+            'avg_return': round(avg_ret * 100, 4),
+            'volatility': round(std_ret * 100, 4),
+            'max_drawdown': round(max_dd * 100, 2),
+        }
+
+    def calculate_max_drawdown(self, days: int = 30) -> dict:
+        """Max drawdown from peak equity."""
+        rows = self.conn.execute("""
+            SELECT equity FROM equity_curve
+            WHERE timestamp >= datetime('now', ?)
+            ORDER BY timestamp ASC
+        """, (f'-{days} days',)).fetchall()
+
+        if not rows:
+            return {'max_drawdown_pct': 0.0, 'max_drawdown_usd': 0.0,
+                    'peak_equity': 0.0, 'trough_equity': 0.0}
+
+        equities = [float(r['equity']) for r in rows if r['equity']]
+        if not equities:
+            return {'max_drawdown_pct': 0.0, 'max_drawdown_usd': 0.0,
+                    'peak_equity': 0.0, 'trough_equity': 0.0}
+
+        peak = equities[0]
+        max_dd_pct = 0.0
+        max_dd_usd = 0.0
+        peak_at = peak
+        trough_at = peak
+
+        for eq in equities:
+            if eq > peak:
+                peak = eq
+            dd_usd = peak - eq
+            dd_pct = dd_usd / peak if peak > 0 else 0
+            if dd_pct > max_dd_pct:
+                max_dd_pct = dd_pct
+                max_dd_usd = dd_usd
+                peak_at = peak
+                trough_at = eq
+
+        return {
+            'max_drawdown_pct': round(max_dd_pct * 100, 2),
+            'max_drawdown_usd': round(max_dd_usd, 2),
+            'peak_equity': round(peak_at, 2),
+            'trough_equity': round(trough_at, 2),
+        }
+
+    def get_daily_pnl(self) -> dict:
+        """Get today's P&L from equity_curve (difference from first entry today to latest).
+        Returns {'daily_pnl': float, 'daily_pct': float, 'open_equity': float, 'current_equity': float}"""
+        rows = self.conn.execute("""
+            SELECT equity FROM equity_curve
+            WHERE date(timestamp) = date('now')
+            ORDER BY timestamp ASC
+        """).fetchall()
+
+        if len(rows) < 1:
+            return {'daily_pnl': 0.0, 'daily_pct': 0.0, 'open_equity': 0.0, 'current_equity': 0.0}
+
+        equities = [float(r['equity']) for r in rows if r['equity']]
+        if not equities:
+            return {'daily_pnl': 0.0, 'daily_pct': 0.0, 'open_equity': 0.0, 'current_equity': 0.0}
+
+        open_eq = equities[0]
+        current_eq = equities[-1]
+        pnl = current_eq - open_eq
+        pct = (pnl / open_eq * 100) if open_eq > 0 else 0.0
+
+        return {
+            'daily_pnl': round(pnl, 2),
+            'daily_pct': round(pct, 2),
+            'open_equity': round(open_eq, 2),
+            'current_equity': round(current_eq, 2),
+        }
+
     def close(self):
         self.conn.close()

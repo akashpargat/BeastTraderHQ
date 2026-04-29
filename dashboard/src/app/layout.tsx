@@ -14,6 +14,12 @@ const navLinks = [
   { href: '/scans', label: '🔍 Scans' },
   { href: '/analytics', label: '📈 Analytics' },
   { href: '/system', label: '⚙️ System' },
+  { href: '/runners', label: '🏃 Runners' },
+  { href: '/sectors', label: '🗺️ Sectors' },
+  { href: '/stops', label: '🛡️ Stops' },
+  { href: '/news', label: '📰 News' },
+  { href: '/ai', label: '🧠 AI' },
+  { href: '/activity', label: '📋 Activity' },
 ]
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

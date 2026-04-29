@@ -18,8 +18,9 @@ from typing import Optional
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
-    LimitOrderRequest, GetOrdersRequest, TrailingStopOrderRequest
+    LimitOrderRequest, GetOrdersRequest, TrailingStopOrderRequest,
 )
+from alpaca.trading.enums import OrderClass
 from alpaca.trading.enums import (
     OrderSide as AlpacaSide, TimeInForce, QueryOrderStatus
 )
@@ -174,6 +175,19 @@ class OrderGateway:
         """Simplified buy for auto-dip-buy. Skips Iron Laws validation (quick entry)."""
         with self._lock:
             try:
+                # Check portfolio heat (max 60% invested)
+                try:
+                    acct = self.client.get_account()
+                    equity = float(acct.equity)
+                    long_value = float(acct.long_market_value)
+                    heat = long_value / equity if equity > 0 else 1.0
+                    if heat > 0.60:
+                        log.warning(f"⛔ HEAT LIMIT: Portfolio {heat:.0%} invested (max 60%). Blocking buy.")
+                        return OrderRecord(symbol=symbol, side=OrderSide.BUY, state=OrderState.REJECTED,
+                                          error=f"Heat limit: {heat:.0%} > 60%")
+                except:
+                    pass
+
                 # Anti-buyback-higher: refuse to buy if we sold this stock today at a lower price
                 sold_price = self.last_sell_prices.get(symbol)
                 if sold_price and limit_price > sold_price * 1.01:
@@ -354,6 +368,48 @@ class OrderGateway:
                     error=str(e),
                 )
 
+    def place_bracket_order(self, symbol: str, qty: int, limit_price: float,
+                            take_profit: float, stop_loss: float,
+                            reason: str = "bracket") -> OrderRecord:
+        """Place buy with automatic take-profit + stop-loss (OCO).
+        All 3 legs in one order — when one fills, other cancels."""
+        with self._lock:
+            try:
+                client_id = f"beast-bracket-{uuid.uuid4().hex[:8]}"
+                order_req = LimitOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=AlpacaSide.BUY,
+                    time_in_force=TimeInForce.GTC,
+                    limit_price=limit_price,
+                    order_class=OrderClass.BRACKET,
+                    take_profit={'limit_price': take_profit},
+                    stop_loss={'stop_price': stop_loss},
+                    client_order_id=client_id,
+                )
+                raw_order = self.client.submit_order(order_req)
+                record = OrderRecord(
+                    id=str(raw_order.id),
+                    client_id=client_id,
+                    symbol=symbol,
+                    side=OrderSide.BUY,
+                    qty=qty,
+                    limit_price=limit_price,
+                    state=OrderState.SENT,
+                )
+                self.active_orders[record.id] = record
+                log.info(
+                    f"✅ BRACKET {qty}x {symbol} @ ${limit_price:.2f} "
+                    f"TP=${take_profit:.2f} SL=${stop_loss:.2f} ({reason})"
+                )
+                return record
+            except Exception as e:
+                log.error(f"❌ BRACKET order failed for {symbol}: {e}")
+                return OrderRecord(
+                    symbol=symbol, side=OrderSide.BUY,
+                    state=OrderState.FAILED, error=str(e),
+                )
+
     def place_split_entry(self, proposal: TradeProposal, market_data,
                           positions, daily_pnl, consecutive_losses,
                           active_day_trades, earnings_dates,
@@ -519,3 +575,27 @@ class OrderGateway:
         except Exception as e:
             log.error(f"Open orders fetch failed: {e}")
             return []
+
+    def cleanup_stale_orders(self, max_age_days: int = 3) -> list:
+        """Cancel GTC orders older than max_age_days. Returns cancelled order IDs.
+        Skips trailing stops (they're protective)."""
+        cancelled = []
+        try:
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            orders = self.client.get_orders(req)
+            cutoff = datetime.now() - timedelta(days=max_age_days)
+            for o in orders:
+                # Don't cancel trailing stops — they protect profits
+                if o.type and str(o.type.value) == 'trailing_stop':
+                    continue
+                created = o.created_at
+                if created and created.replace(tzinfo=None) < cutoff:
+                    try:
+                        self.client.cancel_order_by_id(str(o.id))
+                        cancelled.append(str(o.id))
+                        log.info(f"🧹 Cancelled stale order {o.symbol} ({o.id}) — {max_age_days}+ days old")
+                    except Exception as ce:
+                        log.warning(f"Failed to cancel stale order {o.id}: {ce}")
+        except Exception as e:
+            log.error(f"Stale order cleanup failed: {e}")
+        return cancelled
