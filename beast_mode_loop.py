@@ -130,13 +130,22 @@ CONSUMER = ['NKE', 'SBUX', 'COST', 'WMT', 'TGT', 'HD', 'LOW', 'LULU']
 # Financials
 FINANCIALS = ['JPM', 'GS', 'MS', 'BAC', 'WFC', 'C', 'SCHW', 'BLK']
 
+# Leveraged ETFs — 3x exposure for earnings/momentum plays
+# Day 7: SOXL +7.4% while we watched. NEVER AGAIN.
+LEVERAGED_ETFS = ['SOXL', 'TQQQ', 'FNGU', 'UPRO', 'SPXL',  # 3x BULL
+                  'SOXS', 'SQQQ', 'TZA', 'SPXS',              # 3x BEAR (for hedging)
+                  'BITO']                                        # Bitcoin ETF
+
+# Fintech / High-volume momentum — these show up on most_active daily
+FINTECH_MOMENTUM = ['HOOD', 'SOFI', 'COIN', 'MSTR', 'SQ', 'PYPL', 'AFRM', 'UPST']
+
 # Blue chips (proven winners for Strategy I — Mean Reversion)
 BLUE_CHIPS = ['CRM', 'NOW', 'PLTR', 'LMT', 'NOK']
 
 # PAST WINNERS — Rule #21: Check these FIRST on every scan!
 # These stocks have PROVEN they work for our style.
 PAST_WINNERS = ['NOK', 'GOOGL', 'CRM', 'META', 'MSFT', 'NOW', 'AMD', 'NVDA',
-                'OXY', 'DVN', 'INTC']
+                'OXY', 'DVN', 'INTC', 'SOFI', 'COIN']
 
 # ALL SECTORS combined for full market scan
 ALL_SECTORS = {
@@ -152,6 +161,8 @@ ALL_SECTORS = {
     'commodities': COMMODITIES,
     'consumer': CONSUMER,
     'financials': FINANCIALS,
+    'leveraged_etfs': LEVERAGED_ETFS,
+    'fintech': FINTECH_MOMENTUM,
 }
 
 # Strategy label to Strategy enum
@@ -1692,48 +1703,162 @@ class BeastModeLoop:
     # ── HELPER: MOVERS ─────────────────────────────────
 
     def _get_movers(self) -> dict:
-        """Get market movers from Alpaca."""
+        """Get REAL market runners — not just our watchlist.
+        
+        Day 7 LESSON: Bot only scanned 150 stocks from our watchlist.
+        The market has 10,000+. INTC ran +11%, SOXL +7.4%, HOOD on
+        most_active — we missed all because they weren't in our scan.
+        
+        NEW APPROACH (3-layer detection):
+        
+        Layer 1: MOST ACTIVE stocks (Alpaca screener)
+          → Top 20 by volume. If it's trading massive volume AND
+            up >3% from previous close, it's a runner. Period.
+          → This catches stocks OUTSIDE our watchlist.
+        
+        Layer 2: OUR WATCHLIST snapshots (175+ stocks across 14 sectors)
+          → Compare current price to previous close for every stock
+            in our universe. Catches sector-specific runners.
+        
+        Layer 3: PAST WINNERS priority check
+          → If any past winner is up >1.5%, flag it immediately.
+          → These stocks have PROVEN they work for us.
+        
+        FILTERS:
+        - Price > $5 (no penny stocks)
+        - Symbol doesn't end in 'W' (no warrants)
+        - Volume > 100K (needs liquidity for fills)
+        
+        Returns: {
+            'gainers': [{symbol, price, percent_change}, ...] sorted by % desc
+            'losers': [{symbol, price, percent_change}, ...] sorted by % asc
+            'actives': [raw most_active data]
+            'runners': [{symbol, price, percent_change, source}, ...] — THE MONEY LIST
+        }
+        """
+        result = {'gainers': [], 'losers': [], 'actives': [], 'runners': []}
+        seen_symbols = set()
+        
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockSnapshotRequest
+        
+        client = StockHistoricalDataClient(
+            os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY')
+        )
+        
+        # ═══ LAYER 1: MOST ACTIVE STOCKS (catches runners OUTSIDE our watchlist) ═══
         try:
-            from alpaca.data.historical import StockHistoricalDataClient
-            client = StockHistoricalDataClient(
-                os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY')
-            )
-            # Use Alpaca screener
             from alpaca.data.requests import MostActivesRequest
-            req = MostActivesRequest(top=10, by='volume')
+            req = MostActivesRequest(top=20, by='volume')
             actives = client.get_most_actives(req)
-            return {'gainers': [], 'losers': [], 'actives': actives}
-        except Exception:
-            pass
-        # Fallback: use snapshots of our watchlist
-        try:
-            from alpaca.data.historical import StockHistoricalDataClient
-            from alpaca.data.requests import StockSnapshotRequest
-            client = StockHistoricalDataClient(
-                os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY')
-            )
-            symbols = MAG7 + ENERGY + SEMI + DEFENSE[:5] + TELECOM[:3] + MEDICAL[:3] + PAST_WINNERS
-            req = StockSnapshotRequest(symbol_or_symbols=symbols, feed='iex')
-            snaps = client.get_stock_snapshot(req)
-            gainers, losers = [], []
-            for sym, s in snaps.items():
+            result['actives'] = actives
+            
+            # Get snapshots for active stocks to check % change
+            active_symbols = []
+            if hasattr(actives, 'most_actives'):
+                active_list = actives.most_actives
+            elif isinstance(actives, list):
+                active_list = actives
+            else:
+                active_list = []
+            
+            for a in active_list:
+                sym = a.symbol if hasattr(a, 'symbol') else (a.get('symbol', '') if isinstance(a, dict) else '')
+                if sym and len(sym) <= 5 and not sym.endswith('W') and sym not in seen_symbols:
+                    active_symbols.append(sym)
+                    seen_symbols.add(sym)
+            
+            if active_symbols:
                 try:
-                    price = float(s.latest_trade.price)
-                    prev = float(s.previous_daily_bar.close)
-                    pct = (price - prev) / prev * 100 if prev else 0
-                    entry = {'symbol': sym, 'price': price, 'percent_change': pct}
-                    if pct > 0:
-                        gainers.append(entry)
-                    else:
-                        losers.append(entry)
-                except:
-                    pass
-            gainers.sort(key=lambda x: x['percent_change'], reverse=True)
-            losers.sort(key=lambda x: x['percent_change'])
-            return {'gainers': gainers, 'losers': losers}
+                    snap_req = StockSnapshotRequest(
+                        symbol_or_symbols=active_symbols[:20], feed='iex'
+                    )
+                    snaps = client.get_stock_snapshot(snap_req)
+                    for sym, s in snaps.items():
+                        try:
+                            price = float(s.latest_trade.price) if s.latest_trade else 0
+                            prev = float(s.previous_daily_bar.close) if s.previous_daily_bar else 0
+                            if prev > 0 and price > 5:  # Filter pennies
+                                pct = (price - prev) / prev * 100
+                                entry = {'symbol': sym, 'price': price,
+                                        'percent_change': pct, 'source': 'most_active'}
+                                if pct > 1.5:
+                                    result['gainers'].append(entry)
+                                    if pct > 3.0:
+                                        result['runners'].append(entry)
+                                        log.info(f"  🔥 RUNNER (active): {sym} +{pct:.1f}% @ ${price:.2f}")
+                                elif pct < -1.5:
+                                    result['losers'].append(entry)
+                        except:
+                            pass
+                except Exception as e:
+                    log.debug(f"Active snapshots failed: {e}")
         except Exception as e:
-            log.warning(f"Movers fetch failed: {e}")
-            return {}
+            log.debug(f"Most actives fetch failed: {e}")
+        
+        # ═══ LAYER 2: OUR FULL WATCHLIST (175+ stocks across 14 sectors) ═══
+        try:
+            # Build comprehensive scan list from ALL sectors
+            all_symbols = set()
+            for sector_stocks in ALL_SECTORS.values():
+                all_symbols.update(sector_stocks)
+            all_symbols.update(PAST_WINNERS)
+            all_symbols.update(BLUE_CHIPS)
+            # Remove already-scanned symbols
+            remaining = [s for s in all_symbols if s not in seen_symbols]
+            
+            # Batch snapshots (max 50 per request)
+            for i in range(0, len(remaining), 50):
+                batch = remaining[i:i+50]
+                try:
+                    snap_req = StockSnapshotRequest(
+                        symbol_or_symbols=batch, feed='iex'
+                    )
+                    snaps = client.get_stock_snapshot(snap_req)
+                    for sym, s in snaps.items():
+                        try:
+                            price = float(s.latest_trade.price) if s.latest_trade else 0
+                            prev = float(s.previous_daily_bar.close) if s.previous_daily_bar else 0
+                            if prev > 0 and price > 5:
+                                pct = (price - prev) / prev * 100
+                                entry = {'symbol': sym, 'price': price,
+                                        'percent_change': pct, 'source': 'watchlist'}
+                                if pct > 1.5:
+                                    result['gainers'].append(entry)
+                                    if pct > 3.0:
+                                        result['runners'].append(entry)
+                                elif pct < -1.5:
+                                    result['losers'].append(entry)
+                                seen_symbols.add(sym)
+                        except:
+                            pass
+                except Exception as e:
+                    log.debug(f"Watchlist batch {i} failed: {e}")
+        except Exception as e:
+            log.debug(f"Watchlist scan failed: {e}")
+        
+        # ═══ LAYER 3: PAST WINNERS PRIORITY (always check, flag even +1.5%) ═══
+        for entry in result['gainers']:
+            if entry['symbol'] in PAST_WINNERS and entry not in result['runners']:
+                entry['source'] = 'past_winner'
+                result['runners'].append(entry)
+                log.info(f"  ⚡ PAST WINNER: {entry['symbol']} +{entry['percent_change']:.1f}%")
+        
+        # Sort everything
+        result['gainers'].sort(key=lambda x: x['percent_change'], reverse=True)
+        result['losers'].sort(key=lambda x: x['percent_change'])
+        result['runners'].sort(key=lambda x: x['percent_change'], reverse=True)
+        
+        # Log summary
+        log.info(f"  📊 Movers: {len(result['gainers'])} gainers, "
+                f"{len(result['losers'])} losers, "
+                f"{len(result['runners'])} RUNNERS (>3%)")
+        if result['runners']:
+            top3 = result['runners'][:3]
+            log.info(f"  🔥 TOP RUNNERS: " +
+                    ', '.join(f"{r['symbol']}+{r['percent_change']:.1f}%" for r in top3))
+        
+        return result
 
     # ── FAST RUNNER SCAN (every 2 min) ──────────────────
 
@@ -1768,10 +1893,22 @@ class BeastModeLoop:
             acct = self.gateway.get_account()
             cash = float(acct.get('cash', 0))
             
-            gainers = [m for m in movers.get('gainers', []) 
+            # USE RUNNERS LIST (>3% gainers from ALL sources: most_active + watchlist + past winners)
+            # This is the FIX: we now scan the ENTIRE market, not just our 150 stocks
+            runners = movers.get('runners', [])
+            # Also include strong gainers from our watchlist (>1.5%)
+            gainers = [m for m in movers.get('gainers', [])
                       if m.get('price', 0) > 5 and m.get('percent_change', 0) > 1.5]
+            # Merge: runners first (highest priority), then gainers
+            seen = set()
+            scan_list = []
+            for m in runners + gainers:
+                sym = m.get('symbol', '')
+                if sym not in seen:
+                    seen.add(sym)
+                    scan_list.append(m)
             
-            for m in gainers[:10]:
+            for m in scan_list[:15]:  # Top 15 (was 10)
                 sym = m.get('symbol', '')
                 pct = m.get('percent_change', 0)
                 price = m.get('price', 0)
@@ -1812,9 +1949,17 @@ class BeastModeLoop:
                 # ── STRATEGY MATCHING ──────────────────
                 is_past_winner = sym in PAST_WINNERS
                 in_our_sectors = any(sym in stocks for stocks in ALL_SECTORS.values())
+                is_most_active = m.get('source') == 'most_active'
                 
-                if not is_past_winner and not in_our_sectors:
-                    continue  # Not our universe
+                # Day 7 FIX: If it's on most_active AND up >3%, it's a runner
+                # regardless of whether it's in our watchlist. The MARKET told
+                # us this stock is hot. Don't ignore it.
+                if not is_past_winner and not in_our_sectors and not is_most_active:
+                    continue
+                
+                # If it's a most_active stock NOT in our universe, give it lower
+                # base confidence but still consider it
+                is_unknown_runner = is_most_active and not in_our_sectors and not is_past_winner
                 
                 # Determine strategy and confidence
                 strategy = None
