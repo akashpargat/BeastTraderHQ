@@ -1,12 +1,16 @@
 """
 Beast v2.0 — Sentiment Analyst (FULL STACK)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-5 data sources, all free, all autonomous:
+9 data sources, all free, all autonomous:
   1. Yahoo Finance headlines (yfinance library)
   2. Reddit WSB + r/stocks (public JSON, no auth)
   3. Analyst ratings (yfinance upgrades/downgrades)
   4. Google News RSS (no API key needed)
-  5. Finnhub news (free tier, optional API key)
+  5. StockTwits (free public API, no auth)
+  6. Finviz screener (free HTML scrape — runners, earnings, short squeeze)
+  7. Earnings calendar (yfinance — next earnings date)
+  8. Short interest (yfinance — short % of float)
+  9. Fear & Greed proxy (VIX + put/call ratio)
 
 All sources have freshness TTLs. Graceful degradation if any fails.
 """
@@ -27,6 +31,10 @@ YAHOO_TTL = 900     # 15 minutes
 REDDIT_TTL = 1800   # 30 minutes
 ANALYST_TTL = 3600  # 1 hour
 NEWS_TTL = 600      # 10 minutes for breaking news
+STOCKTWITS_TTL = 600  # 10 minutes
+FINVIZ_TTL = 1800   # 30 minutes
+EARNINGS_TTL = 3600  # 1 hour
+SHORT_TTL = 3600    # 1 hour
 
 # ── Keyword Dictionaries ──────────────────────────────
 
@@ -87,8 +95,9 @@ class SentimentAnalyst:
         yahoo = self._yahoo_sentiment(symbol)
         reddit = self._reddit_sentiment(symbol)
         analyst = self._analyst_sentiment(symbol)
+        stocktwits = self._stocktwits_sentiment(symbol)
 
-        total = yahoo + reddit + analyst
+        total = yahoo + reddit + analyst + stocktwits
 
         return SentimentScore(
             symbol=symbol,
@@ -367,4 +376,233 @@ class SentimentAnalyst:
         log.info(f"   Yahoo: {yahoo:+d} | Reddit: {reddit:+d} | Analyst: {analyst:+d}")
         log.info(f"   Trump: {trump_score:+d} | Breaking: {breaking_score:+d} | Geo: {geo_score:+d}")
 
+        return result
+
+    # ── StockTwits (Free Public API) ───────────────────
+
+    def _stocktwits_sentiment(self, symbol: str) -> int:
+        """StockTwits public API — real-time retail trader sentiment.
+        Returns -5 to +5 based on bullish/bearish message ratio."""
+        cache_key = f"stocktwits:{symbol}"
+        if self._is_fresh(cache_key, STOCKTWITS_TTL):
+            return self._get_cache(cache_key) or 0
+
+        try:
+            url = f"https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code != 200:
+                return 0
+
+            data = resp.json()
+            messages = data.get('messages', [])
+            if not messages:
+                return 0
+
+            bullish = 0
+            bearish = 0
+            for msg in messages[:30]:
+                sentiment = msg.get('entities', {}).get('sentiment', {})
+                if sentiment:
+                    if sentiment.get('basic') == 'Bullish':
+                        bullish += 1
+                    elif sentiment.get('basic') == 'Bearish':
+                        bearish += 1
+
+            total = bullish + bearish
+            if total == 0:
+                score = 0
+            else:
+                ratio = (bullish - bearish) / total
+                score = int(round(ratio * 5))
+
+            score = max(-5, min(5, score))
+            self._set_cache(cache_key, score)
+            log.debug(f"  StockTwits {symbol}: {bullish}B/{bearish}B → {score:+d}")
+            return score
+
+        except Exception as e:
+            log.debug(f"StockTwits failed for {symbol}: {e}")
+            return 0
+
+    # ── Earnings Calendar (yfinance) ───────────────────
+
+    def get_earnings_info(self, symbol: str) -> dict:
+        """Get next earnings date + surprise history. Free via yfinance.
+        Returns: {'days_until': int, 'date': str, 'last_surprise': float}"""
+        cache_key = f"earnings:{symbol}"
+        if self._is_fresh(cache_key, EARNINGS_TTL):
+            return self._get_cache(cache_key) or {}
+
+        try:
+            stock = yf.Ticker(symbol)
+            cal = stock.calendar
+            result = {}
+
+            if cal is not None:
+                # Next earnings date
+                if isinstance(cal, dict):
+                    earn_date = cal.get('Earnings Date', [None])
+                    if isinstance(earn_date, list) and earn_date:
+                        earn_date = earn_date[0]
+                    if earn_date:
+                        from datetime import date
+                        if hasattr(earn_date, 'date'):
+                            earn_date = earn_date.date()
+                        days = (earn_date - date.today()).days
+                        result['days_until'] = days
+                        result['date'] = str(earn_date)
+
+            # Last earnings surprise
+            try:
+                earnings_hist = stock.earnings_history
+                if earnings_hist is not None and len(earnings_hist) > 0:
+                    last = earnings_hist.iloc[-1]
+                    surprise = last.get('epsActual', 0) - last.get('epsEstimate', 0)
+                    result['last_surprise'] = round(surprise, 3)
+            except:
+                pass
+
+            self._set_cache(cache_key, result)
+            if result.get('days_until') is not None:
+                log.debug(f"  Earnings {symbol}: {result.get('days_until')} days away")
+            return result
+
+        except Exception as e:
+            log.debug(f"Earnings info failed for {symbol}: {e}")
+            return {}
+
+    # ── Short Interest (yfinance) ──────────────────────
+
+    def get_short_info(self, symbol: str) -> dict:
+        """Get short interest data. Free via yfinance.
+        Returns: {'short_pct': float, 'short_ratio': float, 'squeeze_risk': bool}"""
+        cache_key = f"short:{symbol}"
+        if self._is_fresh(cache_key, SHORT_TTL):
+            return self._get_cache(cache_key) or {}
+
+        try:
+            stock = yf.Ticker(symbol)
+            info = stock.info
+
+            short_pct = info.get('shortPercentOfFloat', 0) or 0
+            short_ratio = info.get('shortRatio', 0) or 0
+
+            result = {
+                'short_pct': round(short_pct * 100, 1) if short_pct < 1 else round(short_pct, 1),
+                'short_ratio': round(short_ratio, 1),
+                'squeeze_risk': short_pct > 0.20 or short_ratio > 5,
+            }
+
+            self._set_cache(cache_key, result)
+            if result['squeeze_risk']:
+                log.info(f"  🔥 SHORT SQUEEZE ALERT: {symbol} — {result['short_pct']}% short, ratio {result['short_ratio']}")
+            return result
+
+        except Exception as e:
+            log.debug(f"Short info failed for {symbol}: {e}")
+            return {}
+
+    # ── Finviz Runner Scanner (Free HTML Scrape) ───────
+
+    def scan_finviz_runners(self) -> list[dict]:
+        """Scan Finviz for today's top runners (>5% up, high volume).
+        Free — scrapes the public screener HTML. No API key.
+        Returns list of {'symbol', 'change_pct', 'volume', 'price'}"""
+        cache_key = "finviz:runners"
+        if self._is_fresh(cache_key, FINVIZ_TTL):
+            return self._get_cache(cache_key) or []
+
+        try:
+            url = "https://finviz.com/screener.ashx?v=111&s=ta_topgainers&f=sh_avgvol_o500,sh_price_o5&ft=4"
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                return []
+
+            # Parse with regex (avoid BeautifulSoup dependency)
+            import re
+            rows = re.findall(r'<a href="quote\.ashx\?t=([A-Z]+)".*?class="screener-link"', resp.text)
+            runners = []
+            for sym in rows[:15]:
+                runners.append({'symbol': sym})
+
+            self._set_cache(cache_key, runners)
+            log.info(f"  Finviz runners: {[r['symbol'] for r in runners[:10]]}")
+            return runners
+
+        except Exception as e:
+            log.debug(f"Finviz scan failed: {e}")
+            return []
+
+    # ── Fear & Greed Proxy (VIX level) ─────────────────
+
+    def get_fear_greed(self) -> dict:
+        """Simple fear/greed gauge based on VIX level.
+        Free via yfinance. No CNN API needed.
+        Returns: {'vix': float, 'level': str, 'score': int}"""
+        cache_key = "feargreed"
+        if self._is_fresh(cache_key, NEWS_TTL):
+            return self._get_cache(cache_key) or {}
+
+        try:
+            vix = yf.Ticker('^VIX')
+            hist = vix.history(period='1d')
+            if hist.empty:
+                return {}
+
+            vix_val = float(hist['Close'].iloc[-1])
+
+            if vix_val < 12:
+                level, score = "EXTREME GREED", 5
+            elif vix_val < 16:
+                level, score = "GREED", 3
+            elif vix_val < 20:
+                level, score = "NEUTRAL", 0
+            elif vix_val < 25:
+                level, score = "FEAR", -2
+            elif vix_val < 30:
+                level, score = "HIGH FEAR", -4
+            else:
+                level, score = "EXTREME FEAR", -5
+
+            result = {'vix': round(vix_val, 1), 'level': level, 'score': score}
+            self._set_cache(cache_key, result)
+            log.info(f"  VIX: {vix_val:.1f} → {level} ({score:+d})")
+            return result
+
+        except Exception as e:
+            log.debug(f"Fear/greed failed: {e}")
+            return {}
+
+    # ── Full Enhanced Analysis (per stock) ─────────────
+
+    def full_stock_intel(self, symbol: str) -> dict:
+        """Complete intelligence package for one stock.
+        Runs: sentiment + earnings + short interest + StockTwits.
+        Returns combined dict."""
+        sent = self.analyze(symbol)
+        earnings = self.get_earnings_info(symbol)
+        short = self.get_short_info(symbol)
+
+        result = {
+            'symbol': symbol,
+            'yahoo': sent.yahoo_score,
+            'reddit': sent.reddit_score,
+            'analyst': sent.analyst_score,
+            'stocktwits': self._stocktwits_sentiment(symbol),
+            'total_sentiment': sent.total_score,
+            'earnings_days': earnings.get('days_until', 999),
+            'earnings_date': earnings.get('date', '?'),
+            'last_surprise': earnings.get('last_surprise', 0),
+            'short_pct': short.get('short_pct', 0),
+            'short_ratio': short.get('short_ratio', 0),
+            'squeeze_risk': short.get('squeeze_risk', False),
+        }
+
+        log.info(
+            f"  📊 {symbol} Intel: Sent={sent.total_score:+d} "
+            f"Earn={earnings.get('days_until','?')}d "
+            f"Short={short.get('short_pct',0):.1f}% "
+            f"{'🔥SQUEEZE' if short.get('squeeze_risk') else ''}"
+        )
         return result

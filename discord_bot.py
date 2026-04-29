@@ -1253,7 +1253,9 @@ _tv_client = None
 
 # Watchlist for auto-buy dips (Akash Method)
 DIP_BUY_WATCHLIST = ['AAPL', 'AMZN', 'GOOGL', 'META', 'MSFT', 'NVDA', 'TSLA',
-                     'AMD', 'TSM', 'INTC', 'CRM', 'PLTR', 'OXY', 'DVN', 'LMT']
+                     'AMD', 'TSM', 'INTC', 'CRM', 'PLTR', 'OXY', 'DVN', 'LMT',
+                     'SOFI', 'COIN', 'ROKU', 'SQ', 'SNAP', 'UBER', 'SHOP',
+                     'MU', 'MRVL', 'ARM', 'SMCI', 'NOK', 'PLUG', 'NIO', 'RIVN']
 
 # Telegram notifier (sends to BOTH Telegram + Discord)
 _notifier = None
