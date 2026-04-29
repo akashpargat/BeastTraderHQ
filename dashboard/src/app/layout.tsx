@@ -1,6 +1,6 @@
 import './globals.css'
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080'
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://api.beast-trader.com'
 
 export const metadata = {
   title: 'Beast Trader V3 — Dashboard',
@@ -50,4 +50,6 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     </html>
   )
 }
+
+
 

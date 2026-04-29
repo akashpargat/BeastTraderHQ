@@ -1,7 +1,7 @@
 'use client'
 import { useEffect, useState } from 'react'
 
-const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080'
+const API = typeof window !== 'undefined' ? 'https://api.beast-trader.com' : 'http://localhost:8080'
 
 interface Position {
   symbol: string; qty: number; avg_entry: number; current_price: number;
@@ -197,4 +197,5 @@ function Badge({ text, color }: { text: string; color: string }) {
   }
   return <span className={`px-2 py-0.5 rounded text-xs ${colors[color] || colors.gray}`}>{text}</span>
 }
+
 

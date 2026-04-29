@@ -1,7 +1,7 @@
 'use client'
 import { useEffect, useState } from 'react'
 
-const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080'
+const API = typeof window !== 'undefined' ? 'https://api.beast-trader.com' : 'http://localhost:8080'
 
 export default function TradesPage() {
   const [trades, setTrades] = useState<any[]>([])
@@ -59,4 +59,5 @@ export default function TradesPage() {
     </div>
   )
 }
+
 
