@@ -42,12 +42,20 @@ class TVClient:
             return False
 
     def _get_ws_url(self) -> str:
-        """Get WebSocket URL for TradingView tab."""
+        """Get WebSocket URL for TradingView CHART page (not homepage)."""
         resp = requests.get(f"http://{CDP_HOST}:{self.port}/json", timeout=5)
-        for target in resp.json():
+        targets = resp.json()
+        # Priority 1: find /chart/ page specifically
+        for target in targets:
+            url = target.get('url', '')
+            if 'tradingview.com/chart' in url and target.get('type') == 'page':
+                log.info(f"📺 Found TV chart: {target.get('title', '')[:40]}")
+                return target['webSocketDebuggerUrl']
+        # Priority 2: any tradingview page (Desktop app)
+        for target in targets:
             if 'tradingview.com' in target.get('url', '') and target.get('type') == 'page':
                 return target['webSocketDebuggerUrl']
-        raise ConnectionError("TradingView tab not found")
+        raise ConnectionError("TradingView chart tab not found")
 
     def _connect(self):
         """Connect to TradingView via WebSocket."""

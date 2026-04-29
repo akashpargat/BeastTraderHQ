@@ -1397,53 +1397,48 @@ async def position_monitor():
             prev = _prev_prices.get(p.symbol, p.current_price)
             pct = _pct(p)
 
-            # ── AUTO-RUNNER: +5% → sell half ──
+            # ── AUTO-RUNNER: +5% → sell half (only if shares available) ──
             if pct >= 5.0 and not _prev_prices.get(f"_runner_{p.symbol}") and _is_market_hours():
-                half = max(1, p.qty // 2)
-                try:
-                    sell_price = round(p.current_price * 0.999, 2)
-                    gateway.place_sell(p.symbol, half, sell_price,
-                                      reason=f"Auto-runner +{pct:.1f}%")
-                    _prev_prices[f"_runner_{p.symbol}"] = True
-                    _log_trade("LIMIT SELL (Runner)", p.symbol, half, sell_price,
-                               f"+{pct:.1f}% runner — selling half to lock ${p.unrealized_pl/2:+.2f} profit. Keeping {p.qty-half} shares as trailing runner.", "60s Monitor")
-                    if channel:
-                        await channel.send(
-                            f"🏃 **[60s MONITOR] AUTO-RUNNER SELL: {p.symbol}**\n"
-                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"📈 Position up **+{pct:.1f}%** — Runner target hit!\n"
-                            f"📋 **Action:** Limit sell {half} of {p.qty} shares @ ${sell_price}\n"
-                            f"💰 **Locking:** ~${p.unrealized_pl/2:+.2f} profit\n"
-                            f"🏃 **Keeping:** {p.qty-half} shares as trailing runner\n"
-                            f"📊 Entry: ${p.avg_entry:.2f} → Now: ${p.current_price:.2f}\n"
-                            f"🧠 **Why:** +5% exceeds runner target. Session rules say split: lock scalp, let runner ride with trailing stop."
-                        )
-                except Exception as e:
-                    log.error(f"Auto-runner failed {p.symbol}: {e}")
+                avail = p.qty_available or 0
+                half = max(1, min(avail, p.qty // 2))
+                if avail < 1:
+                    log.info(f"  {p.symbol} +{pct:.1f}% runner but 0 shares available (held by orders)")
+                else:
+                    try:
+                        sell_price = round(p.current_price * 0.999, 2)
+                        gateway.place_sell(p.symbol, half, sell_price,
+                                          reason=f"Auto-runner +{pct:.1f}%")
+                        _prev_prices[f"_runner_{p.symbol}"] = True
+                        _log_trade("LIMIT SELL (Runner)", p.symbol, half, sell_price,
+                                   f"+{pct:.1f}% runner — selling {half} to lock profit.", "60s Monitor")
+                        if channel:
+                            await channel.send(
+                                f"🏃 **[60s] AUTO-RUNNER: {p.symbol}** +{pct:.1f}%\n"
+                                f"Selling {half}/{p.qty} shares @ ${sell_price} (avail: {avail})")
+                    except Exception as e:
+                        log.error(f"Auto-runner failed {p.symbol}: {e}")
 
-            # ── AUTO-SCALP: +2% → limit sell half ──
+            # ── AUTO-SCALP: +2% → limit sell half (only if shares available) ──
             elif pct >= 2.0 and not _prev_prices.get(f"_scalp_{p.symbol}") and _is_market_hours():
-                half = max(1, p.qty // 2)
-                sell_price = round(p.avg_entry * 1.025, 2)
-                sell_price = max(sell_price, round(p.current_price * 1.005, 2))
-                try:
-                    gateway.place_sell(p.symbol, half, sell_price,
-                                      reason=f"Auto-scalp +{pct:.1f}%",
-                                      entry_price=p.avg_entry)
-                    _prev_prices[f"_scalp_{p.symbol}"] = True
-                    _log_trade("LIMIT SELL (Scalp)", p.symbol, half, sell_price,
-                               f"+{pct:.1f}% hit 2% scalp target. Selling half, keeping half as runner.", "60s Monitor")
-                    if channel:
-                        await channel.send(
-                            f"🎯 **[60s MONITOR] AUTO-SCALP: {p.symbol}**\n"
-                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"📈 Position up **+{pct:.1f}%** — Scalp target hit!\n"
-                            f"📋 **Action:** Limit sell {half} of {p.qty} shares @ ${sell_price}\n"
-                            f"📊 Entry: ${p.avg_entry:.2f} → Now: ${p.current_price:.2f}\n"
-                            f"🧠 **Why:** +2% minimum scalp target (Session Rule). Sell half to lock profit, keep half for +5% runner."
-                        )
-                except Exception as e:
-                    log.error(f"Auto-scalp failed {p.symbol}: {e}")
+                avail = p.qty_available or 0
+                half = max(1, min(avail, p.qty // 2))
+                if avail < 1:
+                    log.info(f"  {p.symbol} +{pct:.1f}% scalp but 0 shares available (held by orders)")
+                else:
+                    try:
+                        sell_price = round(p.avg_entry * 1.025, 2)
+                        sell_price = max(sell_price, round(p.current_price * 1.005, 2))
+                        gateway.place_sell(p.symbol, half, sell_price,
+                                          reason=f"Auto-scalp +{pct:.1f}%")
+                        _prev_prices[f"_scalp_{p.symbol}"] = True
+                        _log_trade("LIMIT SELL (Scalp)", p.symbol, half, sell_price,
+                                   f"+{pct:.1f}% scalp target hit. Selling {half}, keeping rest.", "60s Monitor")
+                        if channel:
+                            await channel.send(
+                                f"🎯 **[60s] AUTO-SCALP: {p.symbol}** +{pct:.1f}%\n"
+                                f"Selling {half}/{p.qty} shares @ ${sell_price} (avail: {avail})")
+                    except Exception as e:
+                        log.error(f"Auto-scalp failed {p.symbol}: {e}")
 
             # ── DROP ALERT: >2% sudden drop ──
             if prev > 0:

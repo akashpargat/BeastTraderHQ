@@ -65,6 +65,7 @@ class OrderGateway:
                         unrealized_pl=float(p.unrealized_pl),
                         unrealized_pl_pct=float(p.unrealized_plpc),
                         side=p.side,
+                        qty_available=int(p.qty_available) if hasattr(p, 'qty_available') else int(p.qty),
                     ))
                 return positions
             except Exception as e:

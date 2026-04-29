@@ -99,6 +99,7 @@ class Position:
     unrealized_pl: float
     unrealized_pl_pct: float
     side: str = "long"
+    qty_available: int = 0  # shares NOT held by open orders
 
     @property
     def is_green(self) -> bool:

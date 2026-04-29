@@ -190,12 +190,15 @@ class BeastModeLoop:
             from tv_cdp_client import TVClient
             self.tv_cdp = TVClient()
             if self.tv_cdp.health_check():
-                log.info("TV CDP connected")
+                log.info("✅ TV CDP connected — MANDATORY for all trades")
             else:
-                log.warning("TV CDP not available")
+                log.critical("🚨 TV CDP NOT AVAILABLE — NO TRADES WILL BE PLACED WITHOUT TV!")
                 self.tv_cdp = None
         except Exception as e:
-            log.warning(f"TV CDP init failed: {e}")
+            log.critical(f"🚨 TV CDP INIT FAILED: {e} — NO TRADES WITHOUT TV!")
+
+        # TV indicator cache: {symbol: {rsi, macd, vwap, ema, bb, sma, timestamp}}
+        self._tv_cache = {}
 
         # State
         self.daily_pnl = 0.0
@@ -500,6 +503,239 @@ class BeastModeLoop:
         elif price > 50: return 25
         elif price > 20: return 50
         else: return 200
+
+    # ── MANDATORY TV ANALYSIS (Iron Law 3 — NO TRADE WITHOUT TV) ──
+
+    def _run_tv_analysis(self, symbol: str) -> dict:
+        """RUN TRADINGVIEW ANALYSIS ON A STOCK. THIS IS MANDATORY.
+        
+        ⛔ IF TV IS NOT RUNNING, NO ORDERS GET PLACED. PERIOD.
+        ⛔ IF TV RETURNS NO DATA, NO ORDERS GET PLACED. PERIOD.
+        
+        Returns dict with:
+        - rsi: float (0-100)
+        - macd: float (histogram)
+        - macd_signal: float
+        - vwap: float
+        - ema: float (EMA value)
+        - bb_upper, bb_lower, bb_basis: float (Bollinger Bands)
+        - sma: float (200 SMA)
+        - volume: str
+        - confidence: float (0.0-1.0) calculated from ALL indicators
+        - signal: 'BUY' | 'SELL' | 'HOLD'
+        - reasons: list[str] — why this confidence score
+        - tv_ok: bool — whether TV data was successfully retrieved
+        
+        CONFIDENCE SCORING (each indicator adds/subtracts):
+        - RSI < 30 → oversold → +15% (buy signal)
+        - RSI 30-50 → healthy → +10%
+        - RSI 50-70 → neutral → +5%
+        - RSI > 70 → overbought → -10% (unless momentum with catalyst)
+        - MACD histogram > 0 → bullish momentum → +10%
+        - MACD crossing signal upward → +15%
+        - Price > VWAP → bullish → +10%
+        - Price < VWAP → bearish → -5%
+        - Price > EMA → uptrend → +5%
+        - Price above BB upper → extended → -10%
+        - Price near BB lower → oversold → +10%
+        - Price > 200 SMA → long-term uptrend → +10%
+        - Price < 200 SMA → long-term downtrend → -10%
+        
+        Base confidence: 40% (need indicators to push above 60% for auto-buy)
+        """
+        result = {
+            'symbol': symbol, 'tv_ok': False, 'confidence': 0.0,
+            'signal': 'HOLD', 'reasons': [], 'rsi': 0, 'macd': 0,
+            'macd_signal': 0, 'vwap': 0, 'ema': 0, 'sma': 0,
+            'bb_upper': 0, 'bb_lower': 0, 'bb_basis': 0, 'volume': '0',
+            'price': 0,
+        }
+        
+        # ⛔ HARD CHECK: TV MUST BE CONNECTED
+        if not self.tv_cdp:
+            log.critical(f"🚨 TV NOT CONNECTED — CANNOT ANALYZE {symbol}. NO TRADE ALLOWED.")
+            self.notify.send(f"🚨 ERROR: TradingView is NOT running!\nCannot trade {symbol}.\nStart TV Desktop and restart bot.")
+            result['reasons'].append("TV NOT CONNECTED")
+            return result
+        
+        # Check cache (valid for 2 min to avoid hammering TV)
+        cache = self._tv_cache.get(symbol)
+        if cache and (time.time() - cache.get('timestamp', 0)) < 120:
+            return cache
+        
+        try:
+            # Load symbol on TV chart
+            from tv_cdp_client import TVClient
+            self.tv_cdp.set_symbol(symbol)
+            time.sleep(1.5)  # Wait for chart to load
+            
+            # Read ALL study values
+            studies = self.tv_cdp.get_study_values()
+            if not studies or not studies.get('success'):
+                log.error(f"🚨 TV study values FAILED for {symbol}")
+                result['reasons'].append("TV study read failed")
+                return result
+            
+            # Get current price
+            ohlcv = self.tv_cdp.get_ohlcv(count=1, summary=True)
+            price = 0
+            if ohlcv and ohlcv.get('success'):
+                price = ohlcv.get('close', 0)
+            result['price'] = price
+            
+            # Parse all indicators from TV
+            rsi = 0
+            macd_hist = 0
+            macd_val = 0
+            macd_sig = 0
+            vwap = 0
+            ema = 0
+            sma = 0
+            bb_upper = 0
+            bb_lower = 0
+            bb_basis = 0
+            volume_str = "0"
+            
+            for study in studies.get('studies', []):
+                name = study.get('name', '')
+                vals = study.get('values', {})
+                
+                if 'Relative Strength Index' in name or name == 'Relative Strength Index':
+                    rsi = float(vals.get('RSI', 0))
+                elif name == 'MACD':
+                    macd_hist = float(vals.get('Histogram', 0))
+                    macd_val = float(vals.get('MACD', 0))
+                    macd_sig = float(vals.get('Signal', 0))
+                elif name == 'VWAP':
+                    vwap = float(vals.get('VWAP', 0))
+                elif 'Moving Average Exponential' in name:
+                    ema = float(vals.get('MA', 0))
+                elif name == 'Moving Average':
+                    sma = float(vals.get('MA', 0))
+                elif name == 'Bollinger Bands':
+                    bb_upper = float(vals.get('Upper', 0))
+                    bb_lower = float(vals.get('Lower', 0))
+                    bb_basis = float(vals.get('Basis', 0))
+                elif name == 'Volume':
+                    volume_str = vals.get('Volume', '0')
+                elif 'Guru' in name:
+                    # Guru Shopping Test has its own VWAP
+                    if not vwap:
+                        vwap = float(vals.get('VWAP', 0))
+            
+            result.update({
+                'rsi': rsi, 'macd': macd_hist, 'macd_signal': macd_sig,
+                'macd_value': macd_val, 'vwap': vwap, 'ema': ema, 'sma': sma,
+                'bb_upper': bb_upper, 'bb_lower': bb_lower, 'bb_basis': bb_basis,
+                'volume': volume_str, 'tv_ok': True,
+            })
+            
+            # ═══ CONFIDENCE SCORING ENGINE ═══════════════
+            confidence = 0.40  # Base: 40%
+            reasons = []
+            
+            # RSI scoring
+            if rsi > 0:
+                if rsi < 30:
+                    confidence += 0.15
+                    reasons.append(f"RSI {rsi:.0f} OVERSOLD (+15%)")
+                elif rsi < 50:
+                    confidence += 0.10
+                    reasons.append(f"RSI {rsi:.0f} healthy (+10%)")
+                elif rsi < 70:
+                    confidence += 0.05
+                    reasons.append(f"RSI {rsi:.0f} neutral (+5%)")
+                else:
+                    confidence -= 0.10
+                    reasons.append(f"RSI {rsi:.0f} OVERBOUGHT (-10%)")
+            
+            # MACD scoring
+            if macd_hist > 0:
+                confidence += 0.10
+                reasons.append(f"MACD histogram +{macd_hist:.2f} bullish (+10%)")
+                if macd_val > macd_sig and macd_val > 0:
+                    confidence += 0.05
+                    reasons.append(f"MACD above signal = momentum (+5%)")
+            elif macd_hist < 0:
+                confidence -= 0.05
+                reasons.append(f"MACD histogram {macd_hist:.2f} bearish (-5%)")
+            
+            # VWAP scoring
+            if price > 0 and vwap > 0:
+                if price > vwap:
+                    confidence += 0.10
+                    reasons.append(f"Price ${price:.2f} > VWAP ${vwap:.2f} (+10%)")
+                else:
+                    confidence -= 0.05
+                    reasons.append(f"Price ${price:.2f} < VWAP ${vwap:.2f} (-5%)")
+            
+            # EMA scoring
+            if price > 0 and ema > 0:
+                if price > ema:
+                    confidence += 0.05
+                    reasons.append(f"Price > EMA ${ema:.2f} uptrend (+5%)")
+                else:
+                    confidence -= 0.05
+                    reasons.append(f"Price < EMA ${ema:.2f} downtrend (-5%)")
+            
+            # Bollinger Bands scoring
+            if price > 0 and bb_upper > 0:
+                if price >= bb_upper:
+                    confidence -= 0.10
+                    reasons.append(f"Price at BB upper ${bb_upper:.2f} EXTENDED (-10%)")
+                elif price <= bb_lower:
+                    confidence += 0.10
+                    reasons.append(f"Price at BB lower ${bb_lower:.2f} OVERSOLD (+10%)")
+                else:
+                    confidence += 0.03
+                    reasons.append(f"Price inside BB bands (+3%)")
+            
+            # 200 SMA scoring (long-term trend)
+            if price > 0 and sma > 0:
+                if price > sma:
+                    confidence += 0.10
+                    reasons.append(f"Price > 200 SMA ${sma:.2f} UPTREND (+10%)")
+                else:
+                    confidence -= 0.10
+                    reasons.append(f"Price < 200 SMA ${sma:.2f} DOWNTREND (-10%)")
+            
+            # Cap confidence 0-1
+            confidence = max(0.0, min(1.0, confidence))
+            
+            # Determine signal
+            if confidence >= 0.70:
+                signal = 'STRONG_BUY'
+            elif confidence >= 0.60:
+                signal = 'BUY'
+            elif confidence >= 0.45:
+                signal = 'HOLD'
+            elif confidence >= 0.30:
+                signal = 'WEAK'
+            else:
+                signal = 'SELL'
+            
+            result['confidence'] = confidence
+            result['signal'] = signal
+            result['reasons'] = reasons
+            
+            log.info(
+                f"📊 TV ANALYSIS {symbol}: {signal} ({confidence:.0%})\n"
+                f"   RSI={rsi:.0f} MACD={macd_hist:+.2f} VWAP=${vwap:.2f} "
+                f"EMA=${ema:.2f} SMA=${sma:.2f}\n"
+                f"   BB=[${bb_lower:.2f}-${bb_upper:.2f}] Price=${price:.2f}\n"
+                f"   Reasons: {', '.join(reasons[:5])}"
+            )
+            
+            # Cache result for 2 min
+            result['timestamp'] = time.time()
+            self._tv_cache[symbol] = result
+            
+            return result
+            
+        except Exception as e:
+            log.error(f"🚨 TV ANALYSIS FAILED for {symbol}: {e}")
+            result['reasons'].append(f"TV error: {e}")
+            return result
 
     # ── PORTFOLIO RISK CHECK ──────────────────────────
 
@@ -1147,24 +1383,36 @@ class BeastModeLoop:
                         f"+{c['pct']:.1f}% conf={conf:.0%} strategy={c['strategy']}")
                 
                 if conf >= AUTO_EXECUTE_THRESHOLD:
-                    # AUTO-BUY!
+                    # AUTO-BUY — but TV MUST approve first!
                     scalp_target = round(price * 1.025, 2)
                     runner_target = round(price * 1.06, 2)
                     
                     try:
+                        # ⛔ MANDATORY TV ANALYSIS
+                        tv = self._run_tv_analysis(sym)
+                        if not tv['tv_ok']:
+                            log.error(f"🚨 TV FAILED for {sym} — BLOCKED")
+                            continue
+                        tv_conf = tv['confidence']
+                        blended = (conf * 0.5) + (tv_conf * 0.5)
+                        log.info(f"    📊 Phase7B {sym}: strat={conf:.0%} TV={tv_conf:.0%} → {blended:.0%}")
+                        if blended < AUTO_EXECUTE_THRESHOLD:
+                            log.info(f"    ❌ blended {blended:.0%} too low — SKIP")
+                            continue
+                        
                         from models import TradeProposal, Strategy as StratEnum
                         proposal = TradeProposal(
                             symbol=sym, qty=qty,
                             side=OrderSide.BUY,
                             limit_price=round(price * 1.002, 2),
                             strategy=StratEnum.ORB_BREAKOUT,
-                            confidence=conf,
+                            confidence=blended,
                         )
                         results = validate_entry(
                             proposal, None, positions, total_pl,
                             self.consecutive_losses, self.active_day_trades,
                             self.last_sell_times, self.earnings_dates,
-                            has_technicals=True, has_sentiment=True,
+                            has_technicals=tv['tv_ok'], has_sentiment=True,
                         )
                         if is_approved(results):
                             half = qty // 2
@@ -1198,25 +1446,35 @@ class BeastModeLoop:
                         log.error(f"    Auto-buy failed {sym}: {e}")
                         
                 elif conf >= ASK_THRESHOLD:
-                    # AUTO-BUY even at lower confidence — WE ARE FULLY AUTONOMOUS
-                    # Past winners get auto-bought at any confidence above threshold
+                    # AUTO-BUY — TV MUST approve
                     scalp_target = round(price * 1.025, 2)
                     runner_target = round(price * 1.06, 2)
                     
                     try:
+                        # ⛔ MANDATORY TV ANALYSIS
+                        tv = self._run_tv_analysis(sym)
+                        if not tv['tv_ok']:
+                            log.error(f"🚨 TV FAILED for {sym} — BLOCKED")
+                            continue
+                        tv_conf = tv['confidence']
+                        blended = (conf * 0.5) + (tv_conf * 0.5)
+                        if blended < ASK_THRESHOLD:
+                            log.info(f"    ❌ {sym}: blended {blended:.0%} too low — SKIP")
+                            continue
+                        
                         from models import TradeProposal, Strategy as StratEnum
                         proposal = TradeProposal(
                             symbol=sym, qty=qty,
                             side=OrderSide.BUY,
                             limit_price=round(price * 1.002, 2),
                             strategy=StratEnum.ORB_BREAKOUT,
-                            confidence=conf,
+                            confidence=blended,
                         )
                         results = validate_entry(
                             proposal, None, positions, total_pl,
                             self.consecutive_losses, self.active_day_trades,
                             self.last_sell_times, self.earnings_dates,
-                            has_technicals=True, has_sentiment=True,
+                            has_technicals=tv['tv_ok'], has_sentiment=True,
                         )
                         if is_approved(results):
                             half = qty // 2
@@ -1560,6 +1818,22 @@ class BeastModeLoop:
                     runner_target = round(price * 1.06, 2)   # 6% runner
                     
                     try:
+                        # ⛔ MANDATORY: Run TV analysis FIRST
+                        tv = self._run_tv_analysis(sym)
+                        if not tv['tv_ok']:
+                            log.error(f"🚨 TV FAILED for {sym} — TRADE BLOCKED (Iron Law 3)")
+                            continue
+                        
+                        # Override confidence with TV-calculated confidence
+                        # Blend: 50% strategy confidence + 50% TV confidence
+                        tv_conf = tv['confidence']
+                        blended_confidence = (confidence * 0.5) + (tv_conf * 0.5)
+                        log.info(f"  📊 {sym}: strategy={confidence:.0%} TV={tv_conf:.0%} → blended={blended_confidence:.0%} [{tv['signal']}]")
+                        
+                        if blended_confidence < AUTO_EXECUTE_THRESHOLD:
+                            log.info(f"  ❌ {sym}: blended {blended_confidence:.0%} < {AUTO_EXECUTE_THRESHOLD:.0%} threshold — SKIP")
+                            continue
+                        
                         # Buy at limit (current ask)
                         from models import TradeProposal, Strategy as StratEnum
                         proposal = TradeProposal(
@@ -1567,15 +1841,15 @@ class BeastModeLoop:
                             side=OrderSide.BUY,
                             limit_price=round(price * 1.002, 2),  # Tiny premium to fill
                             strategy=StratEnum.ORB_BREAKOUT,
-                            confidence=confidence,
+                            confidence=blended_confidence,
                         )
-                        # Use iron law validation
+                        # Use iron law validation — has_technicals=True because we ACTUALLY ran TV
                         results = validate_entry(
                             proposal, None, list(held.values()),
                             self.daily_pnl, self.consecutive_losses,
                             self.active_day_trades, self.last_sell_times,
                             self.earnings_dates,
-                            has_technicals=True, has_sentiment=True,
+                            has_technicals=tv['tv_ok'], has_sentiment=True,
                         )
                         if is_approved(results):
                             # Place buy
@@ -1616,27 +1890,41 @@ class BeastModeLoop:
                         log.error(f"Auto-trade failed {sym}: {e}")
                     
                 elif confidence >= ASK_THRESHOLD:
-                    # FULLY AUTONOMOUS — AUTO-BUY at lower confidence too
+                    # FULLY AUTONOMOUS — but TV MUST approve first
                     scalp_qty = qty // 2
                     runner_qty = qty - scalp_qty
                     scalp_target = round(price * 1.025, 2)
                     runner_target = round(price * 1.06, 2)
                     
                     try:
+                        # ⛔ MANDATORY: Run TV analysis FIRST
+                        tv = self._run_tv_analysis(sym)
+                        if not tv['tv_ok']:
+                            log.error(f"🚨 TV FAILED for {sym} — TRADE BLOCKED")
+                            continue
+                        
+                        tv_conf = tv['confidence']
+                        blended = (confidence * 0.5) + (tv_conf * 0.5)
+                        log.info(f"  📊 {sym}: strategy={confidence:.0%} TV={tv_conf:.0%} → blended={blended:.0%}")
+                        
+                        if blended < ASK_THRESHOLD:
+                            log.info(f"  ❌ {sym}: blended {blended:.0%} too low — SKIP")
+                            continue
+                        
                         from models import TradeProposal, Strategy as StratEnum
                         proposal = TradeProposal(
                             symbol=sym, qty=qty,
                             side=OrderSide.BUY,
                             limit_price=round(price * 1.002, 2),
                             strategy=StratEnum.ORB_BREAKOUT,
-                            confidence=confidence,
+                            confidence=blended,
                         )
                         results = validate_entry(
                             proposal, None, list(held.values()),
                             self.daily_pnl, self.consecutive_losses,
                             self.active_day_trades, self.last_sell_times,
                             self.earnings_dates,
-                            has_technicals=True, has_sentiment=True,
+                            has_technicals=tv['tv_ok'], has_sentiment=True,
                         )
                         if is_approved(results):
                             self.gateway.place_buy(
