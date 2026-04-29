@@ -116,17 +116,34 @@ class TradingViewAnalyst:
 
             elif 'exponential' in name or 'ema' in name:
                 ma = self._parse_float(values.get('MA', '0'))
+                # Try to identify EMA length from the indicator's inputs
+                length = values.get('length', values.get('Length', 0))
                 if ma > 0:
-                    # Try to determine period from study inputs or position
-                    # EMA studies appear in order they were added — typically 9, 21, 50, 200
-                    if signals.ema_9 == 0:
+                    if length and int(length) <= 10:
                         signals.ema_9 = ma
-                    elif signals.ema_21 == 0:
+                    elif length and int(length) <= 15:
+                        if signals.ema_9 == 0:
+                            signals.ema_9 = ma
+                        else:
+                            signals.ema_13 = ma  # 13 EMA for ribbon
+                    elif length and int(length) >= 20:
                         signals.ema_21 = ma
-                    elif not hasattr(signals, 'ema_50') or signals.ema_50 == 0:
-                        signals.ema_50 = ma
                     else:
-                        signals.ema_200 = ma
+                        # No length info — assign in order
+                        if signals.ema_9 == 0:
+                            signals.ema_9 = ma
+                        elif signals.ema_21 == 0:
+                            signals.ema_21 = ma
+
+            elif 'ichimoku' in name:
+                signals.ichimoku_tenkan = self._parse_float(
+                    values.get('Tenkan-sen', values.get('Conversion Line', '0')))
+                signals.ichimoku_kijun = self._parse_float(
+                    values.get('Kijun-sen', values.get('Base Line', '0')))
+                signals.ichimoku_span_a = self._parse_float(
+                    values.get('Senkou Span A', values.get('Leading Span A', '0')))
+                signals.ichimoku_span_b = self._parse_float(
+                    values.get('Senkou Span B', values.get('Leading Span B', '0')))
 
             elif 'moving average' in name and 'exponential' not in name:
                 signals.sma_20 = self._parse_float(values.get('MA', '0'))
@@ -140,7 +157,15 @@ class TradingViewAnalyst:
         # Get current price from quote
         price = quote.get('last', 0) or quote.get('close', 0)
         if price and signals.vwap > 0:
-            signals.price_vs_vwap = price - signals.vwap
+            # Skip VWAP comparison during extended hours (VWAP resets/stale after close)
+            from zoneinfo import ZoneInfo
+            et_now = datetime.now(ZoneInfo("America/New_York"))
+            is_regular_hours = 9 <= et_now.hour < 16
+            if is_regular_hours:
+                signals.price_vs_vwap = price - signals.vwap
+            else:
+                signals.price_vs_vwap = 0  # Neutral during extended hours
+                log.debug(f"VWAP skipped for {symbol} (extended hours)")
 
         # Parse Pine labels for strategy signals
         strategy_signals = self._parse_pine_labels(labels)
@@ -240,70 +265,83 @@ class TradingViewAnalyst:
     def _calculate_tv_confluence(self, signals: TechnicalSignals, price: float,
                                   strategy_signals: dict, table_data: dict) -> int:
         """Calculate confluence score using TradingView data.
-        Scores 0-10 based on available indicators (not Pine labels)."""
+        Score out of 15. Day 7 fix: was showing 1-2/10 on everything.
+        Now properly weights all indicators including Ichimoku."""
         score = 0
-        max_possible = 0
 
-        # 1. VWAP position (+2)
-        if signals.vwap > 0:
-            max_possible += 2
-            if signals.price_vs_vwap > 0:
-                score += 2
+        # Above VWAP (+2) — skip if extended hours (price_vs_vwap = 0)
+        if signals.price_vs_vwap > 0:
+            score += 2
+        elif signals.price_vs_vwap < 0:
+            score -= 1  # Penalty for below VWAP
 
-        # 2. RSI zone (+2)
-        max_possible += 2
-        if signals.rsi > 0:
-            if 40 <= signals.rsi <= 60:
-                score += 1  # neutral
-            elif signals.rsi < 30:
-                score += 2  # oversold bounce
-            elif signals.rsi > 70:
-                score += 0  # overbought risk
-            else:
-                score += 1  # mild bull/bear
+        # RSI zones
+        if 40 <= signals.rsi <= 60:
+            score += 1  # Neutral = safe
+        elif signals.rsi < 30:
+            score += 2  # Oversold = strong bounce signal
+        elif signals.rsi > 70:
+            score -= 1  # Overbought = caution
 
-        # 3. MACD momentum (+2)
-        max_possible += 2
+        # MACD positive histogram
         if signals.macd_histogram > 0:
-            score += 2  # bullish momentum
-        elif signals.macd_histogram > -0.5:
-            score += 1  # mild
+            score += 2
+        elif signals.macd_histogram < 0:
+            score -= 1
 
-        # 4. Bollinger position (+1)
-        if signals.bb_mid > 0:
-            max_possible += 1
-            if price > signals.bb_mid:
-                score += 1
+        # MACD above signal (momentum)
+        if signals.macd > signals.macd_signal and signals.macd > 0:
+            score += 1
 
-        # 5. EMA alignment (+2): 9 > 21 = uptrend
+        # Above Bollinger mid
+        if price and signals.bb_mid > 0 and price > signals.bb_mid:
+            score += 1
+        # At or near BB lower (oversold bounce)
+        if price and signals.bb_lower > 0 and price <= signals.bb_lower * 1.01:
+            score += 2
+
+        # EMA alignment (9 > 21 = uptrend)
         if signals.ema_9 > 0 and signals.ema_21 > 0:
-            max_possible += 2
             if signals.ema_9 > signals.ema_21:
-                score += 2  # golden alignment
-            elif abs(signals.ema_9 - signals.ema_21) / signals.ema_21 < 0.005:
-                score += 1  # close (consolidating)
+                score += 2  # Bullish EMA cross
+            else:
+                score -= 1  # Bearish
+        
+        # Price above all EMAs
+        if price and signals.ema_9 > 0 and price > signals.ema_9:
+            score += 1
 
-        # 6. Price vs EMA (+1): price above short EMA = bullish
-        if signals.ema_9 > 0 and price > 0:
-            max_possible += 1
-            if price > signals.ema_9:
-                score += 1
+        # Price above 200 SMA (long-term uptrend)
+        if price and signals.sma_20 > 0 and price > signals.sma_20:
+            score += 1
 
-        # 7. Pine strategy signals (bonus, if available)
+        # Ichimoku Cloud (if available)
+        if hasattr(signals, 'ichimoku_span_a') and signals.ichimoku_span_a > 0:
+            cloud_top = max(signals.ichimoku_span_a, signals.ichimoku_span_b)
+            cloud_bottom = min(signals.ichimoku_span_a, signals.ichimoku_span_b)
+            if price and price > cloud_top:
+                score += 2  # Above cloud = strong bullish
+            elif price and price < cloud_bottom:
+                score -= 2  # Below cloud = bearish
+
+        # FVG signals from Pine (strategy F)
         if strategy_signals.get('fvg_count', 0) > 0:
             score += 1
+
+        # R2G signals from Pine (strategy G)
         if strategy_signals.get('r2g_count', 0) > 0:
             score += 1
+
+        # Long signals from Pine (direct entry)
         if strategy_signals.get('long_signals'):
-            score += 1
+            score += 2
 
-        # Normalize to 0-10 scale based on available indicators
-        if max_possible > 0:
-            normalized = int(round(score / max_possible * 10))
-        else:
-            normalized = 5  # no data = neutral
+        # VWAP band position (Guru script)
+        if table_data.get('vwap_band_low', 0) > 0:
+            if price and price > table_data['vwap_band_low']:
+                score += 1
 
-        return min(normalized, 10)
+        return max(0, min(score, 15))  # Cap at 0-15
 
     def _parse_float(self, value) -> float:
         """Safely parse a float from TV output."""

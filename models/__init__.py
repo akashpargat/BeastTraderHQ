@@ -100,6 +100,7 @@ class Position:
     unrealized_pl_pct: float
     side: str = "long"
     qty_available: int = 0  # shares NOT held by open orders
+    lastday_price: float = 0.0  # yesterday's close (for AH % change calc)
 
     @property
     def is_green(self) -> bool:
@@ -144,9 +145,14 @@ class TechnicalSignals:
     bb_mid: float = 0.0
     bb_lower: float = 0.0
     ema_9: float = 0.0
+    ema_13: float = 0.0   # EMA ribbon
     ema_21: float = 0.0
     sma_20: float = 0.0
     sma_200: float = 0.0
+    ichimoku_tenkan: float = 0.0
+    ichimoku_kijun: float = 0.0
+    ichimoku_span_a: float = 0.0
+    ichimoku_span_b: float = 0.0
     volume_ratio: float = 1.0  # current vs 20-bar avg
     orb_high: float = 0.0
     orb_low: float = 0.0

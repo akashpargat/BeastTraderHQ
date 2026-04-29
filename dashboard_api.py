@@ -301,9 +301,198 @@ def index():
             '/api/portfolio', '/api/trades', '/api/trades/today',
             '/api/scans', '/api/equity', '/api/analytics',
             '/api/system', '/api/debug', '/api/alerts', '/api/health',
-            '/api/intraday', '/api/actions', '/api/sentiment'
+            '/api/intraday', '/api/actions', '/api/sentiment',
+            '/api/runners', '/api/sectors', '/api/trailing-stops', '/api/news'
         ]
     })
+
+
+# ── RUNNERS (pre-market, market, post-market) ─────────
+
+@app.route('/api/runners')
+def runners():
+    """Top runners across all sessions. Uses 3-layer detection."""
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import MostActivesRequest, StockSnapshotRequest
+        
+        client = StockHistoricalDataClient(
+            os.getenv('ALPACA_API_KEY', ''), os.getenv('ALPACA_SECRET_KEY', '')
+        )
+        
+        # Get most active
+        req = MostActivesRequest(top=20, by='volume')
+        actives = client.get_most_actives(req)
+        
+        active_syms = []
+        if hasattr(actives, 'most_actives'):
+            for a in actives.most_actives:
+                sym = a.symbol if hasattr(a, 'symbol') else ''
+                if sym and len(sym) <= 5:
+                    active_syms.append(sym)
+        
+        # Get snapshots
+        runners = []
+        if active_syms:
+            snap_req = StockSnapshotRequest(symbol_or_symbols=active_syms[:20], feed='iex')
+            snaps = client.get_stock_snapshot(snap_req)
+            for sym, s in snaps.items():
+                try:
+                    price = float(s.latest_trade.price) if s.latest_trade else 0
+                    prev = float(s.previous_daily_bar.close) if s.previous_daily_bar else 0
+                    if prev > 0 and price > 5:
+                        pct = (price - prev) / prev * 100
+                        runners.append({
+                            'symbol': sym, 'price': round(price, 2),
+                            'change_pct': round(pct, 2),
+                            'prev_close': round(prev, 2),
+                        })
+                except:
+                    pass
+        
+        runners.sort(key=lambda x: x['change_pct'], reverse=True)
+        now = datetime.now(ET)
+        session = 'pre-market' if now.hour < 9 else ('after-hours' if now.hour >= 16 else 'market')
+        
+        return jsonify({
+            'session': session,
+            'runners': runners[:15],
+            'timestamp': now.isoformat(),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+# ── SECTOR HEATMAP ─────────────────────────────────────
+
+@app.route('/api/sectors')
+def sector_heatmap():
+    """Sector rotation heatmap — all 14 sectors with avg % change."""
+    try:
+        from beast_mode_loop import ALL_SECTORS
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockSnapshotRequest
+        
+        client = StockHistoricalDataClient(
+            os.getenv('ALPACA_API_KEY', ''), os.getenv('ALPACA_SECRET_KEY', '')
+        )
+        
+        sectors = {}
+        for sector_name, symbols in ALL_SECTORS.items():
+            sample = symbols[:5]
+            try:
+                req = StockSnapshotRequest(symbol_or_symbols=sample, feed='iex')
+                snaps = client.get_stock_snapshot(req)
+                changes = []
+                for sym, s in snaps.items():
+                    try:
+                        prev = float(s.previous_daily_bar.close)
+                        curr = float(s.latest_trade.price)
+                        if prev > 0:
+                            changes.append((curr - prev) / prev * 100)
+                    except:
+                        pass
+                avg = sum(changes) / len(changes) if changes else 0
+                sectors[sector_name] = {
+                    'avg_change': round(avg, 2),
+                    'stocks_sampled': len(changes),
+                    'stock_list': sample,
+                }
+            except:
+                sectors[sector_name] = {'avg_change': 0, 'stocks_sampled': 0, 'stock_list': sample}
+        
+        return jsonify({
+            'sectors': sectors,
+            'timestamp': datetime.now(ET).isoformat(),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+# ── TRAILING STOPS VISUALIZATION ───────────────────────
+
+@app.route('/api/trailing-stops')
+def trailing_stops():
+    """Show all trailing stops with entry, current, HWM, stop levels."""
+    try:
+        gw = _get_gateway()
+        positions = gw.get_positions()
+        orders = gw.get_open_orders()
+        
+        trails = []
+        for o in orders:
+            if o.get('type') == 'trailing_stop':
+                sym = o.get('symbol', '')
+                pos = next((p for p in positions if p.symbol == sym), None)
+                trails.append({
+                    'symbol': sym,
+                    'qty': o.get('qty'),
+                    'trail_percent': o.get('trail_percent'),
+                    'stop_price': float(o.get('stop_price', 0)),
+                    'hwm': float(o.get('hwm', 0)),
+                    'entry': pos.avg_entry if pos else 0,
+                    'current': pos.current_price if pos else 0,
+                    'pnl': pos.unrealized_pl if pos else 0,
+                    'gap_to_stop': round(
+                        ((pos.current_price - float(o.get('stop_price', 0))) / pos.current_price * 100), 1
+                    ) if pos and float(o.get('stop_price', 0)) > 0 else 0,
+                })
+        
+        return jsonify({
+            'trailing_stops': trails,
+            'count': len(trails),
+            'timestamp': datetime.now(ET).isoformat(),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+# ── LIVE NEWS FEED ─────────────────────────────────────
+
+@app.route('/api/news')
+def news_feed():
+    """Live macro news with sector tagging."""
+    try:
+        from sentiment_analyst import SentimentAnalyst
+        sa = SentimentAnalyst()
+        
+        # Get Trump/tariff headlines
+        t_score, t_headlines = sa.get_trump_sentiment()
+        
+        # Get market headlines
+        _, m_headlines = sa._google_news_sentiment("breaking news stock market today")
+        
+        # Tag headlines with sectors using keyword mapping
+        KEYWORD_SECTORS = {
+            'oil': 'ENERGY', 'crude': 'ENERGY', 'iran': 'ENERGY',
+            'chip': 'SEMI', 'semiconductor': 'SEMI', 'nvidia': 'SEMI',
+            'ai ': 'CLOUD_IT', 'artificial intelligence': 'CLOUD_IT',
+            'fed': 'FINANCIALS', 'rate': 'FINANCIALS', 'powell': 'FINANCIALS',
+            'trump': 'POLITICS', 'tariff': 'TRADE', 'china': 'TRADE',
+            'war': 'DEFENSE', 'military': 'DEFENSE',
+            'fda': 'MEDICAL', 'drug': 'MEDICAL',
+            'earnings': 'EARNINGS', 'revenue': 'EARNINGS',
+        }
+        
+        tagged_news = []
+        for h in (t_headlines + m_headlines)[:20]:
+            tags = []
+            h_lower = h.lower()
+            for keyword, sector in KEYWORD_SECTORS.items():
+                if keyword in h_lower:
+                    tags.append(sector)
+            tagged_news.append({
+                'headline': h,
+                'tags': list(set(tags)) or ['GENERAL'],
+            })
+        
+        return jsonify({
+            'trump_score': t_score,
+            'news': tagged_news,
+            'timestamp': datetime.now(ET).isoformat(),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
 
 
 if __name__ == '__main__':
