@@ -1773,74 +1773,106 @@ async def full_scan():
         embed2.set_footer(text=">> RUNNER (+5%) | -> SCALP (+2%) | ++ ADD (AI buy) | !! SELL (AI sell) | ** DEEP RED | UP/DN = VWAP")
         await channel.send(embed=embed2)
 
-        # ── EMBED 3: Per-Stock Deep Analysis (WHY buy/sell/hold) ──
-        embed3 = discord.Embed(title="🔍 Stock-by-Stock Analysis", color=0x5865f2)
-        for p in sorted(positions, key=lambda x: abs(x.unrealized_pl), reverse=True)[:8]:
+        # ── EMBED 3: Per-Stock Analysis with CLEAR SOURCE LABELS ──
+        # Each stock gets its own embed with labeled data sources
+        for p in sorted(positions, key=lambda x: abs(x.unrealized_pl), reverse=True)[:6]:
             pct = _pct(p)
             tv = tv_data.get(p.symbol, {})
             sent = sentiments.get(p.symbol)
             cr = confidence_results.get(p.symbol)
             ai_v = ai_verdicts.get(p.symbol, {})
 
-            # Build WHY explanation
-            reasons = []
-            # Technical reasons
-            if 'rsi' in tv:
-                if tv['rsi'] > 70: reasons.append(f"⚠️ RSI {tv['rsi']:.0f} — overbought, pullback risk")
-                elif tv['rsi'] < 30: reasons.append(f"📉 RSI {tv['rsi']:.0f} — oversold, bounce candidate")
-                else: reasons.append(f"RSI {tv['rsi']:.0f} — neutral zone")
-            if tv.get('vwap_above'): reasons.append("✅ Above VWAP — institutional buying")
-            elif tv: reasons.append("⚠️ Below VWAP — institutional selling")
-            if tv.get('bb_position') == 'lower': reasons.append("📉 At lower Bollinger Band — mean reversion setup")
-            elif tv.get('bb_position') == 'upper': reasons.append("📈 At upper Bollinger Band — momentum strong")
-            if tv.get('confluence', 0) >= 7: reasons.append(f"🔥 Confluence {tv['confluence']}/10 — multiple signals align")
+            if pct >= 2: color = 0x57f287
+            elif pct >= 0: color = 0xfee75c
+            elif pct > -3: color = 0xed4245
+            else: color = 0x992d22
 
-            # Sentiment reasons
-            if sent:
-                if sent.yahoo_score >= 3: reasons.append(f"📰 Yahoo: bullish headlines ({sent.yahoo_score:+d})")
-                elif sent.yahoo_score <= -2: reasons.append(f"📰 Yahoo: bearish news ({sent.yahoo_score:+d})")
-                if sent.reddit_score >= 2: reasons.append(f"🐒 Reddit: WSB is bullish ({sent.reddit_score:+d})")
-                elif sent.reddit_score <= -2: reasons.append(f"🐒 Reddit: bears in control ({sent.reddit_score:+d})")
-                if sent.analyst_score >= 2: reasons.append(f"🏦 Analysts: upgrades/strong buy ({sent.analyst_score:+d})")
-                elif sent.analyst_score <= -2: reasons.append(f"🏦 Analysts: downgrades ({sent.analyst_score:+d})")
-
-            # Trump/geopolitical (for energy/defense)
-            if trump_score <= -3 and p.symbol in ['OXY', 'DVN', 'XOM', 'LMT']:
-                reasons.append(f"🏛️ Geopolitical risk: Trump score {trump_score:+d}")
-            elif trump_score >= 3 and p.symbol in ['OXY', 'DVN', 'XOM', 'LMT']:
-                reasons.append(f"🏛️ Oil tailwind: Trump score {trump_score:+d}")
-
-            # Confidence engine
-            if cr:
-                reasons.append(f"🎯 Confidence: {cr.overall_confidence:.0%} — best strategy: {cr.best_strategy.value if cr.best_strategy else 'none'}")
-
-            # P&L context
-            if pct >= 5: reasons.append(f"🏃 RUNNER +{pct:.1f}% — take partial profits, trail stop the rest")
-            elif pct >= 2: reasons.append(f"🎯 SCALP target +{pct:.1f}% — sell half, let runner ride")
-            elif pct > 0: reasons.append(f"✅ Green +{pct:.1f}% — hold, approaching scalp target")
-            elif pct > -3: reasons.append(f"🔒 Slight red {pct:.1f}% — HOLD per Iron Law 1 (never sell at loss)")
-            else: reasons.append(f"⚠️ Deep red {pct:.1f}% — HOLD (Iron Law 1), wait for recovery")
-
-            # AI reasoning
-            ai_reason = ai_v.get('reasoning', '')
-            if ai_reason:
-                reasons.append(f"🧠 AI: {ai_reason[:100]}")
-
-            # Determine icon
-            if pct >= 2: title_icon = "🟢"
-            elif pct >= 0: title_icon = "🟡"
-            else: title_icon = "🔴"
-
-            action = ai_v.get('action', 'HOLD')
+            ai_action = ai_v.get('action', 'HOLD')
             ai_conf = ai_v.get('confidence', 0)
 
-            embed3.add_field(
-                name=f"{title_icon} {p.symbol} — {action} ({ai_conf}%) | P&L: ${p.unrealized_pl:+.2f} ({pct:+.1f}%)",
-                value="\n".join(reasons[:5]) or "No data available",
-                inline=False
+            stock_embed = discord.Embed(
+                title=f"{'🟢' if pct>=0 else '🔴'} {p.symbol} — {ai_action} ({ai_conf}%)",
+                description=f"**${p.current_price:.2f}** │ Entry: ${p.avg_entry:.2f} │ {p.qty} shares │ P&L: **${p.unrealized_pl:+.2f}** ({pct:+.1f}%)",
+                color=color
             )
 
-        await channel.send(embed=embed3)
+            # ── SOURCE 1: TradingView (CDP) ──
+            tv_text = ""
+            if tv:
+                tv_text = f"📺 **Source: TradingView Premium (CDP port 9222)**\n"
+                rsi = tv.get('rsi', 0)
+                if rsi > 70: tv_text += f"• RSI **{rsi:.0f}** — ⚠️ OVERBOUGHT\n"
+                elif rsi < 30: tv_text += f"• RSI **{rsi:.0f}** — 🔥 OVERSOLD (dip buy zone)\n"
+                else: tv_text += f"• RSI **{rsi:.0f}** — neutral\n"
+                tv_text += f"• VWAP: **{'ABOVE ✅' if tv.get('vwap_above') else 'BELOW ⚠️'}**\n"
+                tv_text += f"• Bollinger: **{tv.get('bb_position', 'mid').upper()}**\n"
+                tv_text += f"• Confluence: **{tv.get('confluence', 0)}/10**\n"
+                tv_text += f"• EMA 9/21: {tv.get('ema_9', 0):.0f} / {tv.get('ema_21', 0):.0f}"
+            else:
+                tv_text = "📺 **Source: TradingView** — ⏸️ No data (after hours)"
+            stock_embed.add_field(name="📺 Technical (TradingView)", value=tv_text, inline=False)
+
+            # ── SOURCE 2: Sentiment (Yahoo + Reddit + Analyst) ──
+            if sent:
+                sent_text = f"📰 **Source: Yahoo Finance + Reddit + Wall St Analysts**\n"
+                sent_text += f"• Yahoo News: **{sent.yahoo_score:+d}** {'📈' if sent.yahoo_score > 0 else '📉' if sent.yahoo_score < 0 else '➡️'}\n"
+                sent_text += f"• Reddit/WSB: **{sent.reddit_score:+d}** {'🐒↑' if sent.reddit_score > 0 else '🐒↓' if sent.reddit_score < 0 else '🐒→'}\n"
+                sent_text += f"• Analysts: **{sent.analyst_score:+d}** {'🏦↑' if sent.analyst_score > 0 else '🏦↓' if sent.analyst_score < 0 else '🏦→'}\n"
+                total_icon = "🟢 BULLISH" if sent.total_score >= 3 else ("🔴 BEARISH" if sent.total_score <= -3 else "⚪ NEUTRAL")
+                sent_text += f"• **Overall: {sent.total_score:+d} → {total_icon}**"
+            else:
+                sent_text = "📰 **Source: Sentiment** — No data available"
+            stock_embed.add_field(name="📰 Sentiment (3 Sources)", value=sent_text, inline=False)
+
+            # ── SOURCE 3: Confidence Engine (11 Strategies) ──
+            if cr:
+                conf_text = f"🎯 **Source: Confidence Engine (11 strategies scored)**\n"
+                conf_text += f"• Overall: **{cr.overall_confidence:.0%}**\n"
+                conf_text += f"• Signal: **{cr.signal.value.upper()}**\n"
+                if cr.best_strategy:
+                    conf_text += f"• Best Strategy: **{cr.best_strategy.value}**\n"
+                if cr.strategy_scores:
+                    top3 = sorted(cr.strategy_scores, key=lambda s: s.score, reverse=True)[:3]
+                    for ss in top3:
+                        bar = "█" * int(ss.score * 10)
+                        conf_text += f"  {ss.strategy.value}: {bar} {ss.score:.0%}\n"
+            else:
+                conf_text = "🎯 **Source: Confidence Engine** — No TV data to score"
+            stock_embed.add_field(name="🎯 Confidence (Engine)", value=conf_text[:1024], inline=False)
+
+            # ── SOURCE 4: AI Brain (Claude Opus 4.7) ──
+            ai_reason = ai_v.get('reasoning', '')
+            if ai_reason:
+                ai_text = f"🧠 **Source: Claude Opus 4.7 via ai.beast-trader.com**\n"
+                ai_text += f"• Verdict: **{ai_action}** ({ai_conf}% confidence)\n"
+                ai_text += f"• Analysis: {ai_reason[:300]}"
+            else:
+                ai_text = "🧠 **Source: AI Brain** — ⏸️ AI offline or skipped this stock"
+            stock_embed.add_field(name="🧠 AI Analysis (Claude Opus 4.7)", value=ai_text[:1024], inline=False)
+
+            # ── SOURCE 5: Trump/Geopolitical (Google News RSS) ──
+            if p.symbol in ['OXY', 'DVN', 'XOM', 'LMT', 'CAT'] and trump_score != 0:
+                geo_text = f"🏛️ **Source: Google News RSS (Trump/tariff/Hormuz keywords)**\n"
+                geo_text += f"• Score: **{trump_score:+d}/5**\n"
+                if trump_headlines:
+                    geo_text += f"• Latest: {trump_headlines[0][:80]}"
+                stock_embed.add_field(name="🏛️ Geopolitical (Google News)", value=geo_text, inline=False)
+
+            # ── RECOMMENDATION ──
+            if pct >= 5:
+                rec = f"🏃 **SELL HALF (Runner)** — +{pct:.1f}% exceeds 5% runner target. Lock profits on half, trail stop the rest."
+            elif pct >= 2:
+                rec = f"🎯 **SELL HALF (Scalp)** — +{pct:.1f}% hit 2% scalp target. Take profit, keep runner."
+            elif pct >= 0:
+                rec = f"✅ **HOLD** — Green but below target. Wait for +2%."
+            elif pct > -3:
+                rec = f"🔒 **HOLD** — Iron Law 1: never sell at loss. {pct:.1f}% is manageable."
+            else:
+                rec = f"⚠️ **HOLD** — Deep red {pct:.1f}%. Iron Law 1: HOLD. Selling locks the loss."
+            stock_embed.add_field(name="📋 RECOMMENDATION", value=rec, inline=False)
+
+            stock_embed.set_footer(text=f"Data: TV={'✅' if tv else '❌'} Sent={'✅' if sent else '❌'} Conf={'✅' if cr else '❌'} AI={'✅' if ai_reason else '❌'}")
+            await channel.send(embed=stock_embed)
 
         # ── EMBED 4: Sentiment & Geopolitical ──
         embed4 = discord.Embed(title="📰 Sentiment & Geopolitical Intel", color=0xf0b232)

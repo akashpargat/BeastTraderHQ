@@ -190,6 +190,10 @@ class SentimentAnalyst:
     # ── Analyst Ratings ────────────────────────────────
 
     def _analyst_sentiment(self, symbol: str) -> int:
+        # ETFs don't have analyst ratings
+        if symbol in ('SPY', 'QQQ', 'DIA', 'IWM', 'VTI', 'XLK', 'XLE', 'XLF'):
+            return 0
+
         cache_key = f"analyst:{symbol}"
         if self._is_fresh(cache_key, ANALYST_TTL):
             return self._get_cache(cache_key) or 0
