@@ -2103,7 +2103,18 @@ async def claude_deep_scan():
             except:
                 market_intel['fear_greed'] = {}
 
-            # 4. Today's runners
+            # 4. TradingView indicators on ALL positions
+            tv_intel = {}
+            for p in positions:
+                try:
+                    ind = _get_tv_indicators(p.symbol)
+                    if ind:
+                        tv_intel[p.symbol] = ind
+                except:
+                    pass
+            market_intel['tv_data'] = tv_intel
+
+            # 5. Today's runners
             try:
                 from alpaca.data.historical import StockHistoricalDataClient
                 from alpaca.data.requests import StockSnapshotRequest
@@ -2183,6 +2194,7 @@ async def claude_deep_scan():
         # Position details with ALL intel
         for p in sorted(positions, key=lambda x: abs(x.unrealized_pl), reverse=True):
             intel = all_intel.get(p.symbol, {})
+            tv = market_intel.get('tv_data', {}).get(p.symbol, {})
             pct = _pct(p)
             has_trail = p.symbol in {o.get('symbol') for o in trail_stops}
             mega_data['positions'].append({
@@ -2196,6 +2208,15 @@ async def claude_deep_scan():
                 'earnings_date': intel.get('earnings_date', '?'),
                 'short_pct': intel.get('short_pct', 0),
                 'squeeze_risk': intel.get('squeeze_risk', False),
+                # TradingView indicators
+                'rsi': tv.get('rsi', 0),
+                'macd_hist': tv.get('macd_hist', 0),
+                'vwap_above': tv.get('vwap_above', False),
+                'bb_position': tv.get('bb_position', '?'),
+                'confluence': tv.get('confluence', 0),
+                'ema_9': tv.get('ema_9', 0),
+                'ema_21': tv.get('ema_21', 0),
+                'volume_ratio': tv.get('volume_ratio', 1.0),
             })
 
         # ═══════════════════════════════════════════════
