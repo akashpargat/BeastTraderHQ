@@ -1304,7 +1304,7 @@ def _get_tv_indicators(symbol: str) -> dict:
             return {
                 'rsi': result.rsi, 'macd_hist': result.macd_histogram,
                 'vwap_above': result.above_vwap,
-                'bb_position': 'upper' if result.above_upper_bb else ('lower' if result.below_lower_bb else 'mid'),
+                'bb_position': 'upper' if getattr(result, 'above_upper_bb', False) else ('lower' if getattr(result, 'below_lower_bb', False) else 'mid'),
                 'confluence': result.confluence_score,
                 'ema_9': result.ema_9, 'ema_21': result.ema_21,
                 'volume_ratio': result.volume_ratio,
