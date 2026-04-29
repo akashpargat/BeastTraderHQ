@@ -583,18 +583,27 @@ class BeastModeLoop:
                 price = ohlcv.get('close', 0)
             result['price'] = price
             
-            # Parse all indicators from TV
+            # Parse ALL indicators from TV (original + new additions)
             rsi = 0
             macd_hist = 0
             macd_val = 0
             macd_sig = 0
             vwap = 0
-            ema = 0
+            emas = []  # Collect ALL EMAs for ribbon analysis
             sma = 0
             bb_upper = 0
             bb_lower = 0
             bb_basis = 0
             volume_str = "0"
+            # NEW: Ichimoku Cloud
+            ichi_tenkan = 0
+            ichi_kijun = 0
+            ichi_span_a = 0
+            ichi_span_b = 0
+            # NEW: Guru script signals
+            guru_vwap = 0
+            guru_vwap_upper = 0
+            guru_vwap_lower = 0
             
             for study in studies.get('studies', []):
                 name = study.get('name', '')
@@ -609,7 +618,9 @@ class BeastModeLoop:
                 elif name == 'VWAP':
                     vwap = float(vals.get('VWAP', 0))
                 elif 'Moving Average Exponential' in name:
-                    ema = float(vals.get('MA', 0))
+                    ema_val = float(vals.get('MA', 0))
+                    if ema_val > 0:
+                        emas.append(ema_val)
                 elif name == 'Moving Average':
                     sma = float(vals.get('MA', 0))
                 elif name == 'Bollinger Bands':
@@ -618,23 +629,35 @@ class BeastModeLoop:
                     bb_basis = float(vals.get('Basis', 0))
                 elif name == 'Volume':
                     volume_str = vals.get('Volume', '0')
+                elif 'Ichimoku' in name:
+                    ichi_tenkan = float(vals.get('Tenkan-sen', vals.get('Conversion Line', 0)))
+                    ichi_kijun = float(vals.get('Kijun-sen', vals.get('Base Line', 0)))
+                    ichi_span_a = float(vals.get('Senkou Span A', vals.get('Leading Span A', 0)))
+                    ichi_span_b = float(vals.get('Senkou Span B', vals.get('Leading Span B', 0)))
                 elif 'Guru' in name:
-                    # Guru Shopping Test has its own VWAP
+                    guru_vwap = float(vals.get('VWAP', 0))
+                    guru_vwap_upper = float(vals.get('VWAP +2σ', 0))
+                    guru_vwap_lower = float(vals.get('VWAP -2σ', 0))
                     if not vwap:
-                        vwap = float(vals.get('VWAP', 0))
+                        vwap = guru_vwap
+            
+            ema = emas[0] if emas else 0
             
             result.update({
                 'rsi': rsi, 'macd': macd_hist, 'macd_signal': macd_sig,
-                'macd_value': macd_val, 'vwap': vwap, 'ema': ema, 'sma': sma,
-                'bb_upper': bb_upper, 'bb_lower': bb_lower, 'bb_basis': bb_basis,
-                'volume': volume_str, 'tv_ok': True,
+                'macd_value': macd_val, 'vwap': vwap, 'ema': ema, 'emas': emas,
+                'sma': sma, 'bb_upper': bb_upper, 'bb_lower': bb_lower,
+                'bb_basis': bb_basis, 'volume': volume_str, 'tv_ok': True,
+                'ichi_tenkan': ichi_tenkan, 'ichi_kijun': ichi_kijun,
+                'ichi_span_a': ichi_span_a, 'ichi_span_b': ichi_span_b,
+                'guru_vwap_lower': guru_vwap_lower, 'guru_vwap_upper': guru_vwap_upper,
             })
             
-            # ═══ CONFIDENCE SCORING ENGINE ═══════════════
-            confidence = 0.40  # Base: 40%
+            # ═══ CONFIDENCE SCORING ENGINE v2.0 (11 indicators) ═══
+            confidence = 0.35  # Base: 35% (lowered — more indicators to earn it)
             reasons = []
             
-            # RSI scoring
+            # ── 1. RSI scoring ──
             if rsi > 0:
                 if rsi < 30:
                     confidence += 0.15
@@ -649,55 +672,100 @@ class BeastModeLoop:
                     confidence -= 0.10
                     reasons.append(f"RSI {rsi:.0f} OVERBOUGHT (-10%)")
             
-            # MACD scoring
+            # ── 2. MACD scoring ──
             if macd_hist > 0:
-                confidence += 0.10
-                reasons.append(f"MACD histogram +{macd_hist:.2f} bullish (+10%)")
-                if macd_val > macd_sig and macd_val > 0:
+                confidence += 0.08
+                reasons.append(f"MACD histogram +{macd_hist:.2f} bullish (+8%)")
+                if macd_val > macd_sig:
                     confidence += 0.05
-                    reasons.append(f"MACD above signal = momentum (+5%)")
+                    reasons.append(f"MACD above signal (+5%)")
             elif macd_hist < 0:
                 confidence -= 0.05
                 reasons.append(f"MACD histogram {macd_hist:.2f} bearish (-5%)")
             
-            # VWAP scoring
+            # ── 3. VWAP scoring ──
             if price > 0 and vwap > 0:
                 if price > vwap:
-                    confidence += 0.10
-                    reasons.append(f"Price ${price:.2f} > VWAP ${vwap:.2f} (+10%)")
+                    confidence += 0.08
+                    reasons.append(f"Price > VWAP ${vwap:.2f} (+8%)")
                 else:
                     confidence -= 0.05
-                    reasons.append(f"Price ${price:.2f} < VWAP ${vwap:.2f} (-5%)")
+                    reasons.append(f"Price < VWAP ${vwap:.2f} (-5%)")
             
-            # EMA scoring
-            if price > 0 and ema > 0:
+            # ── 4. EMA RIBBON scoring (NEW!) ──
+            if len(emas) >= 2 and price > 0:
+                sorted_emas = sorted(emas)
+                all_bullish = all(price > e for e in emas)
+                all_stacked = sorted_emas == list(reversed(sorted(emas)))
+                if all_bullish:
+                    confidence += 0.08
+                    reasons.append(f"Price above ALL {len(emas)} EMAs (+8%)")
+                elif price > emas[0]:
+                    confidence += 0.03
+                    reasons.append(f"Price above short EMA (+3%)")
+                else:
+                    confidence -= 0.05
+                    reasons.append(f"Price BELOW EMAs (-5%)")
+            elif price > 0 and ema > 0:
                 if price > ema:
                     confidence += 0.05
-                    reasons.append(f"Price > EMA ${ema:.2f} uptrend (+5%)")
+                    reasons.append(f"Price > EMA ${ema:.2f} (+5%)")
                 else:
                     confidence -= 0.05
-                    reasons.append(f"Price < EMA ${ema:.2f} downtrend (-5%)")
+                    reasons.append(f"Price < EMA (-5%)")
             
-            # Bollinger Bands scoring
+            # ── 5. Bollinger Bands scoring ──
             if price > 0 and bb_upper > 0:
                 if price >= bb_upper:
-                    confidence -= 0.10
-                    reasons.append(f"Price at BB upper ${bb_upper:.2f} EXTENDED (-10%)")
+                    confidence -= 0.08
+                    reasons.append(f"At BB upper ${bb_upper:.2f} EXTENDED (-8%)")
                 elif price <= bb_lower:
                     confidence += 0.10
-                    reasons.append(f"Price at BB lower ${bb_lower:.2f} OVERSOLD (+10%)")
+                    reasons.append(f"At BB lower ${bb_lower:.2f} OVERSOLD (+10%)")
                 else:
                     confidence += 0.03
-                    reasons.append(f"Price inside BB bands (+3%)")
+                    reasons.append(f"Inside BB bands (+3%)")
             
-            # 200 SMA scoring (long-term trend)
+            # ── 6. 200 SMA scoring (long-term trend) ──
             if price > 0 and sma > 0:
                 if price > sma:
-                    confidence += 0.10
-                    reasons.append(f"Price > 200 SMA ${sma:.2f} UPTREND (+10%)")
+                    confidence += 0.08
+                    reasons.append(f"Price > 200 SMA ${sma:.2f} UPTREND (+8%)")
                 else:
+                    confidence -= 0.08
+                    reasons.append(f"Price < 200 SMA DOWNTREND (-8%)")
+            
+            # ── 7. ICHIMOKU CLOUD scoring (NEW!) ──
+            if price > 0 and ichi_span_a > 0 and ichi_span_b > 0:
+                cloud_top = max(ichi_span_a, ichi_span_b)
+                cloud_bottom = min(ichi_span_a, ichi_span_b)
+                if price > cloud_top:
+                    confidence += 0.10
+                    reasons.append(f"ABOVE Ichimoku cloud (+10%) 🟢")
+                elif price < cloud_bottom:
                     confidence -= 0.10
-                    reasons.append(f"Price < 200 SMA ${sma:.2f} DOWNTREND (-10%)")
+                    reasons.append(f"BELOW Ichimoku cloud (-10%) 🔴")
+                else:
+                    reasons.append(f"INSIDE Ichimoku cloud (neutral)")
+                
+                # Tenkan/Kijun cross (momentum signal)
+                if ichi_tenkan > ichi_kijun:
+                    confidence += 0.05
+                    reasons.append(f"Tenkan > Kijun = bullish momentum (+5%)")
+            
+            # ── 8. GURU SCRIPT signals (NEW!) ──
+            if guru_vwap_lower > 0 and guru_vwap_upper > 0 and price > 0:
+                if price <= guru_vwap_lower:
+                    confidence += 0.10
+                    reasons.append(f"At Guru VWAP -2σ ${guru_vwap_lower:.2f} OVERSOLD (+10%)")
+                elif price >= guru_vwap_upper:
+                    confidence -= 0.08
+                    reasons.append(f"At Guru VWAP +2σ EXTENDED (-8%)")
+            
+            # ── 9. PAST WINNER BONUS ──
+            if symbol in PAST_WINNERS:
+                confidence += 0.10
+                reasons.append(f"PAST WINNER bonus (+10%)")
             
             # Cap confidence 0-1
             confidence = max(0.0, min(1.0, confidence))
@@ -1388,14 +1456,18 @@ class BeastModeLoop:
                     runner_target = round(price * 1.06, 2)
                     
                     try:
-                        # ⛔ MANDATORY TV ANALYSIS
                         tv = self._run_tv_analysis(sym)
-                        if not tv['tv_ok']:
+                        is_pw = sym in PAST_WINNERS
+                        if not tv['tv_ok'] and not is_pw:
                             log.error(f"🚨 TV FAILED for {sym} — BLOCKED")
                             continue
-                        tv_conf = tv['confidence']
-                        blended = (conf * 0.5) + (tv_conf * 0.5)
-                        log.info(f"    📊 Phase7B {sym}: strat={conf:.0%} TV={tv_conf:.0%} → {blended:.0%}")
+                        elif not tv['tv_ok'] and is_pw:
+                            log.warning(f"⚠️ TV down but {sym} is PAST WINNER — BYPASS")
+                            blended = conf
+                        else:
+                            tv_conf = tv['confidence']
+                            blended = (conf * 0.5) + (tv_conf * 0.5)
+                            log.info(f"    📊 Phase7B {sym}: strat={conf:.0%} TV={tv_conf:.0%} → {blended:.0%}")
                         if blended < AUTO_EXECUTE_THRESHOLD:
                             log.info(f"    ❌ blended {blended:.0%} too low — SKIP")
                             continue
@@ -1451,13 +1523,17 @@ class BeastModeLoop:
                     runner_target = round(price * 1.06, 2)
                     
                     try:
-                        # ⛔ MANDATORY TV ANALYSIS
                         tv = self._run_tv_analysis(sym)
-                        if not tv['tv_ok']:
+                        is_pw = sym in PAST_WINNERS
+                        if not tv['tv_ok'] and not is_pw:
                             log.error(f"🚨 TV FAILED for {sym} — BLOCKED")
                             continue
-                        tv_conf = tv['confidence']
-                        blended = (conf * 0.5) + (tv_conf * 0.5)
+                        elif not tv['tv_ok'] and is_pw:
+                            log.warning(f"⚠️ TV down but {sym} is PAST WINNER — BYPASS")
+                            blended = conf
+                        else:
+                            tv_conf = tv['confidence']
+                            blended = (conf * 0.5) + (tv_conf * 0.5)
                         if blended < ASK_THRESHOLD:
                             log.info(f"    ❌ {sym}: blended {blended:.0%} too low — SKIP")
                             continue
@@ -1818,17 +1894,21 @@ class BeastModeLoop:
                     runner_target = round(price * 1.06, 2)   # 6% runner
                     
                     try:
-                        # ⛔ MANDATORY: Run TV analysis FIRST
+                        # Run TV analysis — BUT past winners can bypass if TV is down
                         tv = self._run_tv_analysis(sym)
-                        if not tv['tv_ok']:
+                        is_pw = sym in PAST_WINNERS
+                        
+                        if not tv['tv_ok'] and not is_pw:
                             log.error(f"🚨 TV FAILED for {sym} — TRADE BLOCKED (Iron Law 3)")
                             continue
-                        
-                        # Override confidence with TV-calculated confidence
-                        # Blend: 50% strategy confidence + 50% TV confidence
-                        tv_conf = tv['confidence']
-                        blended_confidence = (confidence * 0.5) + (tv_conf * 0.5)
-                        log.info(f"  📊 {sym}: strategy={confidence:.0%} TV={tv_conf:.0%} → blended={blended_confidence:.0%} [{tv['signal']}]")
+                        elif not tv['tv_ok'] and is_pw:
+                            log.warning(f"⚠️ TV down but {sym} is PAST WINNER — BYPASS TV, using strategy confidence only")
+                            blended_confidence = confidence  # Use strategy conf alone
+                        else:
+                            # Blend: 50% strategy confidence + 50% TV confidence
+                            tv_conf = tv['confidence']
+                            blended_confidence = (confidence * 0.5) + (tv_conf * 0.5)
+                            log.info(f"  📊 {sym}: strategy={confidence:.0%} TV={tv_conf:.0%} → blended={blended_confidence:.0%} [{tv['signal']}]")
                         
                         if blended_confidence < AUTO_EXECUTE_THRESHOLD:
                             log.info(f"  ❌ {sym}: blended {blended_confidence:.0%} < {AUTO_EXECUTE_THRESHOLD:.0%} threshold — SKIP")
@@ -1897,15 +1977,18 @@ class BeastModeLoop:
                     runner_target = round(price * 1.06, 2)
                     
                     try:
-                        # ⛔ MANDATORY: Run TV analysis FIRST
                         tv = self._run_tv_analysis(sym)
-                        if not tv['tv_ok']:
-                            log.error(f"🚨 TV FAILED for {sym} — TRADE BLOCKED")
+                        is_pw = sym in PAST_WINNERS
+                        if not tv['tv_ok'] and not is_pw:
+                            log.error(f"🚨 TV FAILED for {sym} — BLOCKED")
                             continue
-                        
-                        tv_conf = tv['confidence']
-                        blended = (confidence * 0.5) + (tv_conf * 0.5)
-                        log.info(f"  📊 {sym}: strategy={confidence:.0%} TV={tv_conf:.0%} → blended={blended:.0%}")
+                        elif not tv['tv_ok'] and is_pw:
+                            log.warning(f"⚠️ TV down but {sym} is PAST WINNER — BYPASS")
+                            blended = confidence
+                        else:
+                            tv_conf = tv['confidence']
+                            blended = (confidence * 0.5) + (tv_conf * 0.5)
+                            log.info(f"  📊 {sym}: strategy={confidence:.0%} TV={tv_conf:.0%} → blended={blended:.0%}")
                         
                         if blended < ASK_THRESHOLD:
                             log.info(f"  ❌ {sym}: blended {blended:.0%} too low — SKIP")

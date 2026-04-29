@@ -101,12 +101,12 @@ class TradingViewAnalyst:
             if 'relative strength' in name or name == 'rsi':
                 signals.rsi = self._parse_float(values.get('RSI', '50'))
 
-            elif 'macd' in name:
+            elif 'macd' in name or 'convergence divergence' in name:
                 signals.macd = self._parse_float(values.get('MACD', '0'))
                 signals.macd_signal = self._parse_float(values.get('Signal', '0'))
                 signals.macd_histogram = self._parse_float(values.get('Histogram', '0'))
 
-            elif 'vwap' == name or name == 'volume weighted average price':
+            elif 'vwap' in name or 'volume weighted average' in name:
                 signals.vwap = self._parse_float(values.get('VWAP', '0'))
 
             elif 'bollinger' in name:

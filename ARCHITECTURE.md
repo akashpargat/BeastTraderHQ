@@ -573,27 +573,69 @@ graph LR
 ## 10. TradingView Integration
 
 ### How It Works
-- TradingView Desktop (MSIX app) auto-serves Chrome DevTools Protocol on port 9222
-- The MSIX app IGNORES command line arguments — CDP is always on
-- Python connects via WebSocket to the `/chart` page target
+- TradingView Desktop (MSIX app) serves Chrome DevTools Protocol on port 9222
+- **CRITICAL**: Must launch with `--remote-debugging-port=9222` flag
+- The MSIX app does NOT auto-enable CDP — it must be explicitly launched with the flag
+- On Windows Server (VM), need to `takeown` + `icacls` the WindowsApps folder first
+- Python connects via WebSocket to the `/chart/` page target (NOT the homepage!)
 - Must use `suppress_origin=True` on WebSocket connection (avoids 403)
+
+### VM Setup (One-Time)
+```powershell
+# 1. Take ownership of TV app folder (Admin cmd)
+takeown /f "C:\Program Files\WindowsApps\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj" /r /d Y
+icacls "C:\Program Files\WindowsApps\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj" /grant beastadmin:F /t
+
+# 2. Launch with CDP flag
+"C:\Program Files\WindowsApps\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj\TradingView.exe" --remote-debugging-port=9222
+
+# 3. Verify: http://localhost:9222/json should show TV targets
+```
+
+### Study Name Matching (Case-Insensitive, Partial)
+TV returns full study names, not abbreviations. The `tv_analyst.py` uses partial matching:
+| TV Study Name | Match Pattern | What We Read |
+|---------------|--------------|-------------|
+| `Relative Strength Index` | `'relative strength' in name` | RSI value |
+| `Moving Average Convergence Divergence` | `'convergence divergence' in name` | MACD, Histogram, Signal |
+| `Volume Weighted Average Price` | `'volume weighted average' in name` | VWAP |
+| `Bollinger Bands` | `'bollinger' in name` | Upper, Basis, Lower |
+| `Moving Average Exponential` | `'exponential' in name` | EMA (first=9, second=21) |
+| `Moving Average` | `'moving average' in name` (not exponential) | SMA 20 |
+| `Guru Shopping Test` | `'guru' in name` | Custom strategy signals |
+
+### CDP Target Selection
+Multiple targets exist on port 9222. Must find the `/chart/` page:
+```python
+# WRONG: finds homepage (no chart data)
+for t in targets:
+    if 'tradingview.com' in t['url']:  # Matches homepage!
+
+# RIGHT: find the chart page specifically
+for t in targets:
+    if 'tradingview.com/chart' in t['url'] and t['type'] == 'page':
+```
 
 ### What We Read from TV
 | Indicator | Source | Usage |
 |-----------|--------|-------|
 | RSI (14) | Built-in study | Overbought/oversold detection |
-| MACD | Built-in study | Momentum + divergence |
+| MACD + Histogram | Built-in study | Momentum + divergence |
 | VWAP | Built-in study | Institutional buy/sell level |
 | Bollinger Bands | Built-in study | Volatility + mean reversion |
 | EMA 9/21 | Built-in study | Trend direction + crossovers |
-| SMA 20/200 | Built-in study | Long-term trend |
-| Volume Ratio | Calculated | Current vs 20-bar average |
+| SMA 20 | Built-in study | Long-term trend |
+| Ichimoku Cloud | Built-in study | Support/resistance |
+| Volume | Built-in study | Volume analysis |
+| Guru Shopping | Custom Pine | FVG, R2G, VWAP-σ signals |
 | Confluence Score | Calculated | How many indicators agree (0-10) |
 
-### After-Hours Behavior
-- TV study values show ∅ after market close — THIS IS NORMAL
-- The bot handles this gracefully (shows "After hours" in reports)
-- During market hours (9:30 AM - 4:00 PM ET), all values populate
+### Known Issues (Solved)
+1. **Chrome background throttling**: Chrome suspends inactive tabs → study values empty. Fix: use TV Desktop app instead.
+2. **MSIX access denied**: Can't launch TV Desktop directly. Fix: `takeown` + `icacls` on WindowsApps folder.
+3. **CDP targeting homepage**: Code found first tradingview.com match (homepage, no data). Fix: match `/chart/` specifically.
+4. **Study name mismatch**: TV returns full names like "Moving Average Convergence Divergence" not "MACD". Fix: case-insensitive partial matching.
+5. **Studies loading delay**: After `set_symbol()`, need 5s+ wait for indicators to recalculate. Fix: retry if only Volume loads.
 
 ---
 
