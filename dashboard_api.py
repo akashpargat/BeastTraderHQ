@@ -210,6 +210,89 @@ def health():
     return jsonify({'status': 'ok', 'time': datetime.now(ET).isoformat()})
 
 
+# ── INTRADAY P&L (for live chart) ──────────────────────
+
+@app.route('/api/intraday')
+def intraday_pnl():
+    """Intraday equity snapshots for live P&L chart."""
+    db = _get_db()
+    rows = db.conn.execute("""
+        SELECT timestamp, equity, total_pl, positions_count
+        FROM equity_curve
+        WHERE date(timestamp) = date('now')
+        ORDER BY timestamp ASC
+    """).fetchall()
+    db.close()
+    return jsonify({'data': [dict(r) for r in rows], 'count': len(rows)})
+
+
+# ── ACTION FEED (live timeline) ────────────────────────
+
+@app.route('/api/actions')
+def action_feed():
+    """Live feed of all bot actions: trades, alerts, scans."""
+    db = _get_db()
+    limit = request.args.get('limit', 30, type=int)
+
+    # Combine trades + alerts into one timeline
+    trades = db.conn.execute("""
+        SELECT created_at as timestamp, 'TRADE' as type,
+               side || ' ' || symbol || ' x' || qty || ' @ $' || printf('%.2f', price) as title,
+               reason as detail
+        FROM trades ORDER BY created_at DESC LIMIT ?
+    """, (limit,)).fetchall()
+
+    alerts = db.conn.execute("""
+        SELECT timestamp, alert_type as type, symbol as title, message as detail
+        FROM alerts_log ORDER BY timestamp DESC LIMIT ?
+    """, (limit,)).fetchall()
+
+    scans = db.conn.execute("""
+        SELECT timestamp, 'SCAN' as type,
+               scan_type || ' | ' || regime || ' | SPY:' || printf('%.2f%%', spy_change*100) as title,
+               'TV:' || tv_reads || ' Sent:' || sentiments || ' AI:' || ai_calls || ' Trump:' || trump_score as detail
+        FROM scan_log ORDER BY timestamp DESC LIMIT ?
+    """, (limit,)).fetchall()
+
+    # Merge and sort by time
+    all_actions = [dict(r) for r in trades] + [dict(r) for r in alerts] + [dict(r) for r in scans]
+    all_actions.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+
+    db.close()
+    return jsonify({'actions': all_actions[:limit]})
+
+
+# ── SENTIMENT MATRIX ───────────────────────────────────
+
+@app.route('/api/sentiment')
+def sentiment_matrix():
+    """Per-stock sentiment scores from all sources."""
+    try:
+        from sentiment_analyst import SentimentAnalyst
+        gw = _get_gateway()
+        positions = gw.get_positions()
+        sa = SentimentAnalyst()
+        results = {}
+        for p in positions[:12]:
+            try:
+                s = sa.analyze(p.symbol)
+                results[p.symbol] = {
+                    'yahoo': s.yahoo_score, 'reddit': s.reddit_score,
+                    'analyst': s.analyst_score, 'total': s.total_score,
+                }
+            except:
+                results[p.symbol] = {'yahoo': 0, 'reddit': 0, 'analyst': 0, 'total': 0}
+        # Trump
+        try:
+            t_score, t_headlines = sa.get_trump_sentiment()
+            results['_trump'] = {'score': t_score, 'headlines': t_headlines[:5]}
+        except:
+            results['_trump'] = {'score': 0, 'headlines': []}
+        return jsonify(results)
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
 @app.route('/')
 def index():
     return jsonify({
@@ -217,7 +300,8 @@ def index():
         'endpoints': [
             '/api/portfolio', '/api/trades', '/api/trades/today',
             '/api/scans', '/api/equity', '/api/analytics',
-            '/api/system', '/api/debug', '/api/alerts', '/api/health'
+            '/api/system', '/api/debug', '/api/alerts', '/api/health',
+            '/api/intraday', '/api/actions', '/api/sentiment'
         ]
     })
 
