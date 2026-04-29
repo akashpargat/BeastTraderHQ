@@ -1257,6 +1257,18 @@ DIP_BUY_WATCHLIST = ['AAPL', 'AMZN', 'GOOGL', 'META', 'MSFT', 'NVDA', 'TSLA',
                      'SOFI', 'COIN', 'ROKU', 'SQ', 'SNAP', 'UBER', 'SHOP',
                      'MU', 'MRVL', 'ARM', 'SMCI', 'NOK', 'PLUG', 'NIO', 'RIVN']
 
+# Past winners — scan these FIRST (Phase 0, Rule #21)
+PAST_WINNERS = ['NOK', 'GOOGL', 'CRM', 'META', 'MSFT', 'NOW', 'AMD', 'NVDA',
+                'OXY', 'DVN', 'INTC', 'ORCL', 'MSTR', 'COIN', 'HOOD']
+
+# Rule #29: Don't chase stocks already up >5% WITHOUT catalyst
+# NOK +18% with NVIDIA deal = OK. Random +5% no news = BLOCK.
+MAX_CHASE_PCT = 5.0
+CATALYST_SENTIMENT_THRESHOLD = 3  # sentiment >= +3 = has catalyst, allow chase
+
+# Law 9: Max simultaneous scalp positions (< 2% profit)
+MAX_ACTIVE_SCALPS = 3
+
 # Telegram notifier (sends to BOTH Telegram + Discord)
 _notifier = None
 def _tg(message: str):
@@ -1500,45 +1512,75 @@ async def position_monitor():
 
             _prev_prices[p.symbol] = p.current_price
 
+        # ── LAW 9: Count active scalps (positions < +2%) ──
+        active_scalps = sum(1 for p in positions if 0 < _pct(p) < 2.0)
+
         # ── AUTO-BUY DIPS (Akash Method) ──
         if _is_market_hours() and _cycle_count % 5 == 0:
+            # Law 9: Max 3 active scalps at a time
+            if active_scalps >= MAX_ACTIVE_SCALPS:
+                log.info(f"  Law 9: {active_scalps} active scalps (max {MAX_ACTIVE_SCALPS}). Skipping new buys.")
+            else:
+                try:
+                    from alpaca.data.historical import StockHistoricalDataClient
+                    from alpaca.data.requests import StockSnapshotRequest
+                    dc = StockHistoricalDataClient(os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'))
+                    watch = [s for s in DIP_BUY_WATCHLIST if s not in held_symbols][:8]
+                    if watch:
+                        snaps = dc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=watch, feed='iex'))
+                        for sym, snap in snaps.items():
+                            try:
+                                price = float(snap.latest_trade.price)
+                                prev_close = float(snap.previous_daily_bar.close)
+                                day_change = (price - prev_close) / prev_close * 100
+                                # Akash Method: buy if >5% daily drop
+                                if day_change <= -5.0 and not _prev_prices.get(f"_dipbuy_{sym}"):
+                                    acct = gateway.get_account()
+                                    equity = float(acct.get('equity', 100000))
+                                    qty = max(1, int(equity * 0.03 / price))
+                                    buy_price = round(price * 0.998, 2)
+                                    gateway.quick_buy(sym, qty, buy_price,
+                                                      reason=f"Akash Method: {day_change:+.1f}% dip",
+                                                      day_change_pct=day_change)
+                                    _prev_prices[f"_dipbuy_{sym}"] = True
+                                    _log_trade("LIMIT BUY (Akash Method)", sym, qty, buy_price,
+                                               f"{day_change:+.1f}% daily drop. Oversold dip buy.", "60s Monitor")
+                                    if channel:
+                                        await channel.send(
+                                            f"📉 **[60s] AKASH DIP BUY: {sym}** {day_change:+.1f}%\n"
+                                            f"Buy {qty} @ ${buy_price} | Exit: +2% (${buy_price * 1.02:.2f})")
+                            except:
+                                pass
+                except Exception as e:
+                    log.debug(f"Dip scan: {e}")
+
+        # ── PHASE 0: Past Winners scan (Rule #21) ──
+        if _is_market_hours() and _cycle_count % 10 == 0 and active_scalps < MAX_ACTIVE_SCALPS:
             try:
                 from alpaca.data.historical import StockHistoricalDataClient
                 from alpaca.data.requests import StockSnapshotRequest
                 dc = StockHistoricalDataClient(os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'))
-                watch = [s for s in DIP_BUY_WATCHLIST if s not in held_symbols][:8]
-                if watch:
-                    snaps = dc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=watch, feed='iex'))
+                pw_watch = [s for s in PAST_WINNERS if s not in held_symbols][:10]
+                if pw_watch:
+                    snaps = dc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=pw_watch, feed='iex'))
                     for sym, snap in snaps.items():
                         try:
                             price = float(snap.latest_trade.price)
                             prev_close = float(snap.previous_daily_bar.close)
                             day_change = (price - prev_close) / prev_close * 100
-                            # Akash Method: buy if >5% daily drop
-                            if day_change <= -5.0 and not _prev_prices.get(f"_dipbuy_{sym}"):
-                                acct = gateway.get_account()
-                                equity = float(acct.get('equity', 100000))
-                                qty = max(1, int(equity * 0.03 / price))
-                                buy_price = round(price * 0.998, 2)
-                                gateway.quick_buy(sym, qty, buy_price,
-                                                  reason=f"Akash Method: {day_change:+.1f}% dip")
-                                _prev_prices[f"_dipbuy_{sym}"] = True
-                                _log_trade("LIMIT BUY (Akash Method)", sym, qty, buy_price,
-                                           f"{day_change:+.1f}% daily drop. Oversold dip buy → limit sell at +2% → repeat.", "60s Monitor")
+                            # Past winner running >3% = opportunity
+                            if day_change >= 3.0 and not _prev_prices.get(f"_pw_{sym}"):
+                                _prev_prices[f"_pw_{sym}"] = True
                                 if channel:
                                     await channel.send(
-                                        f"📉 **[60s MONITOR] AKASH METHOD DIP BUY: {sym}**\n"
-                                        f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                                        f"📉 Daily drop: **{day_change:+.1f}%** — Oversold!\n"
-                                        f"📋 **Action:** Limit buy {qty} shares @ ${buy_price}\n"
-                                        f"💰 **Cost:** ~${buy_price * qty:,.2f} (3% of portfolio)\n"
-                                        f"🎯 **Exit plan:** Limit sell at +2% (${buy_price * 1.02:.2f})\n"
-                                        f"🧠 **Why:** Akash Method — buy oversold dips, set limit sell, repeat. {sym} dropped {day_change:+.1f}% today, likely bounce candidate."
-                                    )
+                                        f"🏆 **[PHASE 0] PAST WINNER ALERT: {sym}** +{day_change:.1f}%\n"
+                                        f"${price:.2f} (prev ${prev_close:.2f}) — Past winner running!\n"
+                                        f"Check catalyst before buying. Use `!scan {sym}` for deep analysis.")
+                                log.info(f"  🏆 Phase 0: past winner {sym} +{day_change:.1f}%")
                         except:
                             pass
             except Exception as e:
-                log.debug(f"Dip scan: {e}")
+                log.debug(f"Phase 0 scan: {e}")
 
         # Summary every 5 cycles + Telegram
         if _cycle_count % 5 == 0 and channel:

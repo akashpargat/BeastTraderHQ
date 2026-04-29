@@ -207,10 +207,18 @@ class ConfidenceEngine:
 
         # Technical score (RSI position, MACD, VWAP)
         tech_score = 0.5
+        if tech.rsi == 0 and tech.macd_histogram == 0 and tech.ema_9 == 0:
+            # NO TV DATA = NO TRADE. Iron clad rule.
+            return 0.0
+
+        # Rule 30: RSI>70 is OK if sentiment is strong (catalyst-driven momentum)
         if tech.is_oversold:
             tech_score = 0.8  # Strong buy zone
         elif tech.is_overbought:
-            tech_score = 0.1  # Danger zone
+            if sent.total_score >= 3:
+                tech_score = 0.6  # RSI>70 BUT catalyst = still OK (Rule 30: INTC lesson)
+            else:
+                tech_score = 0.1  # RSI>70 no catalyst = danger
         if tech.above_vwap:
             tech_score += 0.1
         if tech.macd_histogram > 0:

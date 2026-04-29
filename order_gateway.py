@@ -171,10 +171,33 @@ class OrderGateway:
                 )
 
     def quick_buy(self, symbol: str, qty: int, limit_price: float,
-                  reason: str = "dip buy") -> OrderRecord:
-        """Simplified buy for auto-dip-buy. Skips Iron Laws validation (quick entry)."""
+                  reason: str = "dip buy", day_change_pct: float = 0,
+                  sentiment_score: int = 0) -> OrderRecord:
+        """Simplified buy for auto-dip-buy. Has safety checks but skips full Iron Laws."""
         with self._lock:
             try:
+                # Law 8: 5-minute cooldown after selling same stock (no emotional re-entries)
+                last_sold = self.last_sell_times.get(symbol)
+                if last_sold and (datetime.now() - last_sold).total_seconds() < 300:
+                    mins_ago = (datetime.now() - last_sold).total_seconds() / 60
+                    log.warning(
+                        f"⛔ LAW 8: {symbol} sold {mins_ago:.0f}min ago. "
+                        f"5-min cooldown — no emotional re-entries."
+                    )
+                    return OrderRecord(symbol=symbol, side=OrderSide.BUY, state=OrderState.REJECTED,
+                                       error=f"Law 8: sold {mins_ago:.0f}min ago")
+
+                # Rule 29: Don't chase +5% WITHOUT catalyst
+                # If sentiment >= +3, stock has real catalyst (earnings/upgrade/deal) — allow
+                # If sentiment < +3, it's just momentum — block chase
+                if day_change_pct > 5.0 and sentiment_score < 3:
+                    log.warning(
+                        f"⛔ RULE 29: {symbol} +{day_change_pct:.1f}% with weak sentiment ({sentiment_score:+d}). "
+                        f"No catalyst — don't chase. (Would allow if sentiment >= +3)"
+                    )
+                    return OrderRecord(symbol=symbol, side=OrderSide.BUY, state=OrderState.REJECTED,
+                                       error=f"Rule 29: +{day_change_pct:.1f}% no catalyst")
+
                 # Check portfolio heat (max 60% invested)
                 try:
                     acct = self.client.get_account()
