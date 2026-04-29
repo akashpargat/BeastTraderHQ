@@ -915,20 +915,21 @@ C:\beast-test2\
 4. Split positions (scalp + runner)
 5. Pre-market/after-hours scanning
 6. Sector rotation scanning (10 sectors, 48 stocks)
-7. Reddit/Yahoo/Google News/Analyst sentiment (5 sources)
+7. **9 sentiment sources** (Yahoo + Reddit WSB + Analyst + Google News + StockTwits + Earnings + Short Interest + Finviz + Fear/Greed VIX)
 8. Position monitoring (60s cadence)
 9. Auto-buy dips (Akash Method) + Auto-sell (scalp/runner)
-10. AI analysis (Claude Opus 4.7)
+10. **Hybrid AI** (Azure GPT-4o for 5min + Claude Opus 4.7 for 30min deep)
 11. Live dashboard (beast-trader.com)
+12. **Auto-trailing-stop protection** (3% trail on every unprotected position)
+13. **Anti-buyback-higher** (won't re-buy stock at higher price than sold)
+14. **30-stock expanded watchlist** (SOFI, COIN, ARM, SMCI, etc.)
+15. **Short squeeze detection** (>20% short float auto-alert)
+16. **Earnings proximity alerts** (warns before earnings dates)
 
 ### Critical Gaps 🔴 (Priority Order)
 
-#### #1 TRAILING STOPS (Biggest Single Improvement)
-**Current**: Fixed limit sells ($540 for MU)
-**Pro**: Dynamic trailing stops that MOVE UP with price
-**Why**: If MU runs to $580, our $540 sell already filled and we missed $40/share. A 2% trail would sell at $568.
-**Implementation**: Alpaca has `trailing_stop` order type built-in. Change `place_sell()` in `order_gateway.py` to use `trail_percent=2.0`.
-**Impact**: 30-50% more profit on runners
+#### #1 TRAILING STOPS ✅ DONE
+**Implemented**: Auto-trailing-stop in `position_monitor()` — every 3 cycles checks for unprotected positions and places 3% trailing stops automatically. Also `place_trailing_stop()` in `order_gateway.py` with Iron Law 17 (min 2% trail).
 
 #### #2 BRACKET ORDERS (OCO)
 **Current**: Manually place buy, then separately place sells
