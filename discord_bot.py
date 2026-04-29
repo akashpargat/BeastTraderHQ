@@ -1294,6 +1294,10 @@ def _get_tv_indicators(symbol: str) -> dict:
             log.debug(f"  TV: no study values for {symbol} (after-hours?)")
             return {}
 
+        # Log raw study names for debugging
+        study_names = [s.get('name', '?') for s in studies]
+        log.info(f"  TV {symbol} raw studies: {study_names}")
+
         # Parse via TV analyst
         from tv_analyst import TradingViewAnalyst
         tva = TradingViewAnalyst()

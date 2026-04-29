@@ -93,38 +93,38 @@ class TradingViewAnalyst:
 
         signals = TechnicalSignals(symbol=symbol, timestamp=datetime.now())
 
-        # Parse study values
+        # Parse study values — use partial name matching (case-insensitive)
         for study in studies:
-            name = study.get('name', '')
+            name = study.get('name', '').lower()
             values = study.get('values', {})
 
-            if name == 'Relative Strength Index':
+            if 'relative strength' in name or name == 'rsi':
                 signals.rsi = self._parse_float(values.get('RSI', '50'))
 
-            elif name == 'MACD':
+            elif 'macd' in name:
                 signals.macd = self._parse_float(values.get('MACD', '0'))
                 signals.macd_signal = self._parse_float(values.get('Signal', '0'))
                 signals.macd_histogram = self._parse_float(values.get('Histogram', '0'))
 
-            elif name == 'VWAP':
+            elif 'vwap' == name or name == 'volume weighted average price':
                 signals.vwap = self._parse_float(values.get('VWAP', '0'))
 
-            elif name == 'Bollinger Bands':
+            elif 'bollinger' in name:
                 signals.bb_upper = self._parse_float(values.get('Upper', '0'))
                 signals.bb_mid = self._parse_float(values.get('Basis', '0'))
                 signals.bb_lower = self._parse_float(values.get('Lower', '0'))
 
-            elif name == 'Moving Average Exponential':
+            elif 'exponential' in name or 'ema' in name:
                 ma = self._parse_float(values.get('MA', '0'))
                 if signals.ema_9 == 0:
                     signals.ema_9 = ma
                 else:
                     signals.ema_21 = ma
 
-            elif name == 'Moving Average':
+            elif 'moving average' in name and 'exponential' not in name:
                 signals.sma_20 = self._parse_float(values.get('MA', '0'))
 
-            elif 'Guru Shopping' in name:
+            elif 'guru' in name:
                 # Custom strategy indicator
                 guru_vwap = self._parse_float(values.get('VWAP', '0'))
                 if guru_vwap > 0:
