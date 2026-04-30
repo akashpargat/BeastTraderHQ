@@ -1255,11 +1255,17 @@ _tv_client = None
 DIP_BUY_WATCHLIST = ['AAPL', 'AMZN', 'GOOGL', 'META', 'MSFT', 'NVDA', 'TSLA',
                      'AMD', 'TSM', 'INTC', 'CRM', 'PLTR', 'OXY', 'DVN', 'LMT',
                      'SOFI', 'COIN', 'ROKU', 'SQ', 'SNAP', 'UBER', 'SHOP',
-                     'MU', 'MRVL', 'ARM', 'SMCI', 'NOK', 'PLUG', 'NIO', 'RIVN']
+                     'MU', 'MRVL', 'ARM', 'SMCI', 'NOK', 'PLUG', 'NIO', 'RIVN',
+                     'AVGO', 'QCOM', 'HOOD', 'MSTR', 'F', 'ORCL', 'NOW',
+                     'CRWD', 'PANW', 'NET', 'DDOG', 'ZS',  # cybersecurity/cloud
+                     'XOM', 'CVX', 'SLB', 'HAL',            # energy
+                     'BA', 'RTX', 'GD', 'NOC',              # defense
+                     'TQQQ', 'SOXL']                         # leveraged for momentum
 
 # Past winners — scan these FIRST (Phase 0, Rule #21)
 PAST_WINNERS = ['NOK', 'GOOGL', 'CRM', 'META', 'MSFT', 'NOW', 'AMD', 'NVDA',
-                'OXY', 'DVN', 'INTC', 'ORCL', 'MSTR', 'COIN', 'HOOD']
+                'OXY', 'DVN', 'INTC', 'ORCL', 'MSTR', 'COIN', 'HOOD',
+                'AVGO', 'AMZN', 'TSLA', 'PLTR', 'MU', 'TSM']
 
 # Rule #29: Don't chase stocks already up >5% WITHOUT catalyst
 # NOK +18% with NVIDIA deal = OK. Random +5% no news = BLOCK.
@@ -1456,84 +1462,84 @@ async def position_monitor():
         greens = sum(1 for p in positions if p.unrealized_pl >= 0)
         held_symbols = {p.symbol for p in positions}
 
-        # ── AUTO-PROTECT: place 3% trailing stop on any unprotected position ──
+        # ── ACTIVE SCALPER: only protect RED, actively trade GREEN ──
         if _is_trading_hours() and _cycle_count % 3 == 0:
             try:
                 open_orders = await asyncio.to_thread(gateway.get_open_orders)
-                # Build set of symbols that already have trailing stops
                 protected = set()
                 for o in open_orders:
-                    if 'trailing' in str(o.get('type', '')).lower() or 'trail' in str(o.get('client_order_id', '')).lower():
+                    if 'trailing' in str(o.get('type', '')).lower():
                         protected.add(o.get('symbol', ''))
                 for p in positions:
-                    if p.symbol not in protected and p.qty_available and p.qty_available > 0:
+                    pct = _pct(p)
+                    # Only trail RED positions that aren't already protected
+                    if pct < 0 and p.symbol not in protected and p.qty_available and p.qty_available > 0:
                         try:
-                            # Iron Law 14: trail only HALF — keep other half free for active scalping
                             trail_qty = max(1, p.qty_available // 2)
                             gateway.place_trailing_stop(p.symbol, trail_qty, trail_percent=3.0,
-                                                        reason="Auto-protect (no trailing stop found)",
+                                                        reason=f"Protect RED {pct:.1f}%",
                                                         entry_price=p.avg_entry)
-                            _log_trade("TRAILING STOP (Auto-Protect)", p.symbol, trail_qty, 0,
-                                       f"3% trail on {trail_qty} unprotected shares", "60s Monitor")
-                            if channel:
-                                await channel.send(
-                                    f"🛡️ **[60s] AUTO-PROTECT: {p.symbol}** — 3% trailing stop on {trail_qty} shares\n"
-                                    f"No existing trailing stop found. Protecting against downside.")
-                            log.info(f"  🛡️ Auto-protect: {p.symbol} {trail_qty} shares with 3% trail")
-                            _pg_log("PROTECT", symbol=p.symbol, qty=trail_qty, reason="3% trailing stop placed", source="60s")
-                        except Exception as e:
-                            log.debug(f"Auto-protect {p.symbol}: {e}")
-            except Exception as e:
-                log.debug(f"Auto-protect scan: {e}")
+                            _log_trade("TRAILING STOP", p.symbol, trail_qty, 0,
+                                       f"RED {pct:.1f}% — protecting {trail_qty} shares", "60s")
+                            _pg_log("PROTECT", symbol=p.symbol, qty=trail_qty, reason=f"RED {pct:.1f}%", source="60s")
+                        except:
+                            pass
+            except:
+                pass
 
         for p in positions:
             prev = _prev_prices.get(p.symbol, p.current_price)
             pct = _pct(p)
+            avail = p.qty_available or 0
 
-            # ── AUTO-RUNNER: +5% → sell half (only if shares available) ──
-            if pct >= 5.0 and not _prev_prices.get(f"_runner_{p.symbol}") and _is_trading_hours():
-                avail = p.qty_available or 0
-                half = max(1, min(avail, p.qty // 2))
-                if avail < 1:
-                    log.info(f"  {p.symbol} +{pct:.1f}% runner but 0 shares available (held by orders)")
-                    _pg_log("BLOCKED", symbol=p.symbol, reason=f"+{pct:.1f}% runner but 0 shares available", source="60s")
-                else:
+            # Track intraday high for dip detection
+            high_key = f"_hi_{p.symbol}"
+            if p.current_price > _prev_prices.get(high_key, 0):
+                _prev_prices[high_key] = p.current_price
+
+            if _is_trading_hours() and avail > 0:
+                # ── SCALP SELL: +2% → sell available shares, allow re-scalp after 15 min ──
+                last_scalp = _prev_prices.get(f"_scalp_t_{p.symbol}", 0)
+                if pct >= 2.0 and time.time() - last_scalp > 900:  # 15 min cooldown
+                    sell_qty = max(1, avail // 2) if avail > 1 else avail
+                    sell_price = round(p.current_price * 0.999, 2)
                     try:
-                        sell_price = round(p.current_price * 0.999, 2)
-                        gateway.place_sell(p.symbol, half, sell_price,
-                                          reason=f"Auto-runner +{pct:.1f}%")
-                        _prev_prices[f"_runner_{p.symbol}"] = True
-                        _log_trade("LIMIT SELL (Runner)", p.symbol, half, sell_price,
-                                   f"+{pct:.1f}% runner — selling {half} to lock profit.", "60s Monitor")
+                        gateway.place_sell(p.symbol, sell_qty, sell_price,
+                                          reason=f"Scalp +{pct:.1f}%", entry_price=p.avg_entry)
+                        _prev_prices[f"_scalp_t_{p.symbol}"] = time.time()
+                        _log_trade("SCALP SELL", p.symbol, sell_qty, sell_price,
+                                   f"+{pct:.1f}% — selling {sell_qty} for profit", "60s Scalp")
                         if channel:
                             await channel.send(
-                                f"🏃 **[60s] AUTO-RUNNER: {p.symbol}** +{pct:.1f}%\n"
-                                f"Selling {half}/{p.qty} shares @ ${sell_price} (avail: {avail})")
+                                f"🎯 **SCALP: {p.symbol}** +{pct:.1f}% — sell {sell_qty} @ ${sell_price}")
                     except Exception as e:
-                        log.error(f"Auto-runner failed {p.symbol}: {e}")
+                        log.debug(f"Scalp {p.symbol}: {e}")
 
-            # ── AUTO-SCALP: +2% → limit sell half (only if shares available) ──
-            elif pct >= 2.0 and not _prev_prices.get(f"_scalp_{p.symbol}") and _is_trading_hours():
-                avail = p.qty_available or 0
-                half = max(1, min(avail, p.qty // 2))
-                if avail < 1:
-                    log.info(f"  {p.symbol} +{pct:.1f}% scalp but 0 shares available (held by orders)")
-                    _pg_log("BLOCKED", symbol=p.symbol, reason=f"+{pct:.1f}% scalp but 0 shares available", source="60s")
-                else:
-                    try:
-                        sell_price = round(p.avg_entry * 1.025, 2)
-                        sell_price = max(sell_price, round(p.current_price * 1.005, 2))
-                        gateway.place_sell(p.symbol, half, sell_price,
-                                          reason=f"Auto-scalp +{pct:.1f}%")
-                        _prev_prices[f"_scalp_{p.symbol}"] = True
-                        _log_trade("LIMIT SELL (Scalp)", p.symbol, half, sell_price,
-                                   f"+{pct:.1f}% scalp target hit. Selling {half}, keeping rest.", "60s Monitor")
-                        if channel:
-                            await channel.send(
-                                f"🎯 **[60s] AUTO-SCALP: {p.symbol}** +{pct:.1f}%\n"
-                                f"Selling {half}/{p.qty} shares @ ${sell_price} (avail: {avail})")
-                    except Exception as e:
-                        log.error(f"Auto-scalp failed {p.symbol}: {e}")
+            # ── DIP RELOAD: stock dropped >2% from intraday high → buy more for next scalp ──
+            if _is_trading_hours():
+                intraday_high = _prev_prices.get(high_key, 0)
+                if intraday_high > 0 and p.current_price < intraday_high * 0.98 and pct > -3:
+                    dip_pct = (p.current_price - intraday_high) / intraday_high * 100
+                    reload_key = f"_reload_t_{p.symbol}"
+                    if time.time() - _prev_prices.get(reload_key, 0) > 1800:  # 30min cooldown
+                        try:
+                            acct_data = gateway.get_account()
+                            cash = float(acct_data.get('cash', 0))
+                            if cash > 3000:
+                                reload_qty = max(1, int(cash * 0.02 / p.current_price))
+                                buy_price = round(p.current_price * 1.001, 2)
+                                result = gateway.quick_buy(p.symbol, reload_qty, buy_price,
+                                    reason=f"Dip reload {dip_pct:.1f}% from ${intraday_high:.2f}")
+                                if result and result.state.value != 'REJECTED':
+                                    _prev_prices[reload_key] = time.time()
+                                    _log_trade("DIP RELOAD", p.symbol, reload_qty, buy_price,
+                                               f"Dropped {dip_pct:.1f}% from high. Scalp reload.", "60s Reload")
+                                    if channel:
+                                        await channel.send(
+                                            f"📉🟢 **RELOAD: {p.symbol}** {dip_pct:.1f}% dip from ${intraday_high:.2f}\n"
+                                            f"Buy {reload_qty} @ ${buy_price} → scalp at +2%")
+                        except:
+                            pass
 
             # ── DROP ALERT: >2% sudden drop ──
             if prev > 0:
