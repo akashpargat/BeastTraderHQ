@@ -253,24 +253,37 @@ class BeastDB:
 
     def snapshot_positions(self, positions, trailing_stops=None):
         """Save current position state. Called every 60s.
-        positions: list of dicts with symbol, qty, avg_entry, current_price,
-                   unrealized_pl, market_value, pct_change
-        trailing_stops: set/dict of symbols with active trailing stops
+        positions: list of Position objects OR dicts
+        trailing_stops: set of symbols with active trailing stops
         """
         if not positions:
             return
-        trailing_stops = trailing_stops or {}
+        trailing_stops = trailing_stops or set()
         for p in positions:
-            sym = p.get('symbol', '')
+            # Handle both Position objects and dicts
+            if hasattr(p, 'symbol'):
+                sym = p.symbol
+                qty = p.qty
+                entry = float(p.avg_entry) if p.avg_entry else 0
+                price = float(p.current_price) if p.current_price else 0
+                pl = float(p.unrealized_pl) if p.unrealized_pl else 0
+                mv = float(p.market_value) if hasattr(p, 'market_value') and p.market_value else price * qty
+                pct = (pl / (entry * qty) * 100) if entry and qty else 0
+            else:
+                sym = p.get('symbol', '')
+                qty = p.get('qty', 0)
+                entry = float(p.get('avg_entry', 0))
+                price = float(p.get('current_price', 0))
+                pl = float(p.get('unrealized_pl', 0))
+                mv = float(p.get('market_value', 0))
+                pct = float(p.get('pct_change', 0))
             has_ts = sym in trailing_stops
             self._execute(
                 """INSERT INTO position_snapshots
                    (symbol, qty, avg_entry, current_price, unrealized_pl,
                     pct_change, has_trailing_stop, market_value)
                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (sym, p.get('qty'), p.get('avg_entry'),
-                 p.get('current_price'), p.get('unrealized_pl'),
-                 p.get('pct_change'), has_ts, p.get('market_value'))
+                (sym, qty, entry, price, pl, round(pct, 2), has_ts, mv)
             )
 
     def get_position_history(self, symbol, hours=24):
@@ -293,7 +306,8 @@ class BeastDB:
             """INSERT INTO equity_snapshots
                (equity, cash, total_pl, position_count, heat_pct)
                VALUES (%s,%s,%s,%s,%s)""",
-            (equity, cash, total_pl, position_count, heat_pct)
+            (float(equity or 0), float(cash or 0), float(total_pl or 0),
+             int(position_count or 0), round(float(heat_pct or 0), 2))
         )
 
     def get_equity_curve(self, days=30):
@@ -490,16 +504,40 @@ class BeastDB:
     #  Cleanup
     # ══════════════════════════════════════════════
 
-    def cleanup_old_data(self, days=90):
-        """Delete position_snapshots older than N days to control storage."""
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        self._execute(
-            "DELETE FROM position_snapshots WHERE timestamp < %s", (cutoff,)
-        )
-        self._execute(
-            "DELETE FROM equity_snapshots WHERE timestamp < %s", (cutoff,)
-        )
-        log.info(f"🧹 Cleaned up data older than {days} days")
+    def cleanup_old_data(self, days=15):
+        """Purge ALL snapshot data older than 15 days. Keeps DB lean.
+        Activity log and AI verdicts kept for 30 days (audit trail)."""
+        cutoff_15 = datetime.now(timezone.utc) - timedelta(days=15)
+        cutoff_30 = datetime.now(timezone.utc) - timedelta(days=30)
+
+        # 15-day purge: high-frequency data
+        tables_15 = ['position_snapshots', 'equity_snapshots', 'scan_results']
+        for t in tables_15:
+            self._execute(f"DELETE FROM {t} WHERE timestamp < %s", (cutoff_15,))
+
+        # 30-day purge: audit trail
+        tables_30 = ['activity_log', 'ai_verdicts', 'commands']
+        for t in tables_30:
+            self._execute(f"DELETE FROM {t} WHERE timestamp < %s", (cutoff_30,))
+
+        log.info(f"🧹 Purged: snapshots/scans >15d, activity/verdicts/commands >30d")
+
+    def auto_purge(self):
+        """Call this once per day to keep DB clean. Safe to call anytime."""
+        try:
+            # Check last purge time
+            rows = self._execute(
+                "SELECT MAX(timestamp) as last FROM activity_log WHERE action_type = 'PURGE'",
+                fetch=True
+            )
+            last = rows[0].get('last') if rows and rows[0].get('last') else None
+            if last and (datetime.now(timezone.utc) - last).total_seconds() < 86400:
+                return  # Already purged today
+
+            self.cleanup_old_data()
+            self.log_activity('PURGE', reason='Auto-purge: 15d snapshots, 30d audit', source='system')
+        except Exception as e:
+            log.debug(f"Auto-purge: {e}")
 
     # ══════════════════════════════════════════════
     #  Lifecycle

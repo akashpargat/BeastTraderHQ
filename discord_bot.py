@@ -2026,6 +2026,17 @@ async def full_scan():
             except Exception as e:
                 log.debug(f"DB logging failed: {e}")
 
+        # ── PostgreSQL logging ──
+        pg = _get_pg()
+        if pg:
+            try:
+                pg.log_scan('5min', regime=regime.value, spy_change=spy_change,
+                           tv_count=len(tv_data), sentiment_count=len(sentiments),
+                           ai_count=len(ai_verdicts), trump_score=trump_score)
+                pg.auto_purge()  # Daily cleanup
+            except Exception as e:
+                log.debug(f"PG scan log: {e}")
+
     except Exception as e:
         log.error(f"Full scan error: {e}\n{traceback.format_exc()}")
 
