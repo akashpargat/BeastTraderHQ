@@ -68,6 +68,16 @@ def get_ai_stats() -> dict:
     """Get AI health stats (for dashboard/logging)."""
     return dict(_ai_stats)
 
+def _is_trading_hours_check() -> bool:
+    """Returns True during tradeable hours (4 AM - 8 PM ET).
+    Claude fallback only allowed during these hours to save quota."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("America/New_York"))
+    if now.weekday() >= 5:
+        return False
+    return 4 <= now.hour < 20
+
 def _safe_parse_json(text: str) -> dict:
     """Parse JSON from AI response. Handles truncated/malformed responses.
     GPT-5.4 sometimes returns unterminated strings or trailing content."""
@@ -475,7 +485,7 @@ Respond with JSON. confidence MUST be 30-100, never 0."""
                             f"429s today: {_ai_stats['gpt_429s']}")
             else:
                 log.warning(f"  [AI GPT-5.4] FAILED on {symbol} [{elapsed_ms}ms] — {e}")
-            if self._claude_available:
+            if self._claude_available and _is_trading_hours_check():
                 log.info(f"  [AI] GPT-5.4 failed → falling back to Claude quick for {symbol}")
                 _ai_stats['claude_calls'] += 1
                 try:
@@ -490,6 +500,8 @@ Respond with JSON. confidence MUST be 30-100, never 0."""
                     _ai_stats['claude_errors'] += 1
                     _ai_stats['claude_last_error'] = f"{symbol}: {ce}"[:100]
                     log.warning(f"  [AI Claude] ALSO FAILED on {symbol} — {ce}")
+            elif self._claude_available:
+                log.info(f"  [AI] GPT-5.4 failed but outside trading hours (8PM-4AM) — skipping Claude, using deterministic")
             return self._deterministic_fallback(symbol, data)
 
     # ══════════════════════════════════════════════════
