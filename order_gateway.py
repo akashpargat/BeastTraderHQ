@@ -68,6 +68,10 @@ class OrderGateway:
                         unrealized_pl_pct=float(p.unrealized_plpc),
                         side=p.side,
                         qty_available=int(p.qty_available) if hasattr(p, 'qty_available') else int(p.qty),
+                        lastday_price=float(p.lastday_price) if hasattr(p, 'lastday_price') and p.lastday_price else 0.0,
+                        unrealized_intraday_pl=float(p.unrealized_intraday_pl) if hasattr(p, 'unrealized_intraday_pl') and p.unrealized_intraday_pl else 0.0,
+                        unrealized_intraday_plpc=float(p.unrealized_intraday_plpc) if hasattr(p, 'unrealized_intraday_plpc') and p.unrealized_intraday_plpc else 0.0,
+                        change_today=float(p.change_today) if hasattr(p, 'change_today') and p.change_today else 0.0,
                     ))
                 return positions
             except Exception as e:

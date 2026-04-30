@@ -100,7 +100,10 @@ class Position:
     unrealized_pl_pct: float
     side: str = "long"
     qty_available: int = 0  # shares NOT held by open orders
-    lastday_price: float = 0.0  # yesterday's close (for AH % change calc)
+    lastday_price: float = 0.0  # yesterday's close
+    unrealized_intraday_pl: float = 0.0  # today's P&L only
+    unrealized_intraday_plpc: float = 0.0  # today's P&L % (decimal)
+    change_today: float = 0.0  # today's price change % (decimal)
 
     @property
     def is_green(self) -> bool:

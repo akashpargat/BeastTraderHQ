@@ -232,10 +232,7 @@ def portfolio():
     for p in positions:
         cost = p.avg_entry * p.qty
         pct = (p.unrealized_pl / cost * 100) if cost > 0 else 0
-        # Intraday P&L (today's change only)
-        intra_pl = float(p.unrealized_intraday_pl) if hasattr(p, 'unrealized_intraday_pl') and p.unrealized_intraday_pl else 0
-        intra_pct = float(p.unrealized_intraday_plpc) if hasattr(p, 'unrealized_intraday_plpc') and p.unrealized_intraday_plpc else 0
-        daily_pl += intra_pl
+        daily_pl += p.unrealized_intraday_pl
         entry = {
             'symbol': p.symbol,
             'qty': p.qty,
@@ -246,10 +243,10 @@ def portfolio():
             'pnl': float(p.unrealized_pl),
             'pct': round(pct, 2),
             'pnl_pct': round(pct, 2),
-            'intraday_pl': intra_pl,
-            'intraday_pct': round(intra_pct * 100, 2) if abs(intra_pct) < 1 else round(intra_pct, 2),
+            'intraday_pl': float(p.unrealized_intraday_pl),
+            'intraday_pct': round(p.unrealized_intraday_plpc * 100, 2),
+            'change_today': round(p.change_today * 100, 2),
             'is_green': p.unrealized_pl >= 0,
-            'change_today': round(float(p.change_today) * 100, 2) if hasattr(p, 'change_today') and p.change_today else 0,
             'last_tv_data': cached_tv.get(p.symbol),
             'last_sentiment': cached_sent.get(p.symbol),
             'last_ai_verdict': cached_ai.get(p.symbol),

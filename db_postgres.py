@@ -1,5 +1,5 @@
 """
-Beast Terminal V4 — PostgreSQL Database Layer (Schema V4)
+Beast Terminal V4 - PostgreSQL Database Layer (Schema V4)
 =========================================================
 20+ tables, 4 views, 50+ indexes.
 
@@ -20,7 +20,7 @@ Design: PostgreSQL IS the bot's brain. All state persists across restarts.
   - trade_decisions: full audit trail (why we bought/didn't buy)
 
 Alpaca = source of live positions/orders. DB = memory + decisions + analytics.
-Every method handles errors gracefully — bot NEVER crashes from DB issues.
+Every method handles errors gracefully - bot NEVER crashes from DB issues.
 """
 
 import os
@@ -41,7 +41,7 @@ DB_URL = os.getenv('DATABASE_URL', '')
 
 class BeastDB:
     """PostgreSQL database layer with connection pooling and batch operations.
-    Designed for speed at scale — pool reuses connections, batch writes minimize round trips,
+    Designed for speed at scale - pool reuses connections, batch writes minimize round trips,
     and in-memory cache avoids repeated reads of rarely-changing data."""
 
     def __init__(self):
@@ -53,7 +53,7 @@ class BeastDB:
 
     def _connect(self):
         if not DB_URL:
-            log.warning("DATABASE_URL not set — PostgreSQL disabled")
+            log.warning("DATABASE_URL not set - PostgreSQL disabled")
             return
         try:
             # Connection pool: min 1, max 5 connections (B1ms can handle ~50)
@@ -470,7 +470,7 @@ class BeastDB:
     # ══════════════════════════════════════════════
 
     def get_analytics(self):
-        """Dashboard analytics — uses views + aggregations."""
+        """Dashboard analytics - uses views + aggregations."""
         result = {}
         # Strategy performance
         result['strategies'] = self._exec("SELECT * FROM v_strategy_performance", fetch=True)
@@ -485,7 +485,7 @@ class BeastDB:
         return result
 
     def get_debug_info(self):
-        """Debug dashboard — row counts, latest entries, connection status."""
+        """Debug dashboard - row counts, latest entries, connection status."""
         info = {'connected': self.conn is not None, 'tables': {}}
         tables = ['users', 'sessions', 'login_attempts', 'orders', 'ai_verdicts',
                   'tv_readings', 'sentiment_readings', 'equity_snapshots',
@@ -503,7 +503,7 @@ class BeastDB:
         return info
 
     def search_activity(self, query: str, limit=50):
-        """Full-text search across activity log — for debugging."""
+        """Full-text search across activity log - for debugging."""
         return self._exec(
             """SELECT * FROM activity_log 
                WHERE reason ILIKE %s OR action_type ILIKE %s OR symbol ILIKE %s
@@ -535,7 +535,7 @@ class BeastDB:
         log.info(f"🧹 Purged: snapshots>{snapshot_days}d, audit>{audit_days}d, orders>{order_days}d")
 
     def auto_purge(self):
-        """Safe to call every scan — only runs once per day."""
+        """Safe to call every scan - only runs once per day."""
         try:
             rows = self._exec(
                 "SELECT COUNT(*) as cnt FROM activity_log WHERE action_type = 'PURGE' AND created_at > NOW() - interval '23 hours'",
@@ -697,19 +697,19 @@ class BeastDB:
         """Self-learning decision: should we trade this stock based on history?"""
         history = self.get_stock_history(symbol)
         if not history.get('known'):
-            return {'trade': True, 'reason': 'No history — try it', 'size': 'normal'}
+            return {'trade': True, 'reason': 'No history - try it', 'size': 'normal'}
         
         win_rate = history.get('win_rate', 50)
         avg_pnl = history.get('avg_pnl', 0)
         
         if win_rate >= 70 and avg_pnl > 0:
-            return {'trade': True, 'reason': f'{win_rate}% win rate, avg ${avg_pnl:.0f} — go BIGGER', 'size': 'large'}
+            return {'trade': True, 'reason': f'{win_rate}% win rate, avg ${avg_pnl:.0f} - go BIGGER', 'size': 'large'}
         elif win_rate >= 50:
-            return {'trade': True, 'reason': f'{win_rate}% win rate — normal size', 'size': 'normal'}
+            return {'trade': True, 'reason': f'{win_rate}% win rate - normal size', 'size': 'normal'}
         elif win_rate >= 30:
-            return {'trade': True, 'reason': f'{win_rate}% win rate — small size, be careful', 'size': 'small'}
+            return {'trade': True, 'reason': f'{win_rate}% win rate - small size, be careful', 'size': 'small'}
         else:
-            return {'trade': False, 'reason': f'{win_rate}% win rate, avg ${avg_pnl:.0f} — SKIP this stock', 'size': 'none'}
+            return {'trade': False, 'reason': f'{win_rate}% win rate, avg ${avg_pnl:.0f} - SKIP this stock', 'size': 'none'}
 
     # ══════════════════════════════════════════════
     #  EARNINGS PATTERN LEARNING
@@ -750,7 +750,7 @@ class BeastDB:
             play = f'Buy pre-earnings, ride +{avg_gap:.0f}% gap'
         else:
             tendency = 'MIXED'
-            play = 'No clear pattern — skip earnings plays'
+            play = 'No clear pattern - skip earnings plays'
         
         return {
             'known': True,
@@ -819,7 +819,7 @@ class BeastDB:
         return self._exec(sql, params, fetch=True) or []
 
     def get_all_insights_for_stock(self, symbol) -> dict:
-        """Get EVERYTHING we know about a stock — trends + earnings + trade history."""
+        """Get EVERYTHING we know about a stock - trends + earnings + trade history."""
         return {
             'trends': self.get_trends(symbol=symbol),
             'earnings': self.get_earnings_pattern(symbol),
@@ -989,7 +989,7 @@ class BeastDB:
             "CREATE INDEX IF NOT EXISTS idx_daily_reports_date ON daily_reports(report_date DESC)",
 
             # SCAN SNAPSHOTS: ONE row per scan with EVERYTHING (the deep log)
-            # This is the gold mine — every scan, every signal, every verdict, every decision
+            # This is the gold mine - every scan, every signal, every verdict, every decision
             # Stored as JSONB so it's infinitely flexible and fast to write
             """CREATE TABLE IF NOT EXISTS scan_snapshots (
                 id SERIAL PRIMARY KEY,
@@ -1105,40 +1105,69 @@ class BeastDB:
                 is_active BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )""",
-            # Seed blue chips — tier 1 = mega cap (never sell at loss), tier 2 = large cap (hold longer)
+            # Seed blue chips - comprehensive list from Reddit, Motley Fool, Buffett, Pelosi
+            # Tier 1 = mega cap / Magnificent 7 / Dividend Kings (NEVER sell at loss)
+            # Tier 2 = large cap / growth (hold longer but cut at max_loss_pct)
+            # Tier 3 = popular reddit/retail favorites (shorter leash)
             """INSERT INTO blue_chips (symbol, name, sector, tier, max_loss_pct, notes) VALUES
-                ('AAPL', 'Apple', 'tech', 1, -999, 'Mega cap — never sell at loss'),
-                ('MSFT', 'Microsoft', 'tech', 1, -999, 'Mega cap — never sell at loss'),
-                ('GOOGL', 'Alphabet', 'tech', 1, -999, 'Mega cap — never sell at loss'),
-                ('AMZN', 'Amazon', 'tech', 1, -999, 'Mega cap — never sell at loss'),
-                ('META', 'Meta', 'tech', 1, -999, 'Mega cap — never sell at loss'),
-                ('NVDA', 'NVIDIA', 'semi', 1, -999, 'AI leader — never sell at loss'),
-                ('TSLA', 'Tesla', 'auto', 1, -999, 'Volatile but always recovers'),
-                ('AVGO', 'Broadcom', 'semi', 1, -999, 'AI infrastructure — strong'),
-                ('AMD', 'AMD', 'semi', 1, -999, 'AI/gaming — strong recovery'),
-                ('JPM', 'JPMorgan', 'finance', 1, -999, 'Banking leader'),
-                ('V', 'Visa', 'finance', 1, -999, 'Payment monopoly'),
+                ('AAPL', 'Apple', 'tech', 1, -999, 'Mag7 - never sell at loss'),
+                ('MSFT', 'Microsoft', 'tech', 1, -999, 'Mag7 - never sell at loss'),
+                ('GOOGL', 'Alphabet', 'tech', 1, -999, 'Mag7 - never sell at loss'),
+                ('AMZN', 'Amazon', 'tech', 1, -999, 'Mag7 - never sell at loss'),
+                ('META', 'Meta', 'tech', 1, -999, 'Mag7 - never sell at loss'),
+                ('NVDA', 'NVIDIA', 'semi', 1, -999, 'Mag7 - AI king'),
+                ('TSLA', 'Tesla', 'auto', 1, -999, 'Mag7 - volatile but recovers'),
+                ('AVGO', 'Broadcom', 'semi', 1, -999, 'AI infrastructure'),
+                ('AMD', 'AMD', 'semi', 1, -999, 'AI/gaming - strong recovery'),
+                ('TSM', 'TSMC', 'semi', 1, -999, 'Makes all the chips'),
+                ('JPM', 'JPMorgan', 'finance', 1, -999, 'Biggest US bank'),
+                ('V', 'Visa', 'finance', 1, -999, 'Payment monopoly - Buffett holds'),
                 ('MA', 'Mastercard', 'finance', 1, -999, 'Payment monopoly'),
-                ('JNJ', 'J&J', 'health', 1, -999, 'Healthcare staple'),
+                ('GS', 'Goldman Sachs', 'finance', 1, -999, 'Wall Street leader'),
+                ('BRK.B', 'Berkshire', 'finance', 1, -999, 'Buffett - never sell'),
+                ('JNJ', 'J&J', 'health', 1, -999, 'Dividend king 60+ years'),
                 ('UNH', 'UnitedHealth', 'health', 1, -999, 'Healthcare giant'),
+                ('LLY', 'Eli Lilly', 'health', 1, -999, 'Ozempic/Mounjaro - Reddit darling'),
+                ('ABBV', 'AbbVie', 'health', 1, -999, 'Dividend aristocrat'),
                 ('WMT', 'Walmart', 'consumer', 1, -999, 'Recession proof'),
-                ('PG', 'P&G', 'consumer', 1, -999, 'Consumer staple'),
+                ('COST', 'Costco', 'consumer', 1, -999, 'Consumer cult following'),
+                ('PG', 'P&G', 'consumer', 1, -999, 'Consumer staple - Buffett'),
+                ('KO', 'Coca-Cola', 'consumer', 1, -999, 'Dividend king - Buffett holds'),
+                ('PEP', 'PepsiCo', 'consumer', 1, -999, 'Dividend aristocrat'),
                 ('HD', 'Home Depot', 'consumer', 1, -999, 'Housing bellwether'),
-                ('DIS', 'Disney', 'media', 2, -15, 'Tier 2 — cut at -15%'),
-                ('NFLX', 'Netflix', 'media', 2, -15, 'Tier 2 — cut at -15%'),
-                ('ADBE', 'Adobe', 'tech', 2, -15, 'Tier 2 — cut at -15%'),
-                ('CRM', 'Salesforce', 'tech', 2, -10, 'Tier 2 — cut at -10%'),
-                ('ORCL', 'Oracle', 'tech', 2, -10, 'Tier 2 — cut at -10%'),
-                ('COST', 'Costco', 'consumer', 1, -999, 'Consumer staple'),
-                ('PEP', 'PepsiCo', 'consumer', 1, -999, 'Consumer staple'),
-                ('KO', 'Coca-Cola', 'consumer', 1, -999, 'Dividend king'),
-                ('INTC', 'Intel', 'semi', 2, -10, 'Tier 2 — recovering'),
-                ('MU', 'Micron', 'semi', 2, -10, 'Tier 2 — cyclical'),
-                ('QCOM', 'Qualcomm', 'semi', 2, -10, 'Tier 2 — mobile leader'),
-                ('COIN', 'Coinbase', 'fintech', 2, -10, 'Tier 2 — crypto proxy'),
-                ('PLTR', 'Palantir', 'tech', 2, -10, 'Tier 2 — AI/gov'),
-                ('LMT', 'Lockheed', 'defense', 2, -10, 'Tier 2 — defense'),
-                ('BRK.B', 'Berkshire', 'finance', 1, -999, 'Buffett — never sell')
+                ('MCD', 'McDonalds', 'consumer', 1, -999, 'Recession proof - dividend king'),
+                ('XOM', 'ExxonMobil', 'energy', 1, -999, 'Energy giant - Buffett bought'),
+                ('CVX', 'Chevron', 'energy', 1, -999, 'Energy dividend aristocrat'),
+                ('CRM', 'Salesforce', 'tech', 2, -10, 'Cloud leader'),
+                ('ORCL', 'Oracle', 'tech', 2, -10, 'Cloud/AI infrastructure'),
+                ('ADBE', 'Adobe', 'tech', 2, -15, 'Creative monopoly'),
+                ('NFLX', 'Netflix', 'media', 2, -15, 'Streaming leader'),
+                ('DIS', 'Disney', 'media', 2, -15, 'Media empire'),
+                ('INTC', 'Intel', 'semi', 2, -10, 'Foundry recovery play'),
+                ('MU', 'Micron', 'semi', 2, -10, 'Memory cyclical'),
+                ('QCOM', 'Qualcomm', 'semi', 2, -10, 'Mobile/AI chips'),
+                ('PYPL', 'PayPal', 'fintech', 2, -10, 'Fintech recovery - Reddit favorite'),
+                ('SQ', 'Block', 'fintech', 2, -10, 'Fintech - Reddit favorite'),
+                ('UBER', 'Uber', 'tech', 2, -10, 'Ride/delivery monopoly'),
+                ('ABNB', 'Airbnb', 'tech', 2, -12, 'Travel platform'),
+                ('SNOW', 'Snowflake', 'tech', 2, -12, 'Cloud data - Buffett bought'),
+                ('PANW', 'Palo Alto', 'tech', 2, -10, 'Cybersecurity leader'),
+                ('CRWD', 'CrowdStrike', 'tech', 2, -10, 'Cybersecurity - Motley Fool pick'),
+                ('NOW', 'ServiceNow', 'tech', 2, -10, 'Enterprise SaaS leader'),
+                ('SHOP', 'Shopify', 'tech', 2, -12, 'E-commerce platform'),
+                ('NET', 'Cloudflare', 'tech', 2, -12, 'Internet infrastructure'),
+                ('LMT', 'Lockheed', 'defense', 2, -10, 'Defense leader'),
+                ('RTX', 'Raytheon', 'defense', 2, -10, 'Defense/aerospace'),
+                ('COIN', 'Coinbase', 'fintech', 3, -8, 'Reddit crypto proxy'),
+                ('PLTR', 'Palantir', 'tech', 3, -8, 'Reddit AI/gov darling'),
+                ('SOFI', 'SoFi', 'fintech', 3, -8, 'Reddit fintech darling'),
+                ('HOOD', 'Robinhood', 'fintech', 3, -8, 'Reddit meta play'),
+                ('MSTR', 'MicroStrategy', 'fintech', 3, -8, 'Bitcoin proxy - volatile'),
+                ('MARA', 'Marathon Digital', 'crypto', 3, -8, 'Bitcoin miner'),
+                ('RIVN', 'Rivian', 'auto', 3, -8, 'EV startup - Reddit'),
+                ('LCID', 'Lucid', 'auto', 3, -10, 'EV - speculative'),
+                ('ARM', 'ARM Holdings', 'semi', 2, -10, 'Chip architecture monopoly'),
+                ('SMCI', 'Super Micro', 'tech', 3, -8, 'AI server - volatile')
             ON CONFLICT (symbol) DO NOTHING""",
         ]
         for sql in migrations:
@@ -1638,7 +1667,7 @@ class BeastDB:
         }
 
     # ══════════════════════════════════════════════
-    #  FLUSH V4: Smarter — analyze → archive → flush
+    #  FLUSH V4: Smarter - analyze → archive → flush
     # ══════════════════════════════════════════════
 
     def daily_flush_v4(self):
@@ -1704,7 +1733,7 @@ class BeastDB:
                 val, expires = self._cache[key]
                 if _time.time() < expires:
                     return val
-        # Cache miss — fetch from DB
+        # Cache miss - fetch from DB
         val = fetcher()
         with self._cache_lock:
             self._cache[key] = (val, _time.time() + ttl_seconds)
@@ -1719,7 +1748,7 @@ class BeastDB:
 
     def _fire_and_forget(self, sql, params=None):
         """Non-blocking DB write. Errors are logged, never raised.
-        Used for logging — MUST NOT slow trading."""
+        Used for logging - MUST NOT slow trading."""
         try:
             if self._pool:
                 conn = self._pool.getconn()
@@ -1753,7 +1782,7 @@ class BeastDB:
 
     # ══════════════════════════════════════════════════════════
     #  SCAN SNAPSHOTS: One-shot deep log of entire scan
-    #  Everything in one JSONB write — fast, queryable, complete
+    #  Everything in one JSONB write - fast, queryable, complete
     # ══════════════════════════════════════════════════════════
 
     def log_scan_snapshot(self, scan_id: str, scan_type: str, duration_ms: int = 0,
@@ -1765,7 +1794,7 @@ class BeastDB:
                           market_context: dict = None, runners_found: list = None,
                           ai_reasoning: str = None):
         """Log an ENTIRE scan as one row. This is the deep log.
-        Every signal, every verdict, every decision — all in one place.
+        Every signal, every verdict, every decision - all in one place.
         Uses fire-and-forget so it NEVER slows the scan loop."""
         stocks_scanned = len(positions or [])
         stocks_tv = len(tv_data or {})
@@ -1837,7 +1866,7 @@ class BeastDB:
 
     # ══════════════════════════════════════════════════════════
     #  TRADE LOG: Every trade with full context + AI reasoning
-    #  Permanent — never flushed — this is how the bot learns
+    #  Permanent - never flushed - this is how the bot learns
     # ══════════════════════════════════════════════════════════
 
     def log_trade_deep(self, symbol: str, side: str, qty: int, price: float,
@@ -1850,7 +1879,7 @@ class BeastDB:
                        day_change_pct: float = 0, order_result: str = None,
                        order_id: str = None) -> int:
         """Log a trade with EVERY piece of context that led to the decision.
-        This is permanent — the AI learns from this on every deep learn cycle.
+        This is permanent - the AI learns from this on every deep learn cycle.
         Uses fire-and-forget to never slow the trade execution."""
         rows = self._exec(
             """INSERT INTO trade_log (scan_id, symbol, side, qty, price, strategy, source, trigger,
@@ -1910,7 +1939,7 @@ class BeastDB:
         return self._exec(sql, params, fetch=True) or []
 
     def get_trade_win_rate(self, days: int = 30) -> dict:
-        """Win rate analysis for AI learning — which strategies actually work?"""
+        """Win rate analysis for AI learning - which strategies actually work?"""
         return {
             'by_strategy': self._exec(
                 """SELECT strategy, COUNT(*) as total,
@@ -1938,7 +1967,7 @@ class BeastDB:
         }
 
     def get_learning_context_for_stock(self, symbol: str) -> dict:
-        """Get EVERYTHING the bot has learned about a stock — for AI prompts.
+        """Get EVERYTHING the bot has learned about a stock - for AI prompts.
         This is what makes the bot smarter over time. Cached 5 min."""
         cache_key = f"learn_{symbol}"
         return self.cached_get(cache_key, lambda: self._build_learning_context(symbol), ttl_seconds=300)
