@@ -1722,6 +1722,37 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
         steps.append("G5:SKIP no_db")
 
     # ══════════════════════════════════════════════
+    # GATE 5.5: FUNDAMENTALS CHECK (from DB cache)
+    # Boosts proven stocks, warns on weak ones
+    # ══════════════════════════════════════════════
+    if pg:
+        try:
+            fund_trends = pg.get_trends(symbol=symbol, trend_type='fundamentals')
+            if fund_trends:
+                fund_data = fund_trends[0].get('data', {})
+                fund_score = fund_data.get('score', 0)
+                fund_verdict = fund_data.get('verdict', '?')
+                fund_upside = fund_data.get('upside', 0)
+                log.info(f"    [G5.5] Fundamentals: {fund_verdict} (score={fund_score}) "
+                         f"PE={fund_data.get('pe',0)} upside={fund_upside:+.0f}%")
+                if fund_score >= 40:
+                    old_qty = qty
+                    qty = int(qty * 1.3)
+                    log.info(f"    [G5.5] BOOST: Strong fundamentals — qty {old_qty}->{qty}")
+                    steps.append(f"G5.5:BOOST fund_score={fund_score}")
+                elif fund_score < -10:
+                    old_qty = qty
+                    qty = max(1, qty // 2)
+                    log.info(f"    [G5.5] REDUCE: Weak fundamentals — qty {old_qty}->{qty}")
+                    steps.append(f"G5.5:REDUCE fund_score={fund_score}")
+                else:
+                    steps.append(f"G5.5:PASS fund={fund_score}")
+            else:
+                steps.append("G5.5:SKIP no_fund_data")
+        except:
+            steps.append("G5.5:ERROR")
+
+    # ══════════════════════════════════════════════
     # GATE 6: VIX SIZING
     # VIX>30 = high fear, halve position. VIX<15 = greed, boost.
     # ══════════════════════════════════════════════
@@ -1963,25 +1994,49 @@ async def position_monitor():
                     pct = _pct(p)
                     avail = p.qty_available or 0
 
-                    # LOSS CUT LOGIC (DB-driven)
+                    # LOSS CUT LOGIC (DB-driven + fundamentals-aware)
                     if pct <= -5.0 and avail > 0:
                         cut_key = f"_cut_{p.symbol}"
                         if not _prev_prices.get(cut_key):
+                            # Check fundamentals from DB (stored by hourly learning)
+                            fund_score = 0
+                            fund_verdict = ''
+                            if pg:
+                                try:
+                                    ft = pg.get_trends(symbol=p.symbol, trend_type='fundamentals')
+                                    if ft:
+                                        fd = ft[0].get('data', {})
+                                        fund_score = fd.get('score', 0)
+                                        fund_verdict = fd.get('verdict', '')
+                                except:
+                                    pass
+
                             if p.symbol in blue_chip_set:
-                                # Check tier-specific max loss from DB
                                 bc_info = pg.get_blue_chip_info(p.symbol) if pg else {}
                                 max_loss = bc_info.get('max_loss_pct', -999)
                                 tier = bc_info.get('tier', 1)
                                 if max_loss != -999 and pct <= max_loss:
-                                    # Tier 2 blue chip hit its max loss — cut half
                                     cut_qty = max(1, avail // 2)
-                                    log.info(f"    LOSS CUT: {p.symbol} tier-{tier} blue chip at {pct:.1f}% (max: {max_loss}%)")
+                                    log.info(f"    LOSS CUT: {p.symbol} tier-{tier} blue chip at {pct:.1f}% (max: {max_loss}%) fund={fund_verdict}")
                                 else:
-                                    # Tier 1 or within limit — HOLD (blue chip recovers)
-                                    log.info(f"    HOLD: {p.symbol} tier-{tier} blue chip at {pct:.1f}% — will recover")
+                                    log.info(f"    HOLD: {p.symbol} tier-{tier} blue chip at {pct:.1f}% — will recover (fund={fund_verdict})")
                                     continue
+                            elif fund_score >= 40:
+                                # STRONG fundamentals = hold even non-blue-chip longer
+                                if pct > -10:
+                                    log.info(f"    HOLD: {p.symbol} at {pct:.1f}% but STRONG fundamentals (score={fund_score}) — holding")
+                                    _pg_log("FUND_HOLD", symbol=p.symbol, reason=f"Strong fundamentals (score={fund_score}) overrides loss cut at {pct:.1f}%", source="60s")
+                                    continue
+                                else:
+                                    # Even strong fundamentals can't save -10%+
+                                    cut_qty = max(1, avail // 2)
+                                    log.info(f"    LOSS CUT: {p.symbol} at {pct:.1f}% — even strong fundamentals can't hold -10%+")
+                            elif fund_score < -10:
+                                # WEAK fundamentals = cut FASTER (at -3% instead of -5%)
+                                cut_qty = avail if pct <= -8 else max(1, avail // 2)
+                                log.info(f"    LOSS CUT: {p.symbol} at {pct:.1f}% — WEAK fundamentals (score={fund_score}) — cutting aggressively")
                             else:
-                                # Non-blue-chip: cut at -5% half, -10% all
+                                # Normal non-blue-chip
                                 if pct <= -10.0:
                                     cut_qty = avail
                                 else:
@@ -2033,10 +2088,27 @@ async def position_monitor():
                     pass
 
             if _is_trading_hours() and avail > 0:
-                # ── SCALP SELL: +2% → sell available shares, allow re-scalp after 15 min ──
+                # ── SCALP SELL: +2% → sell, but fundamentals-aware ──
+                # If fundamentals show >20% upside, only scalp 1/3 (keep core for swing)
                 last_scalp = _prev_prices.get(f"_scalp_t_{p.symbol}", 0)
-                if pct >= 2.0 and time.time() - last_scalp > 900:  # 15 min cooldown
-                    sell_qty = max(1, avail // 2) if avail > 1 else avail
+                if pct >= 2.0 and time.time() - last_scalp > 900:
+                    # Check fundamentals upside
+                    fund_upside = 0
+                    if pg:
+                        try:
+                            ft = pg.get_trends(symbol=p.symbol, trend_type='fundamentals')
+                            if ft:
+                                fund_upside = ft[0].get('data', {}).get('upside', 0)
+                        except:
+                            pass
+                    
+                    if fund_upside > 20 and avail > 2:
+                        # Strong fundamentals — scalp only 1/3, keep 2/3 as core
+                        sell_qty = max(1, avail // 3)
+                        log.info(f"    SMART SCALP: {p.symbol} +{pct:.1f}% — only selling {sell_qty}/{avail} (upside {fund_upside:+.0f}%, keeping core)")
+                    else:
+                        sell_qty = max(1, avail // 2) if avail > 1 else avail
+                    
                     sell_price = round(p.current_price * 0.999, 2)
                     try:
                         gateway.place_sell(p.symbol, sell_qty, sell_price,
@@ -3574,7 +3646,34 @@ async def ai_background_learning():
                     except:
                         pass
 
-                    # 4. Ask GPT-4o for deeper insight (if available)
+                    # 4. FUNDAMENTAL ANALYSIS: PE, PEG, growth, analyst targets
+                    try:
+                        from fundamentals import analyze_fundamentals
+                        fund = analyze_fundamentals(sym)
+                        if fund and fund.get('fundamental_score', 0) != 0:
+                            score = fund['fundamental_score']
+                            verdict = fund['verdict']
+                            signals = fund.get('signals', [])
+                            insight = f"{verdict} (score={score}): {', '.join(signals[:3])}"
+                            pg.save_trend(sym, 'fundamentals', insight[:500],
+                                confidence=min(95, max(30, 50 + score)),
+                                data={
+                                    'score': score, 'verdict': verdict,
+                                    'pe': fund.get('forward_pe', 0),
+                                    'peg': fund.get('peg', 0),
+                                    'rev_growth': fund.get('revenue_growth_pct', 0),
+                                    'earn_growth': fund.get('earnings_growth_pct', 0),
+                                    'analyst': fund.get('analyst_rating', '?'),
+                                    'target': fund.get('target_mean', 0),
+                                    'upside': fund.get('upside_pct', 0),
+                                    'lynch_type': fund.get('lynch_type', '?'),
+                                })
+                            if score >= 40:
+                                log.info(f"    {sym}: {verdict} score={score} PE={fund.get('forward_pe',0)} Rev={fund.get('revenue_growth_pct',0)}%")
+                    except:
+                        pass
+
+                    # 5. Ask GPT-4o for deeper insight (if available)
                     try:
                         info = stock.info
                         sector = info.get('sector', '?')
