@@ -1577,65 +1577,67 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
     # ══════════════════════════════════════════════
     # GATE 2: SELL COOLDOWN
     # Prevents emotional re-entries after selling same stock
+    # Blue chips get shorter cooldown (2 min vs 5 min) — they run fast
     # INTC lesson: sold $87, rebought $93 = -$165
     # ══════════════════════════════════════════════
-    cooldown_sec = int(pg.get_config('cooldown_after_sell_sec', 300)) if pg else 300
+    is_blue_chip = pg.is_blue_chip(symbol) if pg else False
+    if is_blue_chip:
+        cooldown_sec = int(pg.get_config('cooldown_blue_chip_sec', 120)) if pg else 120
+    else:
+        cooldown_sec = int(pg.get_config('cooldown_after_sell_sec', 300)) if pg else 300
+    
     if pg and pg.check_sell_cooldown(symbol, cooldown_sec):
         mem = pg.get_price_memory(symbol)
         sell_time = str(mem.get('last_sell_time', '?'))[:19]
         sell_price = mem.get('last_sell_price', 0)
         log.info(f"    [G2] BLOCKED: Sold {symbol} at {sell_time} @${sell_price:.2f} — "
-                 f"cooldown {cooldown_sec}s not elapsed")
-        steps.append(f"G2:BLOCKED cooldown sold@{sell_price:.2f}")
+                 f"cooldown {cooldown_sec}s not elapsed (blue_chip={is_blue_chip})")
+        steps.append(f"G2:BLOCKED cooldown={cooldown_sec}s blue={is_blue_chip}")
         pg.log_decision(symbol, 'BLOCK', 0,
-            block_reason=f"Sell cooldown ({cooldown_sec}s) — sold @${sell_price:.2f}",
+            block_reason=f"Sell cooldown ({cooldown_sec}s, blue={is_blue_chip}) — sold @${sell_price:.2f}",
             sentiment_data=_sent_data, ai_verdict=_ai_data,
             signals={'pipeline': steps, 'cooldown_sec': cooldown_sec,
-                     'sell_time': sell_time, 'sell_price': sell_price},
+                     'sell_time': sell_time, 'sell_price': sell_price,
+                     'is_blue_chip': is_blue_chip},
             strategy=source, price_at_decision=price)
         log.info(f"  {'='*50}\n")
         return None
-    log.info(f"    [G2] PASSED: No sell cooldown (limit={cooldown_sec}s)")
-    steps.append("G2:PASS")
+    log.info(f"    [G2] PASSED: No sell cooldown (limit={cooldown_sec}s, blue={is_blue_chip})")
+    steps.append(f"G2:PASS cooldown={cooldown_sec}s")
 
     # ══════════════════════════════════════════════
     # GATE 3: ANTI-BUYBACK
     # Won't rebuy higher than we sold — prevents round-trip losses
-    # EXCEPTION: Blue chips with strong sentiment (>= +3) bypass this
-    # because they're runners we want to re-enter (GOOGL lesson)
+    # EXCEPTION: Blue chips (from DB) with strong sentiment or breakout bypass
+    # GOOGL lesson: sold at $374.86, kept running to $386+
     # ══════════════════════════════════════════════
-    BLUE_CHIPS_SET = {'AAPL','MSFT','GOOGL','AMZN','META','NVDA','TSLA','JPM','V','MA',
-                      'JNJ','UNH','WMT','PG','HD','DIS','NFLX','ADBE','CRM','ORCL',
-                      'COST','PEP','KO','AVGO','AMD','INTC','MU','QCOM'}
     if pg and pg.check_anti_buyback(symbol, price):
         mem = pg.get_price_memory(symbol)
         sold_at = mem.get('last_sell_price', 0)
         diff = price - sold_at
         pct_above = (diff / sold_at * 100) if sold_at > 0 else 0
         
-        # Blue chip + strong sentiment = let it through (GOOGL running +10% lesson)
-        is_blue = symbol in BLUE_CHIPS_SET
+        # Blue chip check from DB (not hardcoded)
         has_strong_sent = sentiment_score >= 3
         
-        if is_blue and has_strong_sent:
-            log.info(f"    [G3] BYPASSED: Anti-buyback overridden — {symbol} is BLUE CHIP "
+        if is_blue_chip and has_strong_sent:
+            log.info(f"    [G3] BYPASSED: {symbol} is BLUE CHIP (DB) "
                      f"with sentiment {sentiment_score:+d} (sold @${sold_at:.2f}, rebuy @${price:.2f} +{pct_above:.1f}%)")
             steps.append(f"G3:BYPASS blue_chip sent={sentiment_score}")
-        elif is_blue and pct_above > 5:
-            # Blue chip running >5% above sell — it's a real breakout, let it in
-            log.info(f"    [G3] BYPASSED: Anti-buyback overridden — {symbol} BLUE CHIP "
+        elif is_blue_chip and pct_above > 5:
+            log.info(f"    [G3] BYPASSED: {symbol} BLUE CHIP (DB) "
                      f"breakout +{pct_above:.1f}% above sell price")
             steps.append(f"G3:BYPASS blue_chip_breakout +{pct_above:.1f}%")
         else:
             log.info(f"    [G3] BLOCKED: Anti-buyback — sold @${sold_at:.2f}, "
-                     f"now @${price:.2f} (+${diff:.2f} / +{pct_above:.1f}% higher) "
-                     f"blue_chip={is_blue} sent={sentiment_score}")
+                     f"now @${price:.2f} (+{pct_above:.1f}%) "
+                     f"blue_chip={is_blue_chip} sent={sentiment_score}")
             steps.append(f"G3:BLOCKED sold@{sold_at:.2f} rebuy@{price:.2f}")
             pg.log_decision(symbol, 'BLOCK', 0,
                 block_reason=f"Anti-buyback: sold @${sold_at:.2f}, now ${price:.2f} (+{pct_above:.1f}%)",
                 sentiment_data=_sent_data, ai_verdict=_ai_data,
                 signals={'pipeline': steps, 'sold_at': sold_at, 'rebuy_at': price,
-                         'pct_above': pct_above, 'is_blue_chip': is_blue},
+                         'pct_above': pct_above, 'is_blue_chip': is_blue_chip},
                 strategy=source, price_at_decision=price)
             log.info(f"  {'='*50}\n")
             return None
@@ -1946,10 +1948,9 @@ async def position_monitor():
         held_symbols = {p.symbol for p in positions}
 
         # ── ACTIVE SCALPER: only protect RED, actively trade GREEN ──
-        # NON-BLUE-CHIP LOSS CUT: -5% = cut half, -10% = cut all
-        BLUE_CHIPS = {'AAPL','MSFT','GOOGL','AMZN','META','NVDA','TSLA','JPM','V','MA',
-                      'JNJ','UNH','WMT','PG','HD','DIS','NFLX','ADBE','CRM','ORCL',
-                      'COST','PEP','KO','AVGO','AMD','INTC','MU','QCOM'}
+        # NON-BLUE-CHIP LOSS CUT: uses DB blue_chips table (dashboard-editable)
+        # Tier 1 blue chips: never sell at loss. Tier 2: cut at max_loss_pct from DB.
+        blue_chip_set = pg.get_blue_chip_symbols() if pg else set()
         if _is_trading_hours() and _cycle_count % 3 == 0:
             try:
                 open_orders = await asyncio.to_thread(gateway.get_open_orders)
@@ -1961,14 +1962,29 @@ async def position_monitor():
                     pct = _pct(p)
                     avail = p.qty_available or 0
 
-                    # NON-BLUE-CHIP LOSS CUT (Buffett rule: only hold quality)
-                    if pct <= -5.0 and p.symbol not in BLUE_CHIPS and avail > 0:
+                    # LOSS CUT LOGIC (DB-driven)
+                    if pct <= -5.0 and avail > 0:
                         cut_key = f"_cut_{p.symbol}"
                         if not _prev_prices.get(cut_key):
-                            if pct <= -10.0:
-                                cut_qty = avail  # Cut ALL at -10%
+                            if p.symbol in blue_chip_set:
+                                # Check tier-specific max loss from DB
+                                bc_info = pg.get_blue_chip_info(p.symbol) if pg else {}
+                                max_loss = bc_info.get('max_loss_pct', -999)
+                                tier = bc_info.get('tier', 1)
+                                if max_loss != -999 and pct <= max_loss:
+                                    # Tier 2 blue chip hit its max loss — cut half
+                                    cut_qty = max(1, avail // 2)
+                                    log.info(f"    LOSS CUT: {p.symbol} tier-{tier} blue chip at {pct:.1f}% (max: {max_loss}%)")
+                                else:
+                                    # Tier 1 or within limit — HOLD (blue chip recovers)
+                                    log.info(f"    HOLD: {p.symbol} tier-{tier} blue chip at {pct:.1f}% — will recover")
+                                    continue
                             else:
-                                cut_qty = max(1, avail // 2)  # Cut HALF at -5%
+                                # Non-blue-chip: cut at -5% half, -10% all
+                                if pct <= -10.0:
+                                    cut_qty = avail
+                                else:
+                                    cut_qty = max(1, avail // 2)
                             try:
                                 sell_price = round(p.current_price * 0.999, 2)
                                 gateway.place_sell(p.symbol, cut_qty, sell_price,

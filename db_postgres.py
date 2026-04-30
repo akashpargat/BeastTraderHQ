@@ -1087,10 +1087,59 @@ class BeastDB:
                 ('kill_switch', 'false', 'boolean', 'control', 'Emergency kill switch'),
                 ('daily_loss_limit', '500', 'number', 'risk', 'Daily loss limit ($)'),
                 ('cooldown_after_sell_sec', '300', 'number', 'risk', 'Cooldown after selling same stock (sec)'),
+                ('cooldown_blue_chip_sec', '120', 'number', 'risk', 'Cooldown for blue chips (shorter - they run fast)'),
                 ('min_confidence_buy', '75', 'number', 'strategy', 'Minimum confidence to auto-buy'),
                 ('enable_pyramiding', 'true', 'boolean', 'strategy', 'Allow adding to winners'),
                 ('enable_dip_reload', 'true', 'boolean', 'strategy', 'Allow buying dips on held stocks')
             ON CONFLICT (key) DO NOTHING""",
+
+            # BLUE CHIPS TABLE: Dashboard-editable, bot reads from DB not hardcoded
+            """CREATE TABLE IF NOT EXISTS blue_chips (
+                symbol TEXT PRIMARY KEY,
+                name TEXT,
+                sector TEXT,
+                tier INT DEFAULT 1,
+                max_loss_pct REAL DEFAULT -999,
+                notes TEXT,
+                added_by TEXT DEFAULT 'system',
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )""",
+            # Seed blue chips — tier 1 = mega cap (never sell at loss), tier 2 = large cap (hold longer)
+            """INSERT INTO blue_chips (symbol, name, sector, tier, max_loss_pct, notes) VALUES
+                ('AAPL', 'Apple', 'tech', 1, -999, 'Mega cap — never sell at loss'),
+                ('MSFT', 'Microsoft', 'tech', 1, -999, 'Mega cap — never sell at loss'),
+                ('GOOGL', 'Alphabet', 'tech', 1, -999, 'Mega cap — never sell at loss'),
+                ('AMZN', 'Amazon', 'tech', 1, -999, 'Mega cap — never sell at loss'),
+                ('META', 'Meta', 'tech', 1, -999, 'Mega cap — never sell at loss'),
+                ('NVDA', 'NVIDIA', 'semi', 1, -999, 'AI leader — never sell at loss'),
+                ('TSLA', 'Tesla', 'auto', 1, -999, 'Volatile but always recovers'),
+                ('AVGO', 'Broadcom', 'semi', 1, -999, 'AI infrastructure — strong'),
+                ('AMD', 'AMD', 'semi', 1, -999, 'AI/gaming — strong recovery'),
+                ('JPM', 'JPMorgan', 'finance', 1, -999, 'Banking leader'),
+                ('V', 'Visa', 'finance', 1, -999, 'Payment monopoly'),
+                ('MA', 'Mastercard', 'finance', 1, -999, 'Payment monopoly'),
+                ('JNJ', 'J&J', 'health', 1, -999, 'Healthcare staple'),
+                ('UNH', 'UnitedHealth', 'health', 1, -999, 'Healthcare giant'),
+                ('WMT', 'Walmart', 'consumer', 1, -999, 'Recession proof'),
+                ('PG', 'P&G', 'consumer', 1, -999, 'Consumer staple'),
+                ('HD', 'Home Depot', 'consumer', 1, -999, 'Housing bellwether'),
+                ('DIS', 'Disney', 'media', 2, -15, 'Tier 2 — cut at -15%'),
+                ('NFLX', 'Netflix', 'media', 2, -15, 'Tier 2 — cut at -15%'),
+                ('ADBE', 'Adobe', 'tech', 2, -15, 'Tier 2 — cut at -15%'),
+                ('CRM', 'Salesforce', 'tech', 2, -10, 'Tier 2 — cut at -10%'),
+                ('ORCL', 'Oracle', 'tech', 2, -10, 'Tier 2 — cut at -10%'),
+                ('COST', 'Costco', 'consumer', 1, -999, 'Consumer staple'),
+                ('PEP', 'PepsiCo', 'consumer', 1, -999, 'Consumer staple'),
+                ('KO', 'Coca-Cola', 'consumer', 1, -999, 'Dividend king'),
+                ('INTC', 'Intel', 'semi', 2, -10, 'Tier 2 — recovering'),
+                ('MU', 'Micron', 'semi', 2, -10, 'Tier 2 — cyclical'),
+                ('QCOM', 'Qualcomm', 'semi', 2, -10, 'Tier 2 — mobile leader'),
+                ('COIN', 'Coinbase', 'fintech', 2, -10, 'Tier 2 — crypto proxy'),
+                ('PLTR', 'Palantir', 'tech', 2, -10, 'Tier 2 — AI/gov'),
+                ('LMT', 'Lockheed', 'defense', 2, -10, 'Tier 2 — defense'),
+                ('BRK.B', 'Berkshire', 'finance', 1, -999, 'Buffett — never sell')
+            ON CONFLICT (symbol) DO NOTHING""",
         ]
         for sql in migrations:
             try:
@@ -1098,6 +1147,53 @@ class BeastDB:
             except Exception as e:
                 log.warning(f"Migration step skipped: {e}")
         log.info("✅ Schema V4 migration complete")
+
+    # ══════════════════════════════════════════════
+    #  BLUE CHIPS: DB-backed, dashboard-editable
+    # ══════════════════════════════════════════════
+
+    def is_blue_chip(self, symbol: str) -> bool:
+        """Check if a stock is in our blue chip list."""
+        return self.cached_get(f"blue_{symbol}",
+            lambda: bool(self._exec(
+                "SELECT 1 FROM blue_chips WHERE symbol = %s AND is_active = TRUE",
+                (symbol,), fetch=True)),
+            ttl_seconds=600)
+
+    def get_blue_chip_info(self, symbol: str) -> dict:
+        """Get blue chip details (tier, max_loss_pct, sector)."""
+        rows = self._exec(
+            "SELECT * FROM blue_chips WHERE symbol = %s AND is_active = TRUE",
+            (symbol,), fetch=True)
+        return rows[0] if rows else {}
+
+    def get_all_blue_chips(self) -> list:
+        """Get all blue chips (for dashboard display)."""
+        return self._exec(
+            "SELECT * FROM blue_chips WHERE is_active = TRUE ORDER BY tier, symbol",
+            fetch=True) or []
+
+    def get_blue_chip_symbols(self) -> set:
+        """Get set of all blue chip symbols (cached 10 min)."""
+        return self.cached_get("blue_chips_set",
+            lambda: set(r['symbol'] for r in (self._exec(
+                "SELECT symbol FROM blue_chips WHERE is_active = TRUE",
+                fetch=True) or [])),
+            ttl_seconds=600)
+
+    def add_blue_chip(self, symbol: str, name: str = '', sector: str = '',
+                      tier: int = 2, max_loss_pct: float = -10, notes: str = '',
+                      added_by: str = 'dashboard'):
+        """Add/update a blue chip from dashboard."""
+        self._exec(
+            """INSERT INTO blue_chips (symbol, name, sector, tier, max_loss_pct, notes, added_by)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (symbol) DO UPDATE SET name=%s, sector=%s, tier=%s,
+                   max_loss_pct=%s, notes=%s, is_active=TRUE""",
+            (symbol, name, sector, tier, max_loss_pct, notes, added_by,
+             name, sector, tier, max_loss_pct, notes))
+        self.invalidate_cache(f"blue_{symbol}")
+        self.invalidate_cache("blue_chips_set")
 
     # ══════════════════════════════════════════════
     #  BOT STATE: Persistent KV store
