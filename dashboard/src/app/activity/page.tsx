@@ -36,10 +36,10 @@ export default function ActivityPage() {
         <div className="space-y-2">
           {actions.map((a: any, i: number) => (
             <div key={i} className="glass p-3 flex items-center gap-4">
-              <span className="text-xs text-gray-500 w-40 flex-shrink-0">{a?.timestamp ? new Date(a.timestamp).toLocaleString() : '—'}</span>
+              <span className="text-xs text-gray-500 w-40 flex-shrink-0">{a?.timestamp || a?.time ? new Date(a.timestamp || a.time).toLocaleString() : '—'}</span>
               <span className="px-2 py-0.5 rounded text-xs font-bold bg-white/10 text-gray-300 flex-shrink-0">{a?.type ?? a?.action ?? '—'}</span>
               <span className="font-mono text-[#00ff88]">{a?.symbol ?? ''}</span>
-              <span className="text-sm text-gray-400 truncate">{a?.details ?? a?.message ?? ''}</span>
+              <span className="text-sm text-gray-400 truncate">{a?.title ?? a?.details ?? a?.detail ?? a?.message ?? ''}</span>
             </div>
           ))}
         </div>

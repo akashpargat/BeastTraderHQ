@@ -24,6 +24,8 @@ import os
 import logging
 import requests
 import json
+import time as _time
+import threading
 from datetime import datetime
 from openai import AzureOpenAI
 
@@ -39,8 +41,24 @@ AZURE_API_VERSION = '2024-10-21'
 CLAUDE_URL = os.getenv('AI_API_URL', 'https://ai.beast-trader.com')
 CLAUDE_API_KEY = os.getenv('AI_API_KEY', 'beast-v3-sk-7f3a9e2b4d1c8f5e6a0b3d9c')
 
+# ── Rate limiting — prevent 429 errors ──
+_ai_last_call = 0  # timestamp of last GPT-4o call
+_ai_lock = threading.Lock()
+AI_MIN_INTERVAL = 3  # minimum seconds between GPT-4o calls
+
+def _rate_limit_gpt():
+    """Wait if needed to avoid 429s. 3 second minimum between calls."""
+    global _ai_last_call
+    with _ai_lock:
+        elapsed = _time.time() - _ai_last_call
+        if elapsed < AI_MIN_INTERVAL:
+            wait = AI_MIN_INTERVAL - elapsed
+            log.debug(f"AI rate limit: waiting {wait:.1f}s")
+            _time.sleep(wait)
+        _ai_last_call = _time.time()
+
 # ── Shared state ──
-_last_deep_briefing = {}  # symbol → last Claude analysis (for GPT-4o to reference)
+_last_deep_briefing = {}  # symbol -> last Claude analysis (for GPT-4o to reference)
 _last_deep_time = None
 
 
@@ -194,6 +212,7 @@ Rules: RSI>70=overbought consider SELL, RSI<30=oversold consider BUY,
 winners running +3%+ with momentum=BUY MORE/HOLD, losers -5%+ with bad sentiment=SELL.
 Be AGGRESSIVE on winners. Be DECISIVE — no wishy-washy 50% holds."""
 
+            _rate_limit_gpt()
             response = self._azure_client.chat.completions.create(
                 model=AZURE_DEPLOYMENT,
                 messages=[
@@ -208,11 +227,18 @@ Be AGGRESSIVE on winners. Be DECISIVE — no wishy-washy 50% holds."""
             result = json.loads(response.choices[0].message.content)
             verdicts = result.get('results', result)
 
-            # Normalize output
-            for sym in verdicts:
+            # Normalize output — fix 0% confidence (GPT sometimes returns 0 for HOLD)
+            for sym in list(verdicts.keys()):
                 if isinstance(verdicts[sym], dict):
                     verdicts[sym]['ai_source'] = 'Azure GPT-4o'
                     verdicts[sym]['scan_type'] = '5min_batch'
+                    # GPT-4o sometimes returns 0% for HOLD — set minimum 30%
+                    conf = verdicts[sym].get('confidence', 0)
+                    if isinstance(conf, (int, float)) and conf == 0:
+                        verdicts[sym]['confidence'] = 40  # Minimum meaningful confidence
+                else:
+                    # Bad format — remove
+                    del verdicts[sym]
 
             log.info(f"GPT-4o BATCH: {len(verdicts)} stocks in 1 call")
             return verdicts
@@ -278,6 +304,7 @@ MARKET:
 
 Give me your COMPLETE TradingView analysis and trading verdict. Be specific with numbers."""
 
+            _rate_limit_gpt()
             response = self._azure_client.chat.completions.create(
                 model=AZURE_DEPLOYMENT,
                 messages=[

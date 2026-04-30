@@ -833,18 +833,19 @@ def trailing_stops():
             if 'trailing' in str(o.get('type', '')).lower() or o.get('trail_percent'):
                 sym = o.get('symbol', '')
                 pos = next((p for p in positions if p.symbol == sym), None)
+                stop_px = float(o.get('stop_price', 0) or 0)
+                hwm_px = float(o.get('hwm', 0) or 0)
+                cur_px = pos.current_price if pos else 0
                 trails.append({
                     'symbol': sym,
                     'qty': o.get('qty'),
-                    'trail_percent': o.get('trail_percent'),
-                    'stop_price': float(o.get('stop_price', 0)),
-                    'hwm': float(o.get('hwm', 0)),
-                    'entry': pos.avg_entry if pos else 0,
-                    'current': pos.current_price if pos else 0,
-                    'pnl': pos.unrealized_pl if pos else 0,
-                    'gap_to_stop': round(
-                        ((pos.current_price - float(o.get('stop_price', 0))) / pos.current_price * 100), 1
-                    ) if pos and float(o.get('stop_price', 0)) > 0 else 0,
+                    'trail_percent': float(o.get('trail_percent', 0) or 0),
+                    'stop_price': stop_px,
+                    'hwm': hwm_px,
+                    'entry': float(pos.avg_entry) if pos else 0,
+                    'current': cur_px,
+                    'pnl': float(pos.unrealized_pl) if pos else 0,
+                    'gap_to_stop': round(((cur_px - stop_px) / cur_px * 100), 1) if cur_px > 0 and stop_px > 0 else 0,
                 })
         
         return jsonify({
@@ -962,36 +963,33 @@ def daily_pnl_api():
 @app.route('/api/ai-verdicts')
 @require_auth
 def ai_verdicts():
-    """AI analysis verdicts for all positions."""
+    """AI analysis verdicts — reads from PostgreSQL (persistent, not in-memory cache)."""
     try:
-        gw = _get_gateway()
-        positions = gw.get_positions()
-
-        from ai_brain import AIBrain
-        brain = AIBrain()
+        # Read from DB (survives restarts, has full history)
+        from db_postgres import BeastDB
+        db = BeastDB()
+        rows = db._exec(
+            """SELECT DISTINCT ON (symbol) symbol, action, confidence, reasoning, ai_source, scan_type, created_at
+               FROM ai_verdicts ORDER BY symbol, created_at DESC""",
+            fetch=True
+        ) or []
+        db.close()
 
         verdicts = []
-        for p in positions:
-            cached = brain.get_cached_analysis(p.symbol) if hasattr(brain, 'get_cached_analysis') else None
+        for r in rows:
             verdicts.append({
-                'symbol': p.symbol,
-                'price': p.current_price,
-                'pnl': round(p.unrealized_pl, 2),
-                'pct': round(((p.current_price - p.avg_entry) / p.avg_entry * 100) if p.avg_entry > 0 else 0, 1),
-                'ai_action': cached.get('action', 'NO DATA') if cached else 'NO DATA',
-                'ai_confidence': cached.get('confidence', 0) if cached else 0,
-                'ai_reasoning': cached.get('reasoning', '') if cached else 'No analysis yet — wait for next scan cycle',
-                'ai_source': cached.get('ai_source', '') if cached else '',
-                'scan_type': cached.get('scan_type', '') if cached else '',
+                'symbol': r.get('symbol', ''),
+                'action': r.get('action', 'HOLD'),
+                'confidence': r.get('confidence', 0),
+                'reasoning': r.get('reasoning', ''),
+                'ai_source': r.get('ai_source', ''),
+                'scan_type': r.get('scan_type', ''),
+                'timestamp': r.get('created_at').isoformat() if r.get('created_at') else '',
             })
-        # Enrich "NO DATA" verdicts with a helpful message
-        for v in verdicts:
-            if v['ai_action'] == 'NO DATA':
-                v['ai_reasoning'] = 'Waiting for next scan cycle (scans run 4AM-8PM ET)'
+        verdicts.sort(key=lambda x: -(x.get('confidence') or 0))
         return jsonify({'verdicts': verdicts, 'count': len(verdicts)})
     except Exception as e:
-        return jsonify({'error': str(e), 'verdicts': [], 'count': 0, 'market_closed': True,
-                        'message': 'AI verdicts unavailable — positions may be empty after hours'})
+        return jsonify({'error': str(e), 'verdicts': [], 'count': 0})
 
 
 # ── DECISION LOG ──────────────────────────────────────
