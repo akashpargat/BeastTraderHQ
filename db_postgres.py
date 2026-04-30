@@ -1063,10 +1063,10 @@ class BeastDB:
             "CREATE INDEX IF NOT EXISTS idx_trade_log_strat ON trade_log(strategy)",
             "CREATE INDEX IF NOT EXISTS idx_trade_log_profitable ON trade_log(was_profitable)",
 
-            # PERFORMANCE: Partial indexes for hot queries (only scan recent data)
-            "CREATE INDEX IF NOT EXISTS idx_tv_readings_recent ON tv_readings(symbol, created_at DESC) WHERE created_at > NOW() - interval '24 hours'",
-            "CREATE INDEX IF NOT EXISTS idx_activity_recent ON activity_log(action_type, created_at DESC) WHERE created_at > NOW() - interval '7 days'",
-            "CREATE INDEX IF NOT EXISTS idx_decisions_recent ON trade_decisions(symbol, created_at DESC) WHERE created_at > NOW() - interval '7 days'",
+            # PERFORMANCE: Regular indexes on hot columns (partial indexes with NOW() not allowed)
+            "CREATE INDEX IF NOT EXISTS idx_tv_readings_sym_date ON tv_readings(symbol, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_activity_type_date ON activity_log(action_type, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_decisions_sym_date ON trade_decisions(symbol, created_at DESC)",
 
             # Seed default bot config
             """INSERT INTO bot_config (key, value, data_type, category, description) VALUES
