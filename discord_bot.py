@@ -3070,13 +3070,41 @@ async def claude_daily_deep_learn():
         def _gather_and_analyze():
             import json as _json
 
-            # Gather ALL intelligence
+            # Gather ALL intelligence (BEFORE flush — this is the gold)
             earnings = pg.scan_all_earnings_patterns()
             trends = pg.get_trends()
             best = pg.get_best_performing_stocks(20)
             positions = gateway.get_positions()
             held = [{'symbol': p.symbol, 'qty': p.qty, 'entry': p.avg_entry,
                      'price': p.current_price, 'pnl': p.unrealized_pl} for p in positions]
+
+            # TODAY'S TV READINGS — the intraday gold mine (will be flushed after analysis)
+            tv_summary = pg._exec(
+                """SELECT symbol, COUNT(*) as readings,
+                   AVG(rsi) as avg_rsi, AVG(macd_hist) as avg_macd,
+                   SUM(CASE WHEN vwap_above THEN 1 ELSE 0 END) as above_vwap_count,
+                   AVG(confluence) as avg_confluence
+                FROM tv_readings WHERE created_at > NOW() - interval '24 hours'
+                GROUP BY symbol ORDER BY readings DESC LIMIT 30""",
+                fetch=True
+            ) or []
+
+            # TODAY'S ACTIVITY SUMMARY — what did the bot do today?
+            activity_summary = pg._exec(
+                """SELECT action_type, COUNT(*) as cnt, 
+                   COUNT(DISTINCT symbol) as stocks
+                FROM activity_log WHERE created_at > NOW() - interval '24 hours'
+                GROUP BY action_type ORDER BY cnt DESC""",
+                fetch=True
+            ) or []
+
+            # TODAY'S TV BLOCKS — what stocks were rejected and why?
+            tv_blocks = pg._exec(
+                """SELECT symbol, reason, COUNT(*) as times_blocked
+                FROM activity_log WHERE action_type = 'TV_BLOCKED' AND created_at > NOW() - interval '24 hours'
+                GROUP BY symbol, reason ORDER BY times_blocked DESC LIMIT 10""",
+                fetch=True
+            ) or []
 
             sa = SentimentAnalyst()
             market = {}
@@ -3099,6 +3127,15 @@ MARKET SENTIMENT: {_json.dumps(market, default=str)[:500]}
 FEAR/GREED: {_json.dumps(fg, default=str)[:200]}
 EXISTING TRENDS: {_json.dumps([{'s': t.get('symbol'), 'i': t.get('insight','')[:80]} for t in trends[:15]], default=str)[:1500]}
 
+TODAY'S TV ANALYSIS (indicator patterns from TradingView):
+{_json.dumps(tv_summary[:15], default=str)[:1500]}
+
+TODAY'S BOT ACTIVITY (what we did today):
+{_json.dumps(activity_summary, default=str)[:800]}
+
+TV BLOCKS (stocks we wanted to buy but TV rejected — analyze WHY):
+{_json.dumps(tv_blocks[:10], default=str)[:800]}
+
 PROVIDE (valid JSON only):
 {{"buy_list": [{{"symbol": "X", "reason": "why", "confidence": 80}}],
   "avoid_list": [{{"symbol": "X", "reason": "why"}}],
@@ -3106,7 +3143,9 @@ PROVIDE (valid JSON only):
   "earnings_plays": [{{"symbol": "X", "play": "buy dip after miss", "confidence": 75}}],
   "risk_alerts": ["alert1"],
   "tomorrow_strategy": "overall approach",
-  "key_insight": "most important discovery"}}"""
+  "key_insight": "most important discovery",
+  "tv_learnings": "what did the TV data tell us today — patterns discovered",
+  "missed_opportunities": "stocks we should have traded but didn't"}}"""
 
             try:
                 if brain._claude_available:
@@ -3144,6 +3183,12 @@ PROVIDE (valid JSON only):
                 pg.save_trend(p['symbol'], 'earnings_play', str(p.get('play', ''))[:500], p.get('confidence', 60), p)
         if insights.get('sector_signal'):
             pg.save_trend('MARKET', 'sector_rotation', str(insights['sector_signal'])[:500], 70)
+        # Store TV learnings (patterns discovered from today's indicators)
+        if insights.get('tv_learnings'):
+            pg.save_trend('MARKET', 'tv_daily_report', str(insights['tv_learnings'])[:500], 75)
+        # Store missed opportunities (so we don't miss them again)
+        if insights.get('missed_opportunities'):
+            pg.save_trend('MARKET', 'missed_opps', str(insights['missed_opportunities'])[:500], 65)
 
         pg.log_activity('DAILY_LEARN', category='ai', reason=f"Deep learn: {len(insights.get('buy_list', []))} buys, {len(insights.get('avoid_list', []))} avoids", source='daily_claude', data=insights)
 
@@ -3158,9 +3203,45 @@ PROVIDE (valid JSON only):
                     msg += f"🔴 **{a.get('symbol','?')}** — {str(a.get('reason',''))[:80]}\n"
             if insights.get('key_insight'):
                 msg += f"\n💡 {str(insights['key_insight'])[:200]}"
+            if insights.get('tv_learnings'):
+                msg += f"\n📺 TV: {str(insights['tv_learnings'])[:150]}"
+            if insights.get('missed_opportunities'):
+                msg += f"\n😤 Missed: {str(insights['missed_opportunities'])[:150]}"
             await channel.send(msg[:2000])
 
         log.info(f"  🧠🌙 Daily learn complete")
+
+        # ── 3 AM DAILY FLUSH: clear intraday data, keep trends ──
+        try:
+            log.info("  🧹 3 AM flush: clearing intraday TV readings + position snapshots")
+            # Flush TV readings (intraday only — trend data stays in ai_trends)
+            pg._exec("DELETE FROM tv_readings WHERE created_at < NOW() - interval '24 hours'")
+            # Flush position snapshots older than 2 days (equity curve keeps 15 days)
+            pg._exec("DELETE FROM position_snapshots WHERE created_at < NOW() - interval '2 days'")
+            # Flush old activity log entries (keep 7 days for debugging)
+            pg._exec("DELETE FROM activity_log WHERE created_at < NOW() - interval '7 days'")
+            # Flush old scan results (keep 3 days)
+            pg._exec("DELETE FROM scan_results WHERE created_at < NOW() - interval '3 days'")
+            # Flush login attempts older than 7 days
+            pg._exec("DELETE FROM login_attempts WHERE timestamp < NOW() - interval '7 days'")
+            # Clear intraday price cache (start fresh)
+            global _prev_prices, _tv_cache
+            # Keep past winner flags and runner flags, clear everything else
+            keep_keys = {k for k in _prev_prices if k.startswith('_hi_') or k.startswith('_intraday')}
+            for k in list(_prev_prices.keys()):
+                if k not in keep_keys:
+                    del _prev_prices[k]
+            _tv_cache.clear()
+            
+            pg.log_activity('DAILY_FLUSH', category='system',
+                reason='3AM flush: TV readings, old snapshots, activity >7d, scan results >3d, price cache cleared',
+                source='daily')
+            log.info("  🧹 3 AM flush complete — fresh start for new trading day")
+            
+            if channel:
+                await channel.send("🧹 **3 AM DAILY FLUSH** — cleared intraday data. Fresh start for tomorrow. Trends preserved.")
+        except Exception as e:
+            log.warning(f"Daily flush error: {e}")
 
     except Exception as e:
         log.error(f"Daily learn error: {e}\n{traceback.format_exc()}")
