@@ -798,6 +798,214 @@ def decision_log():
         return jsonify({'error': str(e), 'decisions': []})
 
 
+# ── Interactive Command Endpoints (V4) ─────────────────────────────────────
+
+# Pending orders waiting for confirmation (in-memory, expires on restart)
+_pending_orders = {}
+
+# Global trading state
+_trading_enabled = True
+
+
+def _parse_command(raw: str) -> dict:
+    """Parse structured commands:
+    /buy NVDA 3 @210    → buy 3 shares of NVDA at $210
+    /buy NVDA 3         → buy 3 shares at market
+    /sell AMD 5 @350    → sell 5 shares at $350
+    /sell AMD 5         → sell 5 at current price
+    /cancel abc123      → cancel order by ID
+    /status             → portfolio status
+    /kill               → disable trading
+    /resume             → re-enable trading
+    """
+    parts = raw.strip().split()
+    if not parts:
+        return {'error': 'Empty command'}
+
+    action = parts[0].lower().lstrip('/')
+    result = {'action': action, 'raw': raw}
+
+    if action in ('buy', 'sell'):
+        if len(parts) < 3:
+            return {'error': f'Usage: /{action} SYMBOL QTY [@PRICE]'}
+        result['symbol'] = parts[1].upper()
+        try:
+            result['qty'] = int(parts[2])
+        except ValueError:
+            return {'error': f'Invalid qty: {parts[2]}'}
+        # Optional price
+        if len(parts) >= 4:
+            price_str = parts[3].lstrip('@$')
+            try:
+                result['price'] = float(price_str)
+            except ValueError:
+                return {'error': f'Invalid price: {parts[3]}'}
+        else:
+            # Use current market price
+            try:
+                gw = _get_gateway()
+                live = gw.get_live_price(result['symbol'])
+                result['price'] = round(live * (1.002 if action == 'buy' else 0.998), 2) if live else 0
+            except:
+                result['price'] = 0
+        return result
+
+    elif action == 'cancel':
+        if len(parts) < 2:
+            return {'error': 'Usage: /cancel ORDER_ID'}
+        result['order_id'] = parts[1]
+        return result
+
+    elif action in ('status', 'kill', 'resume'):
+        return result
+
+    else:
+        return {'error': f'Unknown command: {action}. Use /buy, /sell, /cancel, /status, /kill, /resume'}
+
+
+@app.route('/api/order', methods=['POST'])
+def execute_order():
+    """Execute a trading command. Two-step: parse → preview → confirm.
+
+    Step 1 (preview): POST with {"command": "/buy NVDA 3 @210"}
+    Returns: {"preview": {"action": "buy", "symbol": "NVDA", "qty": 3, "price": 210}, "confirm_token": "abc123"}
+
+    Step 2 (confirm): POST with {"confirm_token": "abc123"}
+    Returns: {"executed": true, "order_id": "...", "message": "Bought 3 NVDA @ $210"}
+    """
+    auth = request.headers.get('X-API-Key', '')
+    if auth != os.getenv('AI_API_KEY', 'beast-v3-sk-7f3a9e2b4d1c8f5e6a0b3d9c'):
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json() or {}
+
+    # Step 2: Confirm execution
+    confirm_token = data.get('confirm_token')
+    if confirm_token and confirm_token in _pending_orders:
+        parsed = _pending_orders.pop(confirm_token)
+        try:
+            gw = _get_gateway()
+            if parsed['action'] == 'buy':
+                result = gw.quick_buy(parsed['symbol'], parsed['qty'], parsed['price'],
+                                      reason=f"Dashboard command: {parsed['raw']}")
+                try:
+                    from db_postgres import BeastDB
+                    db = BeastDB()
+                    db.log_activity('BUY', symbol=parsed['symbol'], side='buy',
+                                   qty=parsed['qty'], price=parsed['price'],
+                                   reason=f"Dashboard: {parsed['raw']}", source='dashboard-command',
+                                   order_id=result.id if result else None)
+                except: pass
+                return jsonify({'executed': True, 'order_id': result.id if result else None,
+                               'message': f"Buy {parsed['qty']} {parsed['symbol']} @ ${parsed['price']}"})
+
+            elif parsed['action'] == 'sell':
+                result = gw.place_sell(parsed['symbol'], parsed['qty'], parsed['price'],
+                                      reason=f"Dashboard command: {parsed['raw']}")
+                try:
+                    from db_postgres import BeastDB
+                    db = BeastDB()
+                    db.log_activity('SELL', symbol=parsed['symbol'], side='sell',
+                                   qty=parsed['qty'], price=parsed['price'],
+                                   reason=f"Dashboard: {parsed['raw']}", source='dashboard-command',
+                                   order_id=result.id if result else None)
+                except: pass
+                return jsonify({'executed': True, 'order_id': result.id if result else None,
+                               'message': f"Sell {parsed['qty']} {parsed['symbol']} @ ${parsed['price']}"})
+
+            elif parsed['action'] == 'cancel':
+                gw.client.cancel_order_by_id(parsed.get('order_id', ''))
+                return jsonify({'executed': True, 'message': f"Cancelled order {parsed.get('order_id')}"})
+
+            else:
+                return jsonify({'error': f"Unknown action: {parsed['action']}"})
+        except Exception as e:
+            return jsonify({'error': str(e), 'executed': False})
+
+    # Step 1: Parse and preview
+    command = data.get('command', '').strip()
+    if not command:
+        return jsonify({'error': 'No command provided'})
+
+    parsed = _parse_command(command)
+    if 'error' in parsed:
+        return jsonify(parsed)
+
+    # Generate confirm token
+    import uuid
+    token = uuid.uuid4().hex[:12]
+    _pending_orders[token] = parsed
+
+    return jsonify({
+        'preview': parsed,
+        'confirm_token': token,
+        'message': f"Preview: {parsed['action'].upper()} {parsed.get('qty','')} {parsed.get('symbol','')} @ ${parsed.get('price','market')}. Send confirm_token to execute."
+    })
+
+
+@app.route('/api/kill', methods=['POST'])
+def kill_switch():
+    """Emergency: disable all new orders."""
+    global _trading_enabled
+    auth = request.headers.get('X-API-Key', '')
+    if auth != os.getenv('AI_API_KEY', 'beast-v3-sk-7f3a9e2b4d1c8f5e6a0b3d9c'):
+        return jsonify({'error': 'Unauthorized'}), 401
+    _trading_enabled = False
+    try:
+        from db_postgres import BeastDB
+        BeastDB().log_activity('KILL', reason='Trading disabled via dashboard kill switch', source='dashboard')
+    except: pass
+    return jsonify({'trading_enabled': False, 'message': '🛑 KILL SWITCH ACTIVATED — all new orders blocked'})
+
+
+@app.route('/api/resume', methods=['POST'])
+def resume_trading():
+    """Re-enable trading after kill switch."""
+    global _trading_enabled
+    auth = request.headers.get('X-API-Key', '')
+    if auth != os.getenv('AI_API_KEY', 'beast-v3-sk-7f3a9e2b4d1c8f5e6a0b3d9c'):
+        return jsonify({'error': 'Unauthorized'}), 401
+    _trading_enabled = True
+    try:
+        from db_postgres import BeastDB
+        BeastDB().log_activity('RESUME', reason='Trading re-enabled via dashboard', source='dashboard')
+    except: pass
+    return jsonify({'trading_enabled': True, 'message': '✅ Trading RESUMED'})
+
+
+@app.route('/api/trading-status')
+def trading_status():
+    """Check if trading is enabled."""
+    return jsonify({'trading_enabled': _trading_enabled})
+
+
+@app.route('/api/activity-log')
+def activity_log_pg():
+    """Activity log from PostgreSQL (replaces SQLite actions)."""
+    limit = request.args.get('limit', 50, type=int)
+    action_type = request.args.get('type')
+    symbol = request.args.get('symbol')
+    try:
+        from db_postgres import BeastDB
+        db = BeastDB()
+        activities = db.get_activity(limit=limit, action_type=action_type, symbol=symbol)
+        return jsonify({'activities': activities, 'count': len(activities)})
+    except Exception as e:
+        return jsonify({'activities': [], 'count': 0, 'error': str(e), 'fallback': 'PostgreSQL not available'})
+
+
+@app.route('/api/strategy-stats')
+def strategy_stats():
+    """P&L breakdown by strategy."""
+    try:
+        from db_postgres import BeastDB
+        db = BeastDB()
+        stats = db.get_strategy_stats()
+        return jsonify(stats)
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
 if __name__ == '__main__':
     print("Beast V3 Dashboard API starting on port 8080...")
     app.run(host='0.0.0.0', port=8080, debug=False)

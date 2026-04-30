@@ -1350,6 +1350,7 @@ def _pct(p) -> float:
 # Trade action log — tracks all auto-trades for reporting + persists to DB
 _trade_log = []
 _trade_db = None
+_pg_db = None
 
 def _get_trade_db():
     global _trade_db
@@ -1361,8 +1362,21 @@ def _get_trade_db():
             log.warning(f"TradeDB init failed: {e}")
     return _trade_db
 
+def _get_pg():
+    """Get PostgreSQL database connection (Beast Terminal V4)."""
+    global _pg_db
+    if _pg_db is None:
+        try:
+            from db_postgres import BeastDB
+            _pg_db = BeastDB()
+            if _pg_db.conn:
+                log.info("📦 PostgreSQL connected")
+        except Exception as e:
+            log.debug(f"PostgreSQL not available: {e}")
+    return _pg_db
+
 def _log_trade(action, symbol, qty, price, reason, scan_type="60s"):
-    """Log a trade action to memory + SQLite database."""
+    """Log a trade action to memory + SQLite + PostgreSQL."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
     now = datetime.now(ZoneInfo("America/New_York"))
@@ -1375,7 +1389,7 @@ def _log_trade(action, symbol, qty, price, reason, scan_type="60s"):
         'reason': reason,
         'scan_type': scan_type,
     })
-    # Persist to SQLite
+    # Persist to SQLite (legacy)
     db = _get_trade_db()
     if db:
         try:
@@ -1388,6 +1402,18 @@ def _log_trade(action, symbol, qty, price, reason, scan_type="60s"):
                             strategy=scan_type, reason=f"{action}: {reason}")
         except Exception as e:
             log.debug(f"Trade DB write failed: {e}")
+    # Persist to PostgreSQL (V4)
+    pg = _get_pg()
+    if pg:
+        try:
+            side = 'sell' if 'SELL' in action.upper() else 'buy'
+            pg.log_activity(
+                action_type=action.split('(')[0].strip().split(' ')[0],
+                symbol=symbol, side=side, qty=qty, price=price,
+                reason=reason, strategy=scan_type, source=scan_type,
+            )
+        except Exception as e:
+            log.debug(f"PostgreSQL write failed: {e}")
 
 def _is_market_hours() -> bool:
     from datetime import datetime
@@ -1581,6 +1607,22 @@ async def position_monitor():
                             pass
             except Exception as e:
                 log.debug(f"Phase 0 scan: {e}")
+
+        # ── PostgreSQL snapshots (every cycle) ──
+        pg = _get_pg()
+        if pg:
+            try:
+                acct = gateway.get_account()
+                eq = float(acct.get('equity', 0))
+                cs = float(acct.get('cash', 0))
+                lmv = float(acct.get('long_market_value', 0))
+                heat = (lmv / eq * 100) if eq > 0 else 0
+                pg.snapshot_equity(eq, cs, total_pl, len(positions), heat)
+                open_ords = gateway.get_open_orders() if _cycle_count % 3 == 0 else []
+                trail_syms = {o.get('symbol') for o in open_ords if 'trailing' in str(o.get('type', '')).lower()}
+                pg.snapshot_positions(positions, trailing_stops=trail_syms)
+            except Exception as e:
+                log.debug(f"PG snapshot: {e}")
 
         # Summary every 5 cycles + Telegram
         if _cycle_count % 5 == 0 and channel:
