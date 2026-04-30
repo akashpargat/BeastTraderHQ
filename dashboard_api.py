@@ -247,13 +247,31 @@ def portfolio():
         pos_data.append(entry)
 
     total_pl = sum(p.unrealized_pl for p in positions)
+
+    # Serialize orders to plain dicts (React can't render raw objects)
+    orders_data = []
+    for o in orders:
+        if isinstance(o, dict):
+            orders_data.append(o)
+        else:
+            orders_data.append({
+                'id': str(getattr(o, 'id', '')),
+                'symbol': getattr(o, 'symbol', ''),
+                'side': str(getattr(o, 'side', '')),
+                'qty': str(getattr(o, 'qty', '')),
+                'type': str(getattr(o, 'type', '')),
+                'status': str(getattr(o, 'status', '')),
+                'limit_price': str(getattr(o, 'limit_price', '') or ''),
+                'trail_percent': str(getattr(o, 'trail_percent', '') or ''),
+            })
+
     return jsonify({
         'equity': float(acct.get('equity', 0)),
         'buying_power': float(acct.get('buying_power', 0)),
         'cash': float(acct.get('cash', 0)),
         'total_pl': total_pl,
         'positions': sorted(pos_data, key=lambda x: x['unrealized_pl'], reverse=True),
-        'open_orders': orders,
+        'open_orders': orders_data,
         'positions_count': len(positions),
         'orders_count': len(orders),
         'timestamp': datetime.now(ET).isoformat(),
@@ -1390,6 +1408,301 @@ def live_feed():
         return jsonify({'feed': [], 'count': 0, 'error': str(e)})
 
 
+# ══════════════════════════════════════════════════════════
+#  V4 ENDPOINTS: Scan snapshots, trade log, performance,
+#  notifications, bot config, bot sessions, learning
+# ══════════════════════════════════════════════════════════
+
+def _get_v4_db():
+    """Get V4 DB connection (cached per-request via g)."""
+    from flask import g
+    if not hasattr(g, '_v4_db'):
+        from db_postgres import BeastDB
+        g._v4_db = BeastDB()
+    return g._v4_db
+
+
+@app.route('/api/v4/dashboard-state')
+@require_auth
+def v4_dashboard_state():
+    """One-call dashboard state: session, mode, notifications, perf."""
+    try:
+        db = _get_v4_db()
+        return jsonify(db.get_dashboard_state())
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/scan-snapshots')
+@require_auth
+def v4_scan_snapshots():
+    """Recent scan snapshots with perf metrics (timeline view)."""
+    try:
+        db = _get_v4_db()
+        scan_type = request.args.get('type')
+        limit = int(request.args.get('limit', 20))
+        return jsonify(db.get_scan_snapshots(limit=limit, scan_type=scan_type))
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/scan-detail/<scan_id>')
+@require_auth
+def v4_scan_detail(scan_id):
+    """Full scan snapshot with all JSONB data (deep dive)."""
+    try:
+        db = _get_v4_db()
+        return jsonify(db.get_scan_detail(scan_id))
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/trade-log')
+@require_auth
+def v4_trade_log():
+    """Deep trade log with full context + AI reasoning."""
+    try:
+        db = _get_v4_db()
+        symbol = request.args.get('symbol')
+        side = request.args.get('side')
+        limit = int(request.args.get('limit', 50))
+        return jsonify(db.get_trade_log(limit=limit, symbol=symbol, side=side))
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/trade-win-rate')
+@require_auth
+def v4_trade_win_rate():
+    """Win rate by strategy, trigger, and regime."""
+    try:
+        db = _get_v4_db()
+        days = int(request.args.get('days', 30))
+        return jsonify(db.get_trade_win_rate(days))
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/decisions')
+@require_auth
+def v4_decisions():
+    """Trade decisions (buy/skip/block) with audit trail."""
+    try:
+        db = _get_v4_db()
+        symbol = request.args.get('symbol')
+        action = request.args.get('action')
+        limit = int(request.args.get('limit', 50))
+        return jsonify(db.get_decisions(limit=limit, symbol=symbol, action=action))
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/decision-accuracy')
+@require_auth
+def v4_decision_accuracy():
+    """Were our decisions correct? Buy vs Skip accuracy."""
+    try:
+        db = _get_v4_db()
+        days = int(request.args.get('days', 7))
+        return jsonify(db.get_decision_accuracy(days))
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/missed-trades')
+@require_auth
+def v4_missed_trades():
+    """Stocks we blocked/skipped but went up (regret analysis)."""
+    try:
+        db = _get_v4_db()
+        days = int(request.args.get('days', 3))
+        return jsonify(db.get_missed_trades(days))
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/notifications')
+@require_auth
+def v4_notifications():
+    """Dashboard notification queue."""
+    try:
+        db = _get_v4_db()
+        unread = request.args.get('unread', 'true').lower() == 'true'
+        limit = int(request.args.get('limit', 50))
+        return jsonify({
+            'notifications': db.get_notifications(limit=limit, unread_only=unread),
+            'unread_count': db.get_unread_count(),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/notifications/read', methods=['POST'])
+@require_auth
+def v4_notifications_read():
+    """Mark notifications as read."""
+    try:
+        db = _get_v4_db()
+        data = request.get_json() or {}
+        ids = data.get('ids')
+        db.mark_notifications_read(ids)
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/config')
+@require_auth
+def v4_config():
+    """All bot config (for settings page)."""
+    try:
+        db = _get_v4_db()
+        category = request.args.get('category')
+        return jsonify(db.get_all_config(category))
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/config', methods=['POST'])
+@require_auth
+def v4_config_update():
+    """Update a bot config value (from dashboard)."""
+    try:
+        db = _get_v4_db()
+        data = request.get_json() or {}
+        key = data.get('key')
+        value = data.get('value')
+        if not key:
+            return jsonify({'error': 'key required'}), 400
+        db.set_config(key, value, updated_by='dashboard')
+        db.invalidate_cache()
+        return jsonify({'ok': True, 'key': key, 'value': value})
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/kill-switch', methods=['POST'])
+@require_auth
+def v4_kill_switch():
+    """Toggle kill switch from dashboard."""
+    try:
+        db = _get_v4_db()
+        data = request.get_json() or {}
+        enabled = data.get('enabled', True)
+        db.set_config('kill_switch', enabled, updated_by='dashboard')
+        db.invalidate_cache()
+        db.notify('Kill Switch ' + ('ON' if enabled else 'OFF'),
+                  'Kill switch toggled from dashboard', severity='warning', category='control')
+        return jsonify({'ok': True, 'kill_switch': enabled})
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/bot-mode', methods=['POST'])
+@require_auth
+def v4_bot_mode():
+    """Change bot mode: active / paused / monitor_only."""
+    try:
+        db = _get_v4_db()
+        data = request.get_json() or {}
+        mode = data.get('mode', 'active')
+        if mode not in ('active', 'paused', 'monitor_only'):
+            return jsonify({'error': 'Invalid mode'}), 400
+        db.set_config('bot_mode', mode, updated_by='dashboard')
+        db.invalidate_cache()
+        db.notify(f'Bot Mode → {mode.upper()}', f'Bot mode changed from dashboard', severity='info')
+        return jsonify({'ok': True, 'mode': mode})
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/session')
+@require_auth
+def v4_session():
+    """Current bot session info (version, uptime, stats)."""
+    try:
+        db = _get_v4_db()
+        return jsonify({
+            'current': db.get_session_info(),
+            'history': db.get_session_history(10),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/performance')
+@require_auth
+def v4_performance():
+    """Scan performance metrics (timing breakdown)."""
+    try:
+        db = _get_v4_db()
+        last_perf = db.get_state('last_scan_perf', {})
+        # Get average scan times from recent snapshots
+        snapshots = db.get_scan_snapshots(limit=20, scan_type='5min')
+        avg_duration = 0
+        if snapshots:
+            durations = [s.get('duration_ms', 0) for s in snapshots if s.get('duration_ms')]
+            avg_duration = sum(durations) // len(durations) if durations else 0
+        return jsonify({
+            'last_scan': last_perf,
+            'avg_scan_ms': avg_duration,
+            'recent_scans': snapshots[:10],
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/learning/<symbol>')
+@require_auth
+def v4_learning(symbol):
+    """Everything the bot has learned about a stock."""
+    try:
+        db = _get_v4_db()
+        return jsonify(db.get_learning_context_for_stock(symbol.upper()))
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/daily-reports')
+@require_auth
+def v4_daily_reports():
+    """Historical daily AI analysis reports."""
+    try:
+        db = _get_v4_db()
+        days = int(request.args.get('days', 30))
+        return jsonify(db.get_daily_reports(days))
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/price-memory')
+@require_auth
+def v4_price_memory():
+    """All price memory (last sell, cooldowns, intraday highs)."""
+    try:
+        db = _get_v4_db()
+        symbol = request.args.get('symbol')
+        if symbol:
+            return jsonify(db.get_price_memory(symbol.upper()))
+        return jsonify(db.get_all_price_memory())
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/signals')
+@require_auth
+def v4_signals():
+    """Strategy signal history (for backtesting view)."""
+    try:
+        db = _get_v4_db()
+        symbol = request.args.get('symbol')
+        strategy = request.args.get('strategy')
+        hours = int(request.args.get('hours', 24))
+        return jsonify(db.get_signal_history(symbol=symbol, strategy=strategy, hours=hours))
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
 if __name__ == '__main__':
-    print("Beast V3 Dashboard API starting on port 8080...")
+    print("Beast V4 Dashboard API starting on port 8080...")
     app.run(host='0.0.0.0', port=8080, debug=False)

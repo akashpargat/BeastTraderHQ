@@ -75,7 +75,7 @@ export default function Dashboard() {
         </div>
         <div className="glass p-4 text-center">
           <div className="text-xs text-gray-400">Orders</div>
-          <div className="text-xl font-bold">{portfolio?.open_orders ?? 0}</div>
+          <div className="text-xl font-bold">{portfolio?.orders_count ?? (Array.isArray(portfolio?.open_orders) ? portfolio.open_orders.length : portfolio?.open_orders ?? 0)}</div>
         </div>
         <div className="glass p-4 text-center">
           <div className="text-xs text-gray-400">AI Status</div>
