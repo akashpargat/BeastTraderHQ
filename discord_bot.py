@@ -3869,6 +3869,151 @@ async def before_daily_learn():
     await asyncio.sleep(wait_secs)
 
 
+# ══════════════════════════════════════════════════════════
+#  AFTER-HOURS / PRE-MARKET EARNINGS SCANNER
+#  Runs every 15 min during extended hours (4-8 PM, 4-9:30 AM)
+#  Catches: earnings movers, AH gaps, PM setups
+#  Stores patterns to DB for the bot to use at market open
+# ══════════════════════════════════════════════════════════
+
+@tasks.loop(minutes=15)
+async def ah_pm_scanner():
+    """Every 15 min during extended hours: scan for earnings movers + gaps.
+    META dropped -9% AH on earnings - this scanner catches that and stores the pattern.
+    Pre-market: catches gap ups/downs before open so the bot is ready."""
+    try:
+        if _is_market_hours():
+            return  # Only run during extended hours
+
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+        if now.weekday() >= 5:
+            return  # Skip weekends
+
+        # Only run 4 PM - 8 PM ET (after hours) and 4 AM - 9:30 AM ET (pre-market)
+        is_ah = 16 <= now.hour < 20
+        is_pm = 4 <= now.hour < 10
+        if not is_ah and not is_pm:
+            return
+
+        session = "AH" if is_ah else "PM"
+        pg = _get_pg()
+        channel = bot.get_channel(SCAN_CHANNEL_ID)
+
+        log.info(f"  🌙 {session} Scanner: checking earnings movers + gaps...")
+
+        # Get all held positions + top watchlist stocks
+        positions = gateway.get_positions()
+        held_syms = [p.symbol for p in positions]
+        watch_syms = PAST_WINNERS[:20]
+        all_syms = list(set(held_syms + watch_syms))
+
+        # Get current vs previous close for all stocks
+        movers = []
+        try:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockSnapshotRequest
+            dc = StockHistoricalDataClient(os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'))
+
+            for batch_start in range(0, len(all_syms), 20):
+                batch = all_syms[batch_start:batch_start + 20]
+                try:
+                    snaps = dc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=batch, feed='iex'))
+                    for sym, s in snaps.items():
+                        try:
+                            price = float(s.latest_trade.price)
+                            prev = float(s.previous_daily_bar.close)
+                            pct = (price - prev) / prev * 100
+                            vol = int(s.daily_bar.volume) if s.daily_bar else 0
+                            if abs(pct) > 2:  # >2% move in AH/PM = significant
+                                movers.append({
+                                    'symbol': sym, 'price': price, 'prev': prev,
+                                    'pct': round(pct, 2), 'volume': vol,
+                                    'session': session, 'held': sym in held_syms,
+                                })
+                        except:
+                            pass
+                except:
+                    pass
+        except Exception as e:
+            log.warning(f"  {session} scanner price fetch: {e}")
+            return
+
+        if not movers:
+            log.info(f"  🌙 {session} Scanner: no significant movers")
+            return
+
+        movers.sort(key=lambda x: -abs(x['pct']))
+        log.info(f"  🌙 {session} Scanner: {len(movers)} stocks moved >2%")
+
+        # Store each mover as a pattern in ai_trends
+        if pg:
+            for m in movers[:10]:
+                sym = m['symbol']
+                direction = "UP" if m['pct'] > 0 else "DOWN"
+                # Check if this is an earnings move (use yfinance)
+                is_earnings = False
+                try:
+                    sa = SentimentAnalyst()
+                    earn = sa.get_earnings_info(sym)
+                    if earn.get('days_until', 999) <= 1:
+                        is_earnings = True
+                except:
+                    pass
+
+                if is_earnings:
+                    trend_type = f'{session.lower()}_earnings_move'
+                    insight = f"{sym} {direction} {abs(m['pct']):.1f}% on earnings in {session}. Prev close ${m['prev']:.2f} -> ${m['price']:.2f}"
+                    pg.save_trend(sym, trend_type, insight, 85, m)
+                    # Store earnings pattern for long-term learning
+                    pg._exec(
+                        """INSERT INTO earnings_patterns (symbol, earnings_date, pre_price, post_price, beat_or_miss, gap_pct)
+                           VALUES (%s, CURRENT_DATE, %s, %s, %s, %s)
+                           ON CONFLICT DO NOTHING""",
+                        (sym, m['prev'], m['price'], 'beat' if m['pct'] > 0 else 'miss', m['pct'])
+                    )
+                    log.info(f"  🌙 EARNINGS: {sym} {direction} {abs(m['pct']):.1f}% in {session} - STORED to earnings_patterns")
+                else:
+                    trend_type = f'{session.lower()}_gap'
+                    insight = f"{sym} {direction} {abs(m['pct']):.1f}% in {session}. Vol: {m['volume']:,}"
+                    pg.save_trend(sym, trend_type, insight, 70, m)
+                    log.info(f"  🌙 GAP: {sym} {direction} {abs(m['pct']):.1f}% in {session}")
+
+                # Add to watchlist if not already there
+                pg.add_to_watchlist(sym, source=f'{session}_mover', pct=m['pct'], volume=m['volume'])
+
+            # Notify via Discord
+            if channel and movers:
+                msg = f"🌙 **{session} SCANNER** - {now.strftime('%I:%M %p ET')}\n\n"
+                for m in movers[:8]:
+                    icon = "🟢" if m['pct'] > 0 else "🔴"
+                    held_tag = " (HELD)" if m['held'] else ""
+                    msg += f"{icon} **{m['symbol']}** {m['pct']:+.1f}% @ ${m['price']:.2f}{held_tag}\n"
+                msg += f"\n_Patterns stored for tomorrow's trading_"
+                await channel.send(msg[:2000])
+
+            # Telegram alert for big movers
+            big_movers = [m for m in movers if abs(m['pct']) > 5]
+            if big_movers:
+                tg_msg = f"🌙 {session} BIG MOVERS:\n"
+                for m in big_movers[:5]:
+                    tg_msg += f"{'🟢' if m['pct']>0 else '🔴'} {m['symbol']} {m['pct']:+.1f}%\n"
+                _tg(tg_msg)
+
+        _pg_log(f"{session}_SCAN", reason=f"{len(movers)} movers found >2%",
+                source=f"{session.lower()}_scanner",
+                data={'movers': [m['symbol'] for m in movers[:10]]})
+
+    except Exception as e:
+        log.warning(f"AH/PM scanner error: {e}")
+
+@ah_pm_scanner.before_loop
+async def before_ah_pm():
+    await bot.wait_until_ready()
+    await asyncio.sleep(60)
+
+
 @bot.event
 async def on_ready():
     log.info(f"🦍 Beast Discord Bot online as {bot.user}")
@@ -3906,6 +4051,9 @@ async def on_ready():
     if not outcome_grader.is_running():
         outcome_grader.start()
         log.info("   ✅ Outcome grader: every 30 min (grades past decisions)")
+    if not ah_pm_scanner.is_running():
+        ah_pm_scanner.start()
+        log.info("   ✅ AH/PM scanner: every 15 min (earnings movers + gaps)")
     if not claude_daily_deep_learn.is_running():
         claude_daily_deep_learn.start()
         log.info("   ✅ Claude daily deep learn: once/day at 3 AM ET")
