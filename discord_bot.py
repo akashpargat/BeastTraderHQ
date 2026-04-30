@@ -2175,32 +2175,61 @@ async def fast_runner_scan():
         channel = bot.get_channel(SCAN_CHANNEL_ID)
         positions = gateway.get_positions()
         held_syms = {p.symbol for p in positions}
-        # No scalp limit — Beast mode, let it roll
-
-        # Scan past winners + watchlist — INCLUDE stocks we hold that are dipping (add to position)
-        scan_list = [s for s in (PAST_WINNERS + DIP_BUY_WATCHLIST[:10]) if s not in held_syms]
-        scan_list = list(dict.fromkeys(scan_list))[:15]  # dedupe, max 15
-
-        if not scan_list:
-            return
 
         def _scan_runners():
+            """Scan the ENTIRE MARKET for movers — no watchlist, let the market tell us."""
             from alpaca.data.historical import StockHistoricalDataClient
             from alpaca.data.requests import StockSnapshotRequest
             dc = StockHistoricalDataClient(os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'))
-            snaps = dc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=scan_list, feed='iex'))
             runners = []
-            for sym, s in snaps.items():
-                try:
-                    price = float(s.latest_trade.price)
-                    prev = float(s.previous_daily_bar.close)
-                    pct = (price - prev) / prev * 100
-                    vol = int(s.daily_bar.volume) if s.daily_bar else 0
-                    if pct >= 3.0 and price > 5 and vol > 100000:
-                        runners.append({'symbol': sym, 'price': price, 'pct': pct, 'volume': vol, 'prev': prev})
-                except:
-                    pass
-            return sorted(runners, key=lambda x: -x['pct'])
+
+            # Layer 1: Alpaca most active (top 20 by volume — ANY stock in the market)
+            try:
+                from alpaca.data.requests import MostActivesRequest
+                actives = dc.get_most_actives(MostActivesRequest(top=20, by='volume'))
+                active_syms = []
+                if hasattr(actives, 'most_actives'):
+                    for a in actives.most_actives:
+                        sym = a.symbol if hasattr(a, 'symbol') else ''
+                        if sym and len(sym) <= 5 and sym not in held_syms:
+                            active_syms.append(sym)
+                if active_syms:
+                    snaps = dc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=active_syms[:20], feed='iex'))
+                    for sym, s in snaps.items():
+                        try:
+                            price = float(s.latest_trade.price)
+                            prev = float(s.previous_daily_bar.close)
+                            pct = (price - prev) / prev * 100
+                            vol = int(s.daily_bar.volume) if s.daily_bar else 0
+                            if price > 5 and vol > 100000 and abs(pct) > 2:
+                                runners.append({'symbol': sym, 'price': price, 'pct': pct, 'volume': vol, 'prev': prev})
+                                # Auto-add to our memory — never forget a mover
+                                if sym not in DIP_BUY_WATCHLIST:
+                                    DIP_BUY_WATCHLIST.append(sym)
+                        except:
+                            pass
+            except Exception as e:
+                log.debug(f"Most actives scan: {e}")
+
+            # Layer 2: Past winners (proven stocks)
+            try:
+                pw = [s for s in PAST_WINNERS if s not in held_syms and s not in [r['symbol'] for r in runners]][:10]
+                if pw:
+                    snaps = dc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=pw, feed='iex'))
+                    for sym, s in snaps.items():
+                        try:
+                            price = float(s.latest_trade.price)
+                            prev = float(s.previous_daily_bar.close)
+                            pct = (price - prev) / prev * 100
+                            vol = int(s.daily_bar.volume) if s.daily_bar else 0
+                            if price > 5 and abs(pct) > 1.5:
+                                runners.append({'symbol': sym, 'price': price, 'pct': pct, 'volume': vol, 'prev': prev})
+                        except:
+                            pass
+            except:
+                pass
+
+            return sorted(runners, key=lambda x: -abs(x['pct']))
 
         runners = await asyncio.to_thread(_scan_runners)
 
