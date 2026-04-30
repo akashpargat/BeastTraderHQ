@@ -1466,8 +1466,10 @@ _cached_vix = 18.0  # Default neutral VIX
 
 
 def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=0, source="bot", **kwargs):
-    """SMART BUY: Trends → TV confirm → Self-learn → VIX size → Execute."""
+    """SMART BUY: Trends → TV confirm → Self-learn → VIX size → Execute.
+    Every decision (buy/skip/block) is logged to trade_decisions for audit + learning."""
     pg = _get_pg()
+    decision_ctx = {'reason': reason, 'day_change_pct': day_change_pct, 'sentiment': sentiment_score}
 
     # CHECK AI TRENDS FIRST: does Claude recommend avoiding this stock?
     if pg:
@@ -1475,29 +1477,47 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
             trends = pg.get_trends(symbol=symbol)
             for t in trends:
                 ttype = t.get('trend_type', '')
-                # Claude said AVOID this stock
                 if ttype == 'claude_daily_avoid':
                     log.info(f"  🧠 TREND BLOCK: {symbol} — Claude daily avoid: {t.get('insight','')[:60]}")
                     _pg_log("TREND_BLOCKED", symbol=symbol, reason=f"Claude avoid: {t.get('insight','')[:80]}", source=source)
+                    if pg: pg.log_decision(symbol, 'BLOCK', 0, block_reason=f"Claude avoid: {t.get('insight','')[:80]}",
+                                           trend_data={'trends': [dict(t)]}, strategy=source, price_at_decision=price)
                     return None
-                # Earnings pattern says it dips after earnings — check if earnings just happened
                 if ttype == 'earnings_pattern' and 'DIPS_AFTER' in str(t.get('insight', '')):
                     sa = SentimentAnalyst()
                     earn = sa.get_earnings_info(symbol)
                     if earn.get('days_until', 999) == 0:
                         log.info(f"  🧠 TREND: {symbol} dips after earnings (today!) — waiting for lower entry")
                         _pg_log("TREND_WAIT", symbol=symbol, reason="Earnings today + dips pattern — waiting", source=source)
+                        if pg: pg.log_decision(symbol, 'SKIP', 0, block_reason="Earnings dip pattern — waiting",
+                                               trend_data={'pattern': 'dips_after_earnings'}, strategy=source, price_at_decision=price)
                         return None
-                # Claude recommended this as a buy — boost confidence
                 if ttype == 'claude_daily_buy' and t.get('confidence', 0) >= 70:
-                    qty = int(qty * 1.3)  # Buy bigger on Claude-recommended stocks
+                    qty = int(qty * 1.3)
                     log.info(f"  🧠 TREND BOOST: {symbol} — Claude daily buy rec ({t.get('confidence')}%)")
+                    decision_ctx['claude_boost'] = True
         except:
             pass
+
+    # DB-backed cooldown check (survives restarts)
+    if pg and pg.check_sell_cooldown(symbol, int(pg.get_config('cooldown_after_sell_sec', 300))):
+        log.info(f"  ⏳ COOLDOWN: {symbol} — recently sold, waiting")
+        pg.log_decision(symbol, 'BLOCK', 0, block_reason="Sell cooldown active", strategy=source, price_at_decision=price)
+        return None
+
+    # DB-backed anti-buyback (survives restarts)
+    if pg and pg.check_anti_buyback(symbol, price):
+        mem = pg.get_price_memory(symbol)
+        log.info(f"  🚫 ANTI-BUYBACK: {symbol} — sold at ${mem.get('last_sell_price',0):.2f}, now ${price:.2f}")
+        pg.log_decision(symbol, 'BLOCK', 0, block_reason=f"Anti-buyback: sold at ${mem.get('last_sell_price',0):.2f}",
+                        strategy=source, price_at_decision=price)
+        return None
 
     # HARD LAW: TV must confirm
     confirmed, tv = _tv_confirm_buy(symbol)
     if not confirmed:
+        if pg: pg.log_decision(symbol, 'BLOCK', 0, tv_data=tv, block_reason="TV rejected",
+                               strategy=source, price_at_decision=price)
         return None
 
     # Self-learning: check trade history
@@ -1507,6 +1527,8 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
             if not advice.get('trade', True):
                 log.info(f"  🧠 Self-learn: SKIP {symbol} — {advice.get('reason', '')}")
                 _pg_log("SELF_LEARN_SKIP", symbol=symbol, reason=advice.get('reason', ''), source=source)
+                pg.log_decision(symbol, 'SKIP', 0, block_reason=f"Self-learn: {advice.get('reason','')}",
+                                strategy=source, price_at_decision=price)
                 return None
             if advice.get('size') == 'large':
                 qty = int(qty * 1.5)
@@ -1526,10 +1548,31 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
         except:
             pass
 
-    return gateway.quick_buy(symbol, qty, price, reason=reason,
+    # EXECUTE THE BUY
+    result = gateway.quick_buy(symbol, qty, price, reason=reason,
                             day_change_pct=day_change_pct,
                             sentiment_score=sentiment_score,
                             vix=_cached_vix, tv_confirmed=True)
+
+    # Log the decision outcome to DB
+    if pg:
+        executed = result is not None and hasattr(result, 'state') and result.state.value != 'REJECTED'
+        exec_result = result.state.value if result and hasattr(result, 'state') else 'FAILED'
+        order_id = result.id if result and hasattr(result, 'id') else None
+        pg.log_decision(symbol, 'BUY', confidence=kwargs.get('confidence', 0),
+                        tv_data=tv, signals=decision_ctx,
+                        executed=executed, execution_result=exec_result,
+                        order_id=str(order_id) if order_id else None,
+                        strategy=source, price_at_decision=price)
+        if executed:
+            pg.record_buy(symbol, price)
+            pg.set_state('last_trade_time', time.strftime('%Y-%m-%dT%H:%M:%SZ'), 'runtime')
+            trades_today = pg.get_state('trades_today', 0)
+            pg.set_state('trades_today', trades_today + 1, 'daily')
+            pg.notify(f"BUY {symbol}", f"{qty} shares @ ${price:.2f} — {reason[:100]}",
+                      severity='success', symbol=symbol, category='trade')
+
+    return result
 
 def _get_trade_db():
     global _trade_db
@@ -1549,7 +1592,8 @@ def _get_pg():
             from db_postgres import BeastDB
             _pg_db = BeastDB()
             if _pg_db.conn:
-                log.info("📦 PostgreSQL connected")
+                _pg_db.migrate_v4()  # Auto-create V4 tables
+                log.info("📦 PostgreSQL connected + V4 schema ready")
         except Exception as e:
             log.debug(f"PostgreSQL not available: {e}")
     return _pg_db
@@ -1626,6 +1670,18 @@ async def position_monitor():
     """Every 60s: check positions, alert drops, auto-scalp, auto-protect, auto-buy dips."""
     global _prev_prices, _cycle_count, _cached_vix
     _cycle_count += 1
+    pg = _get_pg()
+
+    # Persist cycle count to DB (dashboard can see it)
+    if pg and _cycle_count % 5 == 0:
+        pg.set_state('cycle_count', _cycle_count, 'runtime')
+        pg.set_state('last_monitor_time', time.strftime('%Y-%m-%dT%H:%M:%SZ'), 'runtime')
+
+    # Check kill switch from DB (dashboard can flip this)
+    if pg and pg.is_kill_switch_on():
+        if _cycle_count % 60 == 0:
+            log.info("🛑 KILL SWITCH ON — skipping position monitor")
+        return
 
     # Refresh VIX every 10 cycles
     if _cycle_count % 10 == 0:
@@ -1674,10 +1730,16 @@ async def position_monitor():
             pct = _pct(p)
             avail = p.qty_available or 0
 
-            # Track intraday high for dip detection
+            # Track intraday high for dip detection — persist to DB
             high_key = f"_hi_{p.symbol}"
             if p.current_price > _prev_prices.get(high_key, 0):
                 _prev_prices[high_key] = p.current_price
+            # Also persist price to DB (survives restart)
+            if pg:
+                try:
+                    pg.update_price(p.symbol, p.current_price)
+                except:
+                    pass
 
             if _is_trading_hours() and avail > 0:
                 # ── SCALP SELL: +2% → sell available shares, allow re-scalp after 15 min ──
@@ -1689,6 +1751,8 @@ async def position_monitor():
                         gateway.place_sell(p.symbol, sell_qty, sell_price,
                                           reason=f"Scalp +{pct:.1f}%", entry_price=p.avg_entry)
                         _prev_prices[f"_scalp_t_{p.symbol}"] = time.time()
+                        if pg: pg.record_scalp(p.symbol)
+                        if pg: pg.record_sell(p.symbol, sell_price)
                         _log_trade("SCALP SELL", p.symbol, sell_qty, sell_price,
                                    f"+{pct:.1f}% — selling {sell_qty} for profit", "60s Scalp")
                         if channel:
@@ -1715,6 +1779,8 @@ async def position_monitor():
                                     vix=_cached_vix)
                                 if result and result.state.value != 'REJECTED':
                                     _prev_prices[reload_key] = time.time()
+                                    if pg: pg.record_reload(p.symbol)
+                                    if pg: pg.record_buy(p.symbol, buy_price)
                                     _log_trade("DIP RELOAD", p.symbol, reload_qty, buy_price,
                                                f"Dropped {dip_pct:.1f}% from high. Scalp reload.", "60s Reload")
                                     if channel:
@@ -1744,6 +1810,8 @@ async def position_monitor():
                                 vix=_cached_vix)
                             if result and result.state.value != 'REJECTED':
                                 _prev_prices[pyramid_key] = time.time()
+                                if pg: pg.record_pyramid(p.symbol)
+                                if pg: pg.record_buy(p.symbol, buy_price)
                                 _log_trade("PYRAMID BUY", p.symbol, add_qty, buy_price,
                                            f"Winner +{pct:.1f}% — adding more to ride", "60s Pyramid")
                                 if channel:
@@ -1877,26 +1945,38 @@ async def position_monitor():
 @tasks.loop(minutes=5)
 async def full_scan():
     """Every 5 min: MANDATORY full scan — TV + ALL sentiment + confidence engine + AI.
-    NO EXCEPTIONS. Every source runs. Confidence is generated. AI analyzes AFTER data."""
+    NO EXCEPTIONS. Every source runs. Confidence is generated. AI analyzes AFTER data.
+    DEEP LOGGED: Every scan saved as a complete snapshot for learning."""
     global _last_full_scan
     try:
         channel = bot.get_channel(SCAN_CHANNEL_ID)
         if not channel:
             return
 
-        import asyncio
+        import asyncio, uuid
         from datetime import datetime
         from zoneinfo import ZoneInfo
         now = datetime.now(ZoneInfo("America/New_York"))
+        scan_start = time.time()
+        scan_id = f"5min_{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        pg = _get_pg()
 
-        # ── 24/7 scanning — TV and sentiment cost nothing, always scan ──
+        # Kill switch check
+        if pg and pg.is_kill_switch_on():
+            log.info("🛑 KILL SWITCH — skipping full scan")
+            return
 
         positions = gateway.get_positions()
         acct = gateway.get_account()
         equity = float(acct.get('equity', 100000))
+        cash = float(acct.get('cash', 0))
         total_pl = sum(p.unrealized_pl for p in positions)
         greens = sum(1 for p in positions if p.unrealized_pl >= 0)
         held = [p.symbol for p in positions]
+        heat_pct = round((1 - cash / equity) * 100, 1) if equity > 0 else 0
+
+        # Track for snapshot
+        scan_decisions = []
 
         # ── REGIME ──
         spy_change = 0
@@ -1918,20 +1998,31 @@ async def full_scan():
         # Step 2: ALL sentiment (Yahoo + Reddit + Google News + Trump + Analyst)
         # Step 3: Confidence Engine (11 strategies scored)
         # Step 4: AI analysis (AFTER data, not before)
+        # PERFORMANCE: Every step timed per-stock for optimization
         # ══════════════════════════════════════════════════
+        perf = {}  # {step: {total_ms, per_stock: {sym: ms}}}
 
         # ── STEP 1: TV INDICATORS (MANDATORY) ──
         tv_data = {}
         def _read_all_tv(syms):
             d = {}
+            timings = {}
             for sym in syms:
+                t0 = time.time()
                 ind = _get_tv_indicators(sym)
+                elapsed = int((time.time() - t0) * 1000)
+                timings[sym] = elapsed
                 if ind:
                     d[sym] = ind
-                    log.info(f"  TV {sym}: RSI={ind.get('rsi','?'):.0f} MACD={ind.get('macd_hist','?')} VWAP={'above' if ind.get('vwap_above') else 'BELOW'}")
-            return d
-        tv_data = await asyncio.to_thread(_read_all_tv, held[:10])
-        log.info(f"  TV: read {len(tv_data)}/{len(held)} stocks")
+                    log.info(f"  TV {sym}: RSI={ind.get('rsi','?'):.0f} MACD={ind.get('macd_hist','?')} VWAP={'above' if ind.get('vwap_above') else 'BELOW'} [{elapsed}ms]")
+                else:
+                    log.info(f"  TV {sym}: NO DATA [{elapsed}ms]")
+            return d, timings
+        t_step = time.time()
+        tv_data, tv_timings = await asyncio.to_thread(_read_all_tv, held[:10])
+        tv_total = int((time.time() - t_step) * 1000)
+        perf['tv'] = {'total_ms': tv_total, 'stocks': len(held[:10]), 'loaded': len(tv_data), 'per_stock': tv_timings}
+        log.info(f"  📊 TV: {len(tv_data)}/{len(held)} stocks in {tv_total}ms (avg {tv_total//max(len(held[:10]),1)}ms/stock)")
 
         # ── STEP 2: ALL SENTIMENT (MANDATORY — 5 sources) ──
         sentiments = {}
@@ -1941,32 +2032,40 @@ async def full_scan():
             from sentiment_analyst import SentimentAnalyst
             sa = SentimentAnalyst()
             results = {}
-            # Per-stock sentiment (Yahoo + Reddit + Analyst)
+            timings = {}
             for sym in syms:
+                t0 = time.time()
                 try:
                     results[sym] = sa.analyze(sym)
                 except Exception as e:
                     log.warning(f"  Sentiment {sym} failed: {e}")
-            # Trump/tariff/geopolitical (Google News RSS — NO API KEY)
+                timings[sym] = int((time.time() - t0) * 1000)
+            # Trump/tariff/geopolitical
+            t0 = time.time()
             try:
                 t_score, t_headlines = sa.get_trump_sentiment()
                 results['_trump'] = {'score': t_score, 'headlines': t_headlines}
             except Exception as e:
                 log.warning(f"  Trump sentiment failed: {e}")
-            # Market-wide sentiment
+            timings['_trump'] = int((time.time() - t0) * 1000)
+            # Market-wide
+            t0 = time.time()
             try:
                 results['_market'] = sa.analyze_market()
             except:
                 pass
-            return results
-        sent_raw = await asyncio.to_thread(_read_all_sentiment, held[:10])
-        # Extract trump data
+            timings['_market'] = int((time.time() - t0) * 1000)
+            return results, timings
+        t_step = time.time()
+        sent_raw, sent_timings = await asyncio.to_thread(_read_all_sentiment, held[:10])
+        sent_total = int((time.time() - t_step) * 1000)
         trump_info = sent_raw.pop('_trump', {})
         trump_score = trump_info.get('score', 0)
         trump_headlines = trump_info.get('headlines', [])
         market_sent = sent_raw.pop('_market', None)
         sentiments = sent_raw
-        log.info(f"  Sentiment: {len(sentiments)} stocks | Trump: {trump_score:+d} | Headlines: {len(trump_headlines)}")
+        perf['sentiment'] = {'total_ms': sent_total, 'stocks': len(sentiments), 'per_stock': sent_timings}
+        log.info(f"  📊 Sentiment: {len(sentiments)} stocks in {sent_total}ms | Trump: {trump_score:+d} [{sent_timings.get('_trump',0)}ms]")
 
         # ── STEP 3: CONFIDENCE ENGINE (11 strategies, MANDATORY) ──
         confidence_results = {}
@@ -1975,14 +2074,14 @@ async def full_scan():
             from models import TechnicalSignals
             ce = ConfidenceEngine()
             results = {}
+            timings = {}
             for sym in syms:
+                t0 = time.time()
                 tv = tv_d.get(sym, {})
                 sent = sent_d.get(sym)
                 pos = next((p for p in positions if p.symbol == sym), None)
                 price = pos.current_price if pos else 0
-                # Build TechnicalSignals from TV data
-                # VWAP is meaningless outside market hours — default to neutral
-                vwap_val = 0.0  # neutral default for extended hours
+                vwap_val = 0.0
                 if _is_market_hours() and tv.get('vwap_above') is not None:
                     vwap_val = 1.0 if tv.get('vwap_above') else -1.0
                 tech = TechnicalSignals(
@@ -2003,19 +2102,39 @@ async def full_scan():
                     results[sym] = cr
                 except Exception as e:
                     log.warning(f"  Confidence {sym}: {e}")
-            return results
-        confidence_results = await asyncio.to_thread(_run_confidence, held[:10], tv_data, sentiments, regime)
-        log.info(f"  Confidence: {len(confidence_results)} scored")
+                timings[sym] = int((time.time() - t0) * 1000)
+            return results, timings
+        t_step = time.time()
+        confidence_results, conf_timings = await asyncio.to_thread(_run_confidence, held[:10], tv_data, sentiments, regime)
+        conf_total = int((time.time() - t_step) * 1000)
+        perf['confidence'] = {'total_ms': conf_total, 'stocks': len(confidence_results), 'per_stock': conf_timings}
+        log.info(f"  📊 Confidence: {len(confidence_results)} scored in {conf_total}ms")
 
         # ── OPEN ORDERS ──
+        t_step = time.time()
         open_orders = await asyncio.to_thread(gateway.get_open_orders)
+        perf['orders'] = {'total_ms': int((time.time() - t_step) * 1000)}
 
-        # ── STEP 4: AI ANALYSIS (AFTER all data collected) ──
+        # ── STEP 3.5: LEARNING CONTEXT (from DB — cached, fast) ──
+        t_step = time.time()
+        learning_digest = ""
+        if pg:
+            try:
+                learning_digest = pg.get_learning_digest_for_ai(held[:10])
+            except:
+                pass
+        perf['learning'] = {'total_ms': int((time.time() - t_step) * 1000), 'digest_len': len(learning_digest)}
+
+        # ── STEP 4: AI ANALYSIS (AFTER all data, WITH learning context) ──
         ai_verdicts = {}
+
+        t_step = time.time()
         if brain and brain.is_available:
             def _run_ai_final(pos_list, sent_d, tv_d, conf_d, regime_val, t_score):
                 results = {}
+                ai_timings = {}
                 for pos in pos_list:
+                    t0 = time.time()
                     try:
                         sym = pos.symbol
                         sent = sent_d.get(sym)
@@ -2024,6 +2143,21 @@ async def full_scan():
                         conf_pct = int(cr.overall_confidence * 100) if cr else 50
                         best_strat = cr.best_strategy.value if cr and cr.best_strategy else 'none'
                         signal = cr.signal.value if cr else 'no_trade'
+                        # Get per-stock learning context from DB (cached — fast)
+                        stock_learning = ""
+                        if pg:
+                            try:
+                                ctx = pg.get_learning_context_for_stock(sym)
+                                trades = ctx.get('trade_history', [])
+                                if trades:
+                                    wins = sum(1 for t in trades if t.get('was_profitable'))
+                                    total = sum(1 for t in trades if t.get('was_profitable') is not None)
+                                    lessons = [t.get('lesson_learned','') for t in trades if t.get('lesson_learned')]
+                                    stock_learning = f"HISTORY: {wins}/{total} wins. "
+                                    if lessons:
+                                        stock_learning += f"Lessons: {'; '.join(l[:60] for l in lessons[:3])}"
+                            except:
+                                pass
                         data = {
                             'price': pos.current_price, 'entry': pos.avg_entry,
                             'pnl': pos.unrealized_pl, 'qty': pos.qty,
@@ -2046,16 +2180,24 @@ async def full_scan():
                             'signal': signal,
                             'sector': '?', 'earnings_days': 999, 'holding': True,
                             'unrealized_pl': pos.unrealized_pl,
+                            'learning_context': stock_learning,
+                            'portfolio_learning': learning_digest[:500] if learning_digest else '',
                         }
                         results[sym] = brain.analyze_stock(sym, data)
                     except:
                         pass
-                return results
-            ai_verdicts = await asyncio.to_thread(
+                    ai_timings[pos.symbol] = int((time.time() - t0) * 1000)
+                return results, ai_timings
+            ai_verdicts, ai_timings = await asyncio.to_thread(
                 _run_ai_final, positions[:8], sentiments, tv_data,
                 confidence_results, regime.value, trump_score
             )
-        log.info(f"  AI: {len(ai_verdicts)} analyzed")
+        else:
+            ai_timings = {}
+        ai_total = int((time.time() - t_step) * 1000)
+        perf['ai'] = {'total_ms': ai_total, 'stocks': len(ai_verdicts), 'per_stock': ai_timings,
+                       'model': 'GPT-4o', 'learning_injected': len(learning_digest) > 0}
+        log.info(f"  📊 AI: {len(ai_verdicts)} analyzed in {ai_total}ms (avg {ai_total//max(len(ai_verdicts),1)}ms/stock)")
 
         # ══════════════════════════════════════════════════
         # AUTO-EXECUTE: GPT-4o high-confidence verdicts (≥75%)
@@ -2088,10 +2230,26 @@ async def full_scan():
                             sym, qty, buy_price,
                             reason=f"GPT-4o BUY {conf}%: {reason}",
                             day_change_pct=0, sentiment_score=sent_score,
-                            vix=_cached_vix
+                            vix=_cached_vix, confidence=conf
                         )
-                        if result and result.state.value != 'REJECTED':
+                        executed = result and result.state.value != 'REJECTED'
+                        scan_decisions.append({'symbol': sym, 'action': 'BUY', 'confidence': conf,
+                                               'executed': executed, 'reason': reason, 'source': 'GPT-4o'})
+                        if executed:
                             _log_trade(f"AI BUY (GPT-4o {conf}%)", sym, qty, buy_price, reason, "5min GPT")
+                            # Deep trade log with full context
+                            if pg:
+                                pg.log_trade_deep(sym, 'buy', qty, buy_price, scan_id=scan_id,
+                                    strategy='5min_GPT', source='full_scan', trigger=f'GPT-4o {conf}%',
+                                    tv_at_trade=tv_data.get(sym, {}),
+                                    sentiment_at_trade={'total': sent_score, 'yahoo': getattr(sent, 'yahoo_score', 0),
+                                                        'reddit': getattr(sent, 'reddit_score', 0)} if sent else {},
+                                    ai_verdict_at_trade=v, confidence=conf,
+                                    ai_reasoning=v.get('reasoning', '')[:500],
+                                    regime=regime.value, vix=_cached_vix, spy_change=spy_change,
+                                    heat_pct=heat_pct, position_count=len(positions),
+                                    order_result=result.state.value if result else 'NONE',
+                                    order_id=str(result.id) if result and hasattr(result, 'id') else None)
                             if channel:
                                 await channel.send(
                                     f"🤖🟢 **GPT-4o AUTO-BUY: {sym}** ({conf}%)\n"
@@ -2105,7 +2263,17 @@ async def full_scan():
                             gateway.place_sell(sym, sell_qty, sell_price,
                                               reason=f"GPT-4o SELL {conf}%: {reason}",
                                               entry_price=pos.avg_entry)
+                            scan_decisions.append({'symbol': sym, 'action': 'SELL', 'confidence': conf,
+                                                   'executed': True, 'reason': reason, 'source': 'GPT-4o'})
                             _log_trade(f"AI SELL (GPT-4o {conf}%)", sym, sell_qty, sell_price, reason, "5min GPT")
+                            if pg:
+                                pg.log_trade_deep(sym, 'sell', sell_qty, sell_price, scan_id=scan_id,
+                                    strategy='5min_GPT', source='full_scan', trigger=f'GPT-4o SELL {conf}%',
+                                    tv_at_trade=tv_data.get(sym, {}), ai_verdict_at_trade=v,
+                                    confidence=conf, ai_reasoning=v.get('reasoning', '')[:500],
+                                    regime=regime.value, vix=_cached_vix, spy_change=spy_change,
+                                    heat_pct=heat_pct, position_count=len(positions))
+                                pg.record_sell(sym, sell_price)
                             if channel:
                                 await channel.send(
                                     f"🤖🔴 **GPT-4o AUTO-SELL: {sym}** ({conf}%)\n"
@@ -2230,37 +2398,67 @@ async def full_scan():
         _tg(tg_report)
 
         _last_full_scan = time.time()
-        log.info(f"Full scan sent at {now.strftime('%H:%M')} [TV:{len(tv_data)} AI:{len(ai_verdicts)}]")
-        _pg_log("SCAN", reason=f"5min scan TV:{len(tv_data)} Sent:{len(sentiments)} AI:{len(ai_verdicts)}", source="5min", data={"tv_count": len(tv_data), "sentiment_count": len(sentiments), "ai_count": len(ai_verdicts)})
+        scan_duration = int((time.time() - scan_start) * 1000)
+        perf['total_ms'] = scan_duration
 
-        # ── LOG TO DATABASE (scan log + equity curve + position snapshots) ──
-        db = _get_trade_db()
-        if db:
-            try:
-                conf_data = {sym: cr.overall_confidence for sym, cr in confidence_results.items()}
-                db.log_scan(
-                    regime=regime.value, spy_change=spy_change, equity=equity,
-                    total_pl=total_pl, positions_count=len(positions),
-                    tv_count=len(tv_data), sentiment_count=len(sentiments),
-                    ai_count=len(ai_verdicts), trump_score=trump_score,
-                    confidence_scores=conf_data
-                )
-                db.log_equity(equity, total_pl, len(positions))
-                db.snapshot_positions(positions)
-                log.info(f"  DB: scan + equity + snapshots logged")
-            except Exception as e:
-                log.debug(f"DB logging failed: {e}")
+        # ── PERFORMANCE SUMMARY LOG ──
+        slowest_tv = max(tv_timings.items(), key=lambda x: x[1]) if tv_timings else ('none', 0)
+        slowest_sent = max(sent_timings.items(), key=lambda x: x[1]) if sent_timings else ('none', 0)
+        slowest_ai = max(ai_timings.items(), key=lambda x: x[1]) if ai_timings else ('none', 0)
+        log.info(f"  ⏱️ SCAN PERF: Total={scan_duration}ms | TV={perf['tv']['total_ms']}ms Sent={perf['sentiment']['total_ms']}ms "
+                 f"Conf={perf['confidence']['total_ms']}ms AI={perf['ai']['total_ms']}ms Learn={perf['learning']['total_ms']}ms")
+        log.info(f"  ⏱️ SLOWEST: TV={slowest_tv[0]}({slowest_tv[1]}ms) Sent={slowest_sent[0]}({slowest_sent[1]}ms) "
+                 f"AI={slowest_ai[0]}({slowest_ai[1]}ms)")
 
-        # ── PostgreSQL logging ──
+        _pg_log("SCAN", reason=f"5min scan TV:{len(tv_data)} Sent:{len(sentiments)} AI:{len(ai_verdicts)} [{scan_duration}ms]",
+                source="5min", data={"perf": perf, "tv_count": len(tv_data),
+                                      "sentiment_count": len(sentiments), "ai_count": len(ai_verdicts)})
+
+        # ── DEEP SCAN SNAPSHOT: Everything in one row for learning ──
         pg = _get_pg()
         if pg:
             try:
+                # Build serializable position data
+                pos_data = [{'symbol': p.symbol, 'qty': p.qty, 'entry': float(p.avg_entry),
+                             'price': float(p.current_price), 'pnl': float(p.unrealized_pl),
+                             'pct': round(_pct(p), 2)} for p in positions]
+                # Build serializable confidence data
+                conf_data = {}
+                for sym, cr in confidence_results.items():
+                    conf_data[sym] = {'confidence': round(cr.overall_confidence * 100, 1) if cr else 0,
+                                      'strategy': cr.best_strategy.value if cr and cr.best_strategy else 'none',
+                                      'signal': cr.signal.value if cr else 'none'}
+                # Build serializable sentiment data
+                sent_data = {}
+                for sym, s in sentiments.items():
+                    if hasattr(s, 'total_score'):
+                        sent_data[sym] = {'total': s.total_score, 'yahoo': s.yahoo_score,
+                                          'reddit': s.reddit_score, 'analyst': s.analyst_score}
+                    else:
+                        sent_data[sym] = s if isinstance(s, dict) else {}
+
+                pg.log_scan_snapshot(
+                    scan_id=scan_id, scan_type='5min', duration_ms=scan_duration,
+                    regime=regime.value, spy_change=spy_change, vix=_cached_vix,
+                    equity=equity, total_pl=total_pl,
+                    positions=pos_data, tv_data=tv_data, sentiment_data=sent_data,
+                    confidence_data=conf_data, ai_verdicts=ai_verdicts,
+                    decisions=scan_decisions,
+                    market_context={'trump_score': trump_score, 'trump_headlines': trump_headlines[:3],
+                                    'heat_pct': heat_pct, 'cash': cash, 'market_status': market_status,
+                                    'performance': perf}
+                )
+                pg.set_state('last_scan_time', time.strftime('%Y-%m-%dT%H:%M:%SZ'), 'runtime')
+                pg.set_state('last_scan_perf', perf, 'runtime')
+
                 pg.log_scan('5min', regime=regime.value, spy_change=spy_change,
                            tv_count=len(tv_data), sentiment_count=len(sentiments),
                            ai_count=len(ai_verdicts), trump_score=trump_score)
-                pg.auto_purge()  # Daily cleanup
+                pg.auto_purge()
             except Exception as e:
-                log.debug(f"PG scan log: {e}")
+                log.debug(f"PG scan snapshot: {e}")
+
+        log.info(f"Full scan #{scan_id} at {now.strftime('%H:%M')} [TV:{len(tv_data)} AI:{len(ai_verdicts)} {scan_duration}ms]")
 
     except Exception as e:
         log.error(f"Full scan error: {e}\n{traceback.format_exc()}")
