@@ -1431,6 +1431,11 @@ def _is_extended_hours() -> bool:
         return False
     return (4 <= now.hour < 9) or (16 <= now.hour < 20)
 
+def _is_trading_hours() -> bool:
+    """Pre-market (4AM) + market (9:30-4PM) + after-hours (4-8PM).
+    GTC orders fill during ALL sessions. This is when we can trade."""
+    return _is_market_hours() or _is_extended_hours()
+
 
 @tasks.loop(seconds=60)
 async def position_monitor():
@@ -1447,7 +1452,7 @@ async def position_monitor():
         held_symbols = {p.symbol for p in positions}
 
         # ── AUTO-PROTECT: place 3% trailing stop on any unprotected position ──
-        if _is_market_hours() and _cycle_count % 3 == 0:
+        if _is_trading_hours() and _cycle_count % 3 == 0:
             try:
                 open_orders = await asyncio.to_thread(gateway.get_open_orders)
                 # Build set of symbols that already have trailing stops
@@ -1479,7 +1484,7 @@ async def position_monitor():
             pct = _pct(p)
 
             # ── AUTO-RUNNER: +5% → sell half (only if shares available) ──
-            if pct >= 5.0 and not _prev_prices.get(f"_runner_{p.symbol}") and _is_market_hours():
+            if pct >= 5.0 and not _prev_prices.get(f"_runner_{p.symbol}") and _is_trading_hours():
                 avail = p.qty_available or 0
                 half = max(1, min(avail, p.qty // 2))
                 if avail < 1:
@@ -1500,7 +1505,7 @@ async def position_monitor():
                         log.error(f"Auto-runner failed {p.symbol}: {e}")
 
             # ── AUTO-SCALP: +2% → limit sell half (only if shares available) ──
-            elif pct >= 2.0 and not _prev_prices.get(f"_scalp_{p.symbol}") and _is_market_hours():
+            elif pct >= 2.0 and not _prev_prices.get(f"_scalp_{p.symbol}") and _is_trading_hours():
                 avail = p.qty_available or 0
                 half = max(1, min(avail, p.qty // 2))
                 if avail < 1:
@@ -1542,7 +1547,7 @@ async def position_monitor():
         active_scalps = sum(1 for p in positions if 0 < _pct(p) < 2.0)
 
         # ── AUTO-BUY DIPS (Akash Method) ──
-        if _is_market_hours() and _cycle_count % 5 == 0:
+        if _is_trading_hours() and _cycle_count % 5 == 0:
             # Law 9: Max 3 active scalps at a time
             if active_scalps >= MAX_ACTIVE_SCALPS:
                 log.info(f"  Law 9: {active_scalps} active scalps (max {MAX_ACTIVE_SCALPS}). Skipping new buys.")
@@ -1581,7 +1586,7 @@ async def position_monitor():
                     log.debug(f"Dip scan: {e}")
 
         # ── PHASE 0: Past Winners scan (Rule #21) ──
-        if _is_market_hours() and _cycle_count % 10 == 0 and active_scalps < MAX_ACTIVE_SCALPS:
+        if _is_trading_hours() and _cycle_count % 10 == 0 and active_scalps < MAX_ACTIVE_SCALPS:
             try:
                 from alpaca.data.historical import StockHistoricalDataClient
                 from alpaca.data.requests import StockSnapshotRequest
@@ -1834,7 +1839,7 @@ async def full_scan():
         # Same logic as Claude 30-min but runs every 5 min
         # ══════════════════════════════════════════════════
         GPT_AUTO_THRESHOLD = 75
-        if _is_market_hours() and ai_verdicts:
+        if _is_trading_hours() and ai_verdicts:
             active_scalps = sum(1 for p in positions if 0 < _pct(p) < 2.0)
             held_syms = {p.symbol for p in positions}
 
@@ -2142,7 +2147,7 @@ async def fast_runner_scan():
         from datetime import datetime
         from zoneinfo import ZoneInfo
         now = datetime.now(ZoneInfo("America/New_York"))
-        if not _is_market_hours():
+        if not _is_trading_hours():
             return
 
         channel = bot.get_channel(SCAN_CHANNEL_ID)
@@ -2541,7 +2546,7 @@ async def claude_deep_scan():
         # ═══════════════════════════════════════════════
         CLAUDE_AUTO_THRESHOLD = 75  # Only auto-execute >= 75% confidence
 
-        if _is_market_hours() and deep_results:
+        if _is_trading_hours() and deep_results:
             held_syms = {p.symbol for p in positions}
             active_scalps = sum(1 for p in positions if 0 < _pct(p) < 2.0)
 
