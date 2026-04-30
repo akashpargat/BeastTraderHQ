@@ -1792,11 +1792,9 @@ async def position_monitor():
 
             # ── PYRAMIDING: add to winning positions that keep running ──
             if _is_trading_hours() and pct >= 3.0 and avail == 0:
-                # Stock is running +3%+ but we can't sell (all locked)
-                # Instead of watching, ADD MORE and scalp the new shares
                 pyramid_key = f"_pyramid_t_{p.symbol}"
                 last_pyramid = _prev_prices.get(pyramid_key, 0)
-                if time.time() - last_pyramid > 1800:  # 30min between pyramids
+                if time.time() - last_pyramid > 900:  # 15min between pyramids (was 30)
                     try:
                         acct_data = gateway.get_account()
                         cash = float(acct_data.get('cash', 0))
@@ -2130,74 +2128,64 @@ async def full_scan():
 
         t_step = time.time()
         if brain and brain.is_available:
-            def _run_ai_final(pos_list, sent_d, tv_d, conf_d, regime_val, t_score):
-                results = {}
-                ai_timings = {}
+            def _run_ai_batch(pos_list, sent_d, tv_d, conf_d, regime_val, t_score):
+                # Build data for ALL stocks at once
+                batch_data = {}
                 for pos in pos_list:
-                    t0 = time.time()
-                    try:
-                        sym = pos.symbol
-                        sent = sent_d.get(sym)
-                        tv = tv_d.get(sym, {})
-                        cr = conf_d.get(sym)
-                        conf_pct = int(cr.overall_confidence * 100) if cr else 50
-                        best_strat = cr.best_strategy.value if cr and cr.best_strategy else 'none'
-                        signal = cr.signal.value if cr else 'no_trade'
-                        # Get per-stock learning context from DB (cached — fast)
-                        stock_learning = ""
-                        if pg:
-                            try:
-                                ctx = pg.get_learning_context_for_stock(sym)
-                                trades = ctx.get('trade_history', [])
-                                if trades:
-                                    wins = sum(1 for t in trades if t.get('was_profitable'))
-                                    total = sum(1 for t in trades if t.get('was_profitable') is not None)
-                                    lessons = [t.get('lesson_learned','') for t in trades if t.get('lesson_learned')]
-                                    stock_learning = f"HISTORY: {wins}/{total} wins. "
-                                    if lessons:
-                                        stock_learning += f"Lessons: {'; '.join(l[:60] for l in lessons[:3])}"
-                            except:
-                                pass
-                        data = {
-                            'price': pos.current_price, 'entry': pos.avg_entry,
-                            'pnl': pos.unrealized_pl, 'qty': pos.qty,
-                            'regime': regime_val,
-                            'sentiment': sent.total_score if sent else 0,
-                            'rsi': tv.get('rsi', 50),
-                            'macd_hist': tv.get('macd_hist', 0),
-                            'vwap_above': tv.get('vwap_above', False),
-                            'volume_ratio': tv.get('volume_ratio', 1.0),
-                            'bb_position': tv.get('bb_position', 'mid'),
-                            'confluence': tv.get('confluence', 5),
-                            'ema_9': tv.get('ema_9', 0),
-                            'ema_21': tv.get('ema_21', 0),
-                            'yahoo_score': sent.yahoo_score if sent else 0,
-                            'analyst_score': sent.analyst_score if sent else 0,
-                            'reddit_score': sent.reddit_score if sent else 0,
-                            'trump_score': t_score,
-                            'confidence_engine': conf_pct,
-                            'best_strategy': best_strat,
-                            'signal': signal,
-                            'sector': '?', 'earnings_days': 999, 'holding': True,
-                            'unrealized_pl': pos.unrealized_pl,
-                            'learning_context': stock_learning,
-                            'portfolio_learning': learning_digest[:500] if learning_digest else '',
-                        }
-                        results[sym] = brain.analyze_stock(sym, data)
-                    except:
-                        pass
-                    ai_timings[pos.symbol] = int((time.time() - t0) * 1000)
-                return results, ai_timings
+                    sym = pos.symbol
+                    sent = sent_d.get(sym)
+                    tv = tv_d.get(sym, {})
+                    cr = conf_d.get(sym)
+                    conf_pct = int(cr.overall_confidence * 100) if cr else 50
+                    best_strat = cr.best_strategy.value if cr and cr.best_strategy else 'none'
+                    signal = cr.signal.value if cr else 'no_trade'
+                    stock_learning = ""
+                    if pg:
+                        try:
+                            ctx = pg.get_learning_context_for_stock(sym)
+                            trades = ctx.get('trade_history', [])
+                            if trades:
+                                wins = sum(1 for t in trades if t.get('was_profitable'))
+                                total = sum(1 for t in trades if t.get('was_profitable') is not None)
+                                lessons = [t.get('lesson_learned','') for t in trades if t.get('lesson_learned')]
+                                stock_learning = f"HISTORY: {wins}/{total} wins. "
+                                if lessons:
+                                    stock_learning += f"Lessons: {'; '.join(l[:60] for l in lessons[:3])}"
+                        except:
+                            pass
+                    batch_data[sym] = {
+                        'price': pos.current_price, 'entry': pos.avg_entry,
+                        'pnl': pos.unrealized_pl, 'qty': pos.qty,
+                        'regime': regime_val,
+                        'sentiment': sent.total_score if sent else 0,
+                        'rsi': tv.get('rsi', 50),
+                        'macd_hist': tv.get('macd_hist', 0),
+                        'vwap_above': tv.get('vwap_above', False),
+                        'volume_ratio': tv.get('volume_ratio', 1.0),
+                        'confluence': tv.get('confluence', 5),
+                        'ema_9': tv.get('ema_9', 0), 'ema_21': tv.get('ema_21', 0),
+                        'trump_score': t_score,
+                        'confidence_engine': conf_pct,
+                        'best_strategy': best_strat, 'signal': signal,
+                        'unrealized_pl': pos.unrealized_pl,
+                        'learning_context': stock_learning,
+                    }
+                # ONE API call for all stocks
+                t0 = time.time()
+                results = brain.analyze_batch(batch_data)
+                elapsed = int((time.time() - t0) * 1000)
+                return results, {'_batch': elapsed}
+
             ai_verdicts, ai_timings = await asyncio.to_thread(
-                _run_ai_final, positions[:8], sentiments, tv_data,
+                _run_ai_batch, positions[:16], sentiments, tv_data,
                 confidence_results, regime.value, trump_score
             )
         else:
             ai_timings = {}
         ai_total = int((time.time() - t_step) * 1000)
         perf['ai'] = {'total_ms': ai_total, 'stocks': len(ai_verdicts), 'per_stock': ai_timings,
-                       'model': 'GPT-4o', 'learning_injected': len(learning_digest) > 0}
-        log.info(f"  📊 AI: {len(ai_verdicts)} analyzed in {ai_total}ms (avg {ai_total//max(len(ai_verdicts),1)}ms/stock)")
+                       'model': 'GPT-4o_BATCH', 'learning_injected': len(learning_digest) > 0}
+        log.info(f"  📊 AI BATCH: {len(ai_verdicts)} stocks in {ai_total}ms (1 API call)")
 
         # ══════════════════════════════════════════════════
         # AUTO-EXECUTE: GPT-4o high-confidence verdicts (≥75%)

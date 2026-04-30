@@ -148,6 +148,79 @@ class AIBrain:
             return self._claude_quick(symbol, data)
         return self._deterministic_fallback(symbol, data)
 
+    def analyze_batch(self, stocks_data: dict) -> dict:
+        """BATCH analyze all stocks in ONE API call. 10x faster than per-stock.
+        stocks_data = {symbol: {price, rsi, macd_hist, sentiment, ...}}
+        Returns {symbol: {action, confidence, reasoning}}"""
+        if not stocks_data:
+            return {}
+        if not self._gpt_available:
+            # Fallback to per-stock
+            return {sym: self.analyze_stock(sym, data) for sym, data in stocks_data.items()}
+
+        try:
+            # Build compact portfolio summary for ONE prompt
+            lines = []
+            for sym, d in stocks_data.items():
+                pnl = d.get('unrealized_pl', d.get('pnl', 0))
+                lines.append(
+                    f"{sym}: ${d.get('price',0):.2f} entry=${d.get('entry',0):.2f} "
+                    f"P&L=${pnl:.2f} RSI={d.get('rsi',50):.0f} MACD={d.get('macd_hist',0):.2f} "
+                    f"VWAP={'above' if d.get('vwap_above') else 'below'} Conf={d.get('confluence',5)}/10 "
+                    f"Sent={d.get('sentiment',0):+d} EngScore={d.get('confidence_engine',50)}% "
+                    f"Signal={d.get('signal','?')} {d.get('learning_context','')}"
+                )
+
+            deep_refs = []
+            for sym in stocks_data:
+                if sym in _last_deep_briefing:
+                    b = _last_deep_briefing[sym]
+                    deep_refs.append(f"{sym}: {b.get('action','?')} ({b.get('confidence',0)}%) — {str(b.get('reasoning',''))[:60]}")
+
+            user_msg = f"""Analyze ALL these positions for day trading. Regime: {list(stocks_data.values())[0].get('regime','?')}
+
+PORTFOLIO:
+{chr(10).join(lines)}
+
+{'LAST CLAUDE DEEP ANALYSIS:' + chr(10) + chr(10).join(deep_refs) if deep_refs else ''}
+
+For EACH stock, respond with a JSON object:
+{{"results": {{
+  "SYMBOL": {{"action": "BUY/SELL/HOLD", "confidence": 0-100, "reasoning": "why in 30 words"}},
+  ...
+}}}}
+
+Rules: RSI>70=overbought consider SELL, RSI<30=oversold consider BUY, 
+winners running +3%+ with momentum=BUY MORE/HOLD, losers -5%+ with bad sentiment=SELL.
+Be AGGRESSIVE on winners. Be DECISIVE — no wishy-washy 50% holds."""
+
+            response = self._azure_client.chat.completions.create(
+                model=AZURE_DEPLOYMENT,
+                messages=[
+                    {"role": "system", "content": GPT4O_SYSTEM},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.3,
+                max_tokens=1200,
+                response_format={"type": "json_object"},
+            )
+
+            result = json.loads(response.choices[0].message.content)
+            verdicts = result.get('results', result)
+
+            # Normalize output
+            for sym in verdicts:
+                if isinstance(verdicts[sym], dict):
+                    verdicts[sym]['ai_source'] = 'Azure GPT-4o'
+                    verdicts[sym]['scan_type'] = '5min_batch'
+
+            log.info(f"GPT-4o BATCH: {len(verdicts)} stocks in 1 call")
+            return verdicts
+
+        except Exception as e:
+            log.warning(f"GPT-4o batch failed: {e} — falling back to per-stock")
+            return {sym: self.analyze_stock(sym, data) for sym, data in list(stocks_data.items())[:5]}
+
     def deep_analysis(self, symbol: str, data: dict) -> dict:
         """30-min ultra deep: Claude Opus preferred, GPT-4o fallback."""
         if self._claude_available:
