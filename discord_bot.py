@@ -3695,7 +3695,33 @@ async def claude_daily_deep_learn():
         def _gather_and_analyze():
             import json as _json
 
-            # Gather ALL intelligence (BEFORE flush — this is the gold)
+            log.info("  [DAILY LEARN] Step 1: Running backtests...")
+
+            # ── STEP 1: BACKTEST — What strategies actually work? ──
+            backtest_data = {}
+            try:
+                from backtester import BacktestEngine
+                bt = BacktestEngine(pg)
+                backtest_data['what_if'] = bt.replay_what_if()
+                for sym in ['GOOGL', 'NVDA', 'AMD', 'TSLA', 'COIN', 'META'][:4]:
+                    try:
+                        backtest_data[sym] = bt.run_all_strategies(sym, 90)
+                    except:
+                        pass
+                log.info(f"  [DAILY LEARN] Backtests done: {len(backtest_data)} results")
+            except Exception as e:
+                log.warning(f"  Backtest error: {e}")
+
+            log.info("  [DAILY LEARN] Step 2: Gathering decision accuracy...")
+
+            # ── STEP 2: SELF-GRADE — How accurate are we? ──
+            decision_acc = pg.get_decision_accuracy(7)
+            missed = pg.get_missed_trades(7)
+            win_rates = pg.get_trade_win_rate(30)
+
+            log.info("  [DAILY LEARN] Step 3: Gathering market data...")
+
+            # ── STEP 3: ALL DATA ──
             earnings = pg.scan_all_earnings_patterns()
             trends = pg.get_trends()
             best = pg.get_best_performing_stocks(20)
@@ -3703,7 +3729,6 @@ async def claude_daily_deep_learn():
             held = [{'symbol': p.symbol, 'qty': p.qty, 'entry': p.avg_entry,
                      'price': p.current_price, 'pnl': p.unrealized_pl} for p in positions]
 
-            # TODAY'S TV READINGS — the intraday gold mine (will be flushed after analysis)
             tv_summary = pg._exec(
                 """SELECT symbol, COUNT(*) as readings,
                    AVG(rsi) as avg_rsi, AVG(macd_hist) as avg_macd,
@@ -3714,16 +3739,14 @@ async def claude_daily_deep_learn():
                 fetch=True
             ) or []
 
-            # TODAY'S ACTIVITY SUMMARY — what did the bot do today?
             activity_summary = pg._exec(
-                """SELECT action_type, COUNT(*) as cnt, 
+                """SELECT action_type, COUNT(*) as cnt,
                    COUNT(DISTINCT symbol) as stocks
                 FROM activity_log WHERE created_at > NOW() - interval '24 hours'
                 GROUP BY action_type ORDER BY cnt DESC""",
                 fetch=True
             ) or []
 
-            # TODAY'S TV BLOCKS — what stocks were rejected and why?
             tv_blocks = pg._exec(
                 """SELECT symbol, reason, COUNT(*) as times_blocked
                 FROM activity_log WHERE action_type = 'TV_BLOCKED' AND created_at > NOW() - interval '24 hours'
@@ -3743,46 +3766,79 @@ async def claude_daily_deep_learn():
             except:
                 pass
 
-            prompt = f"""You are the world's #1 quantitative analyst. Analyze this complete trading data and produce ACTIONABLE insights.
+            log.info("  [DAILY LEARN] Step 4: Sending to AI for analysis...")
 
-EARNINGS PATTERNS (how stocks react to earnings): {_json.dumps(earnings[:20], default=str)[:2000]}
-BEST PERFORMING STOCKS: {_json.dumps(best, default=str)[:1000]}
-CURRENT POSITIONS: {_json.dumps(held, default=str)[:1000]}
-MARKET SENTIMENT: {_json.dumps(market, default=str)[:500]}
-FEAR/GREED: {_json.dumps(fg, default=str)[:200]}
-EXISTING TRENDS: {_json.dumps([{'s': t.get('symbol'), 'i': t.get('insight','')[:80]} for t in trends[:15]], default=str)[:1500]}
+            # ── STEP 4: AI ANALYSIS with institutional frameworks ──
+            prompt = f"""You are a senior portfolio manager at a top quantitative hedge fund.
+The bot has been trading all day. Now at 3 AM, you must analyze EVERYTHING
+and produce tomorrow's playbook. The bot will use your output ALL DAY tomorrow.
 
-TODAY'S TV ANALYSIS (indicator patterns from TradingView):
-{_json.dumps(tv_summary[:15], default=str)[:1500]}
+THIS IS THE SELF-LEARNING LOOP: Your insights become the bot's intelligence.
 
-TODAY'S BOT ACTIVITY (what we did today):
-{_json.dumps(activity_summary, default=str)[:800]}
+=== BACKTEST RESULTS (90-day historical simulation) ===
+What-if scenarios (would different settings have made more money?):
+{_json.dumps(backtest_data.get('what_if', {}), default=str)[:1500]}
 
-TV BLOCKS (stocks we wanted to buy but TV rejected — analyze WHY):
-{_json.dumps(tv_blocks[:10], default=str)[:800]}
+Historical strategy performance on key stocks:
+{_json.dumps({{k: v for k, v in backtest_data.items() if k != 'what_if'}}, default=str)[:2000]}
 
-PROVIDE (valid JSON only):
-{{"buy_list": [{{"symbol": "X", "reason": "why", "confidence": 80}}],
-  "avoid_list": [{{"symbol": "X", "reason": "why"}}],
-  "sector_signal": "which sectors rotating in/out",
-  "earnings_plays": [{{"symbol": "X", "play": "buy dip after miss", "confidence": 75}}],
-  "risk_alerts": ["alert1"],
-  "tomorrow_strategy": "overall approach",
-  "key_insight": "most important discovery",
-  "tv_learnings": "what did the TV data tell us today — patterns discovered",
-  "missed_opportunities": "stocks we should have traded but didn't"}}"""
+=== OUR DECISION ACCURACY (last 7 days) ===
+{_json.dumps(decision_acc, default=str)[:500]}
+
+=== MISSED OPPORTUNITIES (we blocked these but they went UP) ===
+{_json.dumps(missed[:5], default=str)[:600]}
+
+=== STRATEGY WIN RATES (30 days of actual trades) ===
+{_json.dumps(win_rates, default=str)[:800]}
+
+=== TODAY'S DATA ===
+Positions: {_json.dumps(held, default=str)[:600]}
+TV patterns: {_json.dumps(tv_summary[:10], default=str)[:600]}
+Activity: {_json.dumps(activity_summary, default=str)[:400]}
+Blocks: {_json.dumps(tv_blocks[:5], default=str)[:300]}
+Earnings: {_json.dumps(earnings[:10], default=str)[:600]}
+Market: {_json.dumps(market, default=str)[:300]}
+VIX: {_json.dumps(fg, default=str)[:150]}
+Trends: {_json.dumps([{{'s': t.get('symbol'), 'i': t.get('insight','')[:50]}} for t in trends[:10]], default=str)[:600]}
+
+=== USE THESE FRAMEWORKS ===
+1. BUFFETT: Moat, quality, hold winners. Which stocks have durable advantages?
+2. LYNCH: P/E growth, categorize each stock (stalwart/fast grower/turnaround)
+3. DALIO: Where in the cycle? Risk parity across sectors?
+4. LIVERMORE: Follow the trend. Only trade with the market direction.
+5. CANSLIM: Earnings growth + new products + institutional buying?
+6. MOMENTUM: Which stocks are winning? Don't fight the tape.
+7. MEAN REVERSION: Oversold bounces? RSI<30 setups for tomorrow?
+8. OUR BACKTESTS: Which strategy wins on which stock? Use the data above.
+9. MISSED TRADES: What should we change to not miss winners?
+10. RISK: Correlation risk? Too concentrated in one sector?
+
+=== OUTPUT (valid JSON) ===
+{{"buy_list": [{{"symbol": "X", "reason": "why (cite framework + backtest data)", "confidence": 80, "strategy": "best backtest strategy for this stock"}}],
+  "avoid_list": [{{"symbol": "X", "reason": "why (cite framework)"}}],
+  "sector_signal": "rotation analysis",
+  "earnings_plays": [{{"symbol": "X", "play": "specific play with entry/exit"}}],
+  "risk_alerts": ["specific risks"],
+  "tomorrow_strategy": "detailed playbook based on backtests + frameworks",
+  "key_insight": "most important discovery from the data",
+  "tv_learnings": "what TV patterns predict moves",
+  "missed_opportunities": "what settings to change (from what-if analysis)",
+  "strategy_adjustments": "which strategies to use more/less based on win rates",
+  "position_sizing": "which stocks deserve bigger positions based on backtest win rates"}}"""
 
             try:
                 if brain._claude_available:
                     import requests
                     resp = requests.post(
                         f"{os.getenv('AI_API_URL', 'https://ai.beast-trader.com')}/analyze",
-                        json={'prompt': prompt, 'system_prompt': 'Quantitative analyst. Output valid JSON only.'},
+                        json={'prompt': prompt, 'system_prompt': 'Senior quant PM. Self-learning trading bot. Your output becomes the bot intelligence for tomorrow. Be specific with numbers. Output valid JSON only.'},
                         headers={'X-API-Key': os.getenv('AI_API_KEY', ''), 'Content-Type': 'application/json'},
-                        timeout=60)
+                        timeout=120)
                     if resp.status_code == 200:
+                        log.info("  [DAILY LEARN] Claude analysis complete")
                         return resp.json()
                 if brain._gpt_available:
+                    log.info("  [DAILY LEARN] Using GPT-5.4 fallback")
                     return brain.analyze_stock('PORTFOLIO', {'deep_analysis_prompt': prompt})
             except Exception as e:
                 log.warning(f"Claude daily: {e}")
