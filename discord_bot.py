@@ -4098,8 +4098,11 @@ async def fill_tracker():
                             pg._exec(
                                 """UPDATE trade_log SET filled_price = %s, filled_at = NOW(),
                                    pnl_eod = %s, was_profitable = %s
-                                   WHERE symbol = %s AND side = 'buy' AND filled_price IS NULL
-                                   ORDER BY created_at DESC LIMIT 1""",
+                                   WHERE id = (
+                                       SELECT id FROM trade_log
+                                       WHERE symbol = %s AND side = 'buy' AND filled_price IS NULL
+                                       ORDER BY created_at DESC LIMIT 1
+                                   )""",
                                 (filled_price, realized_pnl, realized_pnl > 0, sym)
                             )
 
