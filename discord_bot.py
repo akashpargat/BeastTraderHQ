@@ -1439,14 +1439,41 @@ _cached_vix = 18.0  # Default neutral VIX
 
 
 def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=0, source="bot", **kwargs):
-    """SMART BUY: TV confirm → VIX size → quick_buy. All buys go through here."""
+    """SMART BUY: Trends → TV confirm → Self-learn → VIX size → Execute."""
+    pg = _get_pg()
+
+    # CHECK AI TRENDS FIRST: does Claude recommend avoiding this stock?
+    if pg:
+        try:
+            trends = pg.get_trends(symbol=symbol)
+            for t in trends:
+                ttype = t.get('trend_type', '')
+                # Claude said AVOID this stock
+                if ttype == 'claude_daily_avoid':
+                    log.info(f"  🧠 TREND BLOCK: {symbol} — Claude daily avoid: {t.get('insight','')[:60]}")
+                    _pg_log("TREND_BLOCKED", symbol=symbol, reason=f"Claude avoid: {t.get('insight','')[:80]}", source=source)
+                    return None
+                # Earnings pattern says it dips after earnings — check if earnings just happened
+                if ttype == 'earnings_pattern' and 'DIPS_AFTER' in str(t.get('insight', '')):
+                    sa = SentimentAnalyst()
+                    earn = sa.get_earnings_info(symbol)
+                    if earn.get('days_until', 999) == 0:
+                        log.info(f"  🧠 TREND: {symbol} dips after earnings (today!) — waiting for lower entry")
+                        _pg_log("TREND_WAIT", symbol=symbol, reason="Earnings today + dips pattern — waiting", source=source)
+                        return None
+                # Claude recommended this as a buy — boost confidence
+                if ttype == 'claude_daily_buy' and t.get('confidence', 0) >= 70:
+                    qty = int(qty * 1.3)  # Buy bigger on Claude-recommended stocks
+                    log.info(f"  🧠 TREND BOOST: {symbol} — Claude daily buy rec ({t.get('confidence')}%)")
+        except:
+            pass
+
     # HARD LAW: TV must confirm
     confirmed, tv = _tv_confirm_buy(symbol)
     if not confirmed:
         return None
 
-    # Self-learning: check if we should trade this stock
-    pg = _get_pg()
+    # Self-learning: check trade history
     if pg:
         try:
             advice = pg.should_trade_stock(symbol)
@@ -1454,7 +1481,6 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
                 log.info(f"  🧠 Self-learn: SKIP {symbol} — {advice.get('reason', '')}")
                 _pg_log("SELF_LEARN_SKIP", symbol=symbol, reason=advice.get('reason', ''), source=source)
                 return None
-            # Adjust size based on history
             if advice.get('size') == 'large':
                 qty = int(qty * 1.5)
             elif advice.get('size') == 'small':
@@ -2996,7 +3022,134 @@ async def ai_background_learning():
 @ai_background_learning.before_loop
 async def before_learning():
     await bot.wait_until_ready()
-    await asyncio.sleep(300)  # Wait 5 min — let everything else start first
+    await asyncio.sleep(300)
+
+
+@tasks.loop(hours=24)
+async def claude_daily_deep_learn():
+    """Once per day (3 AM ET): Claude EXTREME deep analysis on all trends.
+    Takes everything hourly learning found → asks Claude for playbook."""
+    try:
+        pg = _get_pg()
+        if not pg or not brain:
+            return
+
+        now = datetime.now(ZoneInfo("America/New_York"))
+        log.info(f"  🧠🌙 DAILY DEEP LEARN starting at {now.strftime('%I:%M %p ET')}")
+        channel = bot.get_channel(SCAN_CHANNEL_ID)
+        if channel:
+            await channel.send("🧠🌙 **DAILY DEEP LEARNING** — Claude analyzing all historical trends...")
+
+        def _gather_and_analyze():
+            import json as _json
+
+            # Gather ALL intelligence
+            earnings = pg.scan_all_earnings_patterns()
+            trends = pg.get_trends()
+            best = pg.get_best_performing_stocks(20)
+            positions = gateway.get_positions()
+            held = [{'symbol': p.symbol, 'qty': p.qty, 'entry': p.avg_entry,
+                     'price': p.current_price, 'pnl': p.unrealized_pl} for p in positions]
+
+            sa = SentimentAnalyst()
+            market = {}
+            try:
+                market = sa.full_market_sentiment()
+            except:
+                pass
+            fg = {}
+            try:
+                fg = sa.get_fear_greed()
+            except:
+                pass
+
+            prompt = f"""You are the world's #1 quantitative analyst. Analyze this complete trading data and produce ACTIONABLE insights.
+
+EARNINGS PATTERNS (how stocks react to earnings): {_json.dumps(earnings[:20], default=str)[:2000]}
+BEST PERFORMING STOCKS: {_json.dumps(best, default=str)[:1000]}
+CURRENT POSITIONS: {_json.dumps(held, default=str)[:1000]}
+MARKET SENTIMENT: {_json.dumps(market, default=str)[:500]}
+FEAR/GREED: {_json.dumps(fg, default=str)[:200]}
+EXISTING TRENDS: {_json.dumps([{'s': t.get('symbol'), 'i': t.get('insight','')[:80]} for t in trends[:15]], default=str)[:1500]}
+
+PROVIDE (valid JSON only):
+{{"buy_list": [{{"symbol": "X", "reason": "why", "confidence": 80}}],
+  "avoid_list": [{{"symbol": "X", "reason": "why"}}],
+  "sector_signal": "which sectors rotating in/out",
+  "earnings_plays": [{{"symbol": "X", "play": "buy dip after miss", "confidence": 75}}],
+  "risk_alerts": ["alert1"],
+  "tomorrow_strategy": "overall approach",
+  "key_insight": "most important discovery"}}"""
+
+            try:
+                if brain._claude_available:
+                    import requests
+                    resp = requests.post(
+                        f"{os.getenv('AI_API_URL', 'https://ai.beast-trader.com')}/analyze",
+                        json={'prompt': prompt, 'system_prompt': 'Quantitative analyst. Output valid JSON only.'},
+                        headers={'X-API-Key': os.getenv('AI_API_KEY', ''), 'Content-Type': 'application/json'},
+                        timeout=60)
+                    if resp.status_code == 200:
+                        return resp.json()
+                if brain._gpt_available:
+                    return brain.analyze_stock('PORTFOLIO', {'deep_analysis_prompt': prompt})
+            except Exception as e:
+                log.warning(f"Claude daily: {e}")
+            return {}
+
+        insights = await asyncio.to_thread(_gather_and_analyze)
+        if not insights:
+            return
+
+        import json as _json
+        # Store playbook
+        pg.save_trend('PORTFOLIO', 'daily_playbook', _json.dumps(insights, default=str)[:2000], 80, insights)
+
+        # Store buy/avoid/earnings recommendations
+        for b in (insights.get('buy_list') or [])[:5]:
+            if isinstance(b, dict) and b.get('symbol'):
+                pg.save_trend(b['symbol'], 'claude_daily_buy', str(b.get('reason', ''))[:500], b.get('confidence', 60), b)
+        for a in (insights.get('avoid_list') or [])[:3]:
+            if isinstance(a, dict) and a.get('symbol'):
+                pg.save_trend(a['symbol'], 'claude_daily_avoid', str(a.get('reason', ''))[:500], 80, a)
+        for p in (insights.get('earnings_plays') or [])[:5]:
+            if isinstance(p, dict) and p.get('symbol'):
+                pg.save_trend(p['symbol'], 'earnings_play', str(p.get('play', ''))[:500], p.get('confidence', 60), p)
+        if insights.get('sector_signal'):
+            pg.save_trend('MARKET', 'sector_rotation', str(insights['sector_signal'])[:500], 70)
+
+        pg.log_activity('DAILY_LEARN', category='ai', reason=f"Deep learn: {len(insights.get('buy_list', []))} buys, {len(insights.get('avoid_list', []))} avoids", source='daily_claude', data=insights)
+
+        # Report
+        if channel:
+            msg = "🧠🌙 **DAILY DEEP LEARNING COMPLETE**\n\n"
+            for b in (insights.get('buy_list') or [])[:5]:
+                if isinstance(b, dict):
+                    msg += f"🟢 **{b.get('symbol','?')}** ({b.get('confidence',0)}%) — {str(b.get('reason',''))[:80]}\n"
+            for a in (insights.get('avoid_list') or [])[:3]:
+                if isinstance(a, dict):
+                    msg += f"🔴 **{a.get('symbol','?')}** — {str(a.get('reason',''))[:80]}\n"
+            if insights.get('key_insight'):
+                msg += f"\n💡 {str(insights['key_insight'])[:200]}"
+            await channel.send(msg[:2000])
+
+        log.info(f"  🧠🌙 Daily learn complete")
+
+    except Exception as e:
+        log.error(f"Daily learn error: {e}\n{traceback.format_exc()}")
+
+
+@claude_daily_deep_learn.before_loop
+async def before_daily_learn():
+    await bot.wait_until_ready()
+    now = datetime.now(ZoneInfo("America/New_York"))
+    if now.hour >= 3:
+        target = now.replace(hour=3, minute=0, second=0) + timedelta(days=1)
+    else:
+        target = now.replace(hour=3, minute=0, second=0)
+    wait_secs = (target - now).total_seconds()
+    log.info(f"   🧠 Daily deep learn: {target.strftime('%I:%M %p ET')} ({wait_secs/3600:.1f}h)")
+    await asyncio.sleep(wait_secs)
 
 
 @bot.event
@@ -3033,6 +3186,9 @@ async def on_ready():
     if not ai_background_learning.is_running():
         ai_background_learning.start()
         log.info("   ✅ AI background learning: every 1 hour (all watchlist stocks)")
+    if not claude_daily_deep_learn.is_running():
+        claude_daily_deep_learn.start()
+        log.info("   ✅ Claude daily deep learn: once/day at 3 AM ET")
 
     channel = bot.get_channel(SCAN_CHANNEL_ID)
     if channel:
