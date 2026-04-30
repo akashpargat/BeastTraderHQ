@@ -2027,7 +2027,7 @@ async def position_monitor():
                                 buy_price = round(p.current_price * 1.001, 2)
                                 result = _smart_buy(p.symbol, reload_qty, buy_price,
                                     reason=f"Dip reload {dip_pct:.1f}% from ${intraday_high:.2f}",
-                                    vix=_cached_vix)
+                                    source="60s_reload", vix=_cached_vix)
                                 if result and result.state.value != 'REJECTED':
                                     _prev_prices[reload_key] = time.time()
                                     if pg: pg.record_reload(p.symbol)
@@ -2056,7 +2056,7 @@ async def position_monitor():
                             result = _smart_buy(
                                 p.symbol, add_qty, buy_price,
                                 reason=f"Pyramid: +{pct:.1f}% winner, adding {add_qty} shares",
-                                vix=_cached_vix)
+                                source="60s_pyramid", vix=_cached_vix)
                             if result and result.state.value != 'REJECTED':
                                 _prev_prices[pyramid_key] = time.time()
                                 if pg: pg.record_pyramid(p.symbol)
@@ -2110,7 +2110,7 @@ async def position_monitor():
                                 _smart_buy(sym, qty, buy_price,
                                                   reason=f"Akash Method: {day_change:+.1f}% dip",
                                                   day_change_pct=day_change,
-                                                  vix=_cached_vix)
+                                                  source="60s_dipbuy", vix=_cached_vix)
                                 _prev_prices[f"_dipbuy_{sym}"] = True
                                 _log_trade("LIMIT BUY (Akash Method)", sym, qty, buy_price,
                                            f"{day_change:+.1f}% daily drop. Oversold dip buy.", "60s Monitor")
@@ -2494,7 +2494,12 @@ async def full_scan():
                             sym, qty, buy_price,
                             reason=f"GPT-4o BUY {conf}%: {reason}",
                             day_change_pct=0, sentiment_score=sent_score,
-                            vix=_cached_vix, confidence=conf
+                            source="5min_GPT", vix=_cached_vix, confidence=conf,
+                            ai_verdict_data=v,
+                            sentiment_data={'total': sent_score,
+                                            'yahoo': getattr(sent, 'yahoo_score', 0),
+                                            'reddit': getattr(sent, 'reddit_score', 0),
+                                            'analyst': getattr(sent, 'analyst_score', 0)} if sent else {'total': sent_score}
                         )
                         executed = result and result.state.value != 'REJECTED'
                         scan_decisions.append({'symbol': sym, 'action': 'BUY', 'confidence': conf,
@@ -2929,6 +2934,7 @@ async def fast_runner_scan():
                 continue
 
             # Quick sentiment check
+            sent = None
             try:
                 sa = SentimentAnalyst()
                 sent = sa.analyze(sym)
@@ -2949,7 +2955,11 @@ async def fast_runner_scan():
                 sym, qty, buy_price,
                 reason=f"Fast runner +{r['pct']:.1f}% vol={r['volume']:,}",
                 day_change_pct=r['pct'], sentiment_score=sent_score,
-                vix=_cached_vix
+                source="2min_runner", vix=_cached_vix,
+                sentiment_data={'total': sent_score,
+                                'yahoo': getattr(sent, 'yahoo_score', 0) if sent else 0,
+                                'reddit': getattr(sent, 'reddit_score', 0) if sent else 0,
+                                'analyst': getattr(sent, 'analyst_score', 0) if sent else 0}
             )
 
             if result and result.state.value != 'REJECTED':
@@ -3303,7 +3313,10 @@ async def claude_deep_scan():
                                 reason=f"Claude AI BUY {conf}%: {reasoning}",
                                 day_change_pct=0,
                                 sentiment_score=intel.get('total_sentiment', 0),
-                                vix=_cached_vix
+                                source="30min_claude", vix=_cached_vix,
+                                confidence=conf,
+                                ai_verdict_data=r,
+                                sentiment_data={'total': intel.get('total_sentiment', 0)}
                             )
                             if result and result.state.value != 'REJECTED':
                                 _log_trade(f"AI BUY (Claude {conf}%)", sym, qty, buy_price, reasoning, "30min Claude")
