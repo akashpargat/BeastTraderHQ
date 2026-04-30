@@ -2333,6 +2333,67 @@ async def claude_deep_scan():
             tg += f"\n🏆 Past winners running: {pw_str}\n"
         _tg(tg)
 
+        # ═══════════════════════════════════════════════
+        # PHASE 5: AUTO-EXECUTE high-confidence Claude verdicts
+        # ═══════════════════════════════════════════════
+        CLAUDE_AUTO_THRESHOLD = 75  # Only auto-execute >= 75% confidence
+
+        if _is_market_hours() and deep_results:
+            held_syms = {p.symbol for p in positions}
+            active_scalps = sum(1 for p in positions if 0 < _pct(p) < 2.0)
+
+            for sym, r in deep_results.items():
+                action = r.get('action', 'HOLD')
+                conf = r.get('confidence', 0)
+                reasoning = r.get('reasoning', '')[:100]
+
+                if conf < CLAUDE_AUTO_THRESHOLD:
+                    continue
+
+                try:
+                    if action == 'BUY' and sym not in held_syms and active_scalps < MAX_ACTIVE_SCALPS:
+                        # Auto-buy: 3% of portfolio, limit at current price
+                        pos_data = next((pd for pd in mega_data['positions'] if pd['symbol'] == sym), None)
+                        price = pos_data['price'] if pos_data else 0
+                        if price > 0:
+                            qty = max(1, int(equity * 0.03 / price))
+                            buy_price = round(price * 1.002, 2)  # Slight premium to ensure fill
+                            intel = all_intel.get(sym, {})
+                            result = gateway.quick_buy(
+                                sym, qty, buy_price,
+                                reason=f"Claude AI BUY {conf}%: {reasoning}",
+                                day_change_pct=0,
+                                sentiment_score=intel.get('total_sentiment', 0)
+                            )
+                            if result and result.state.value != 'REJECTED':
+                                _log_trade(f"AI BUY (Claude {conf}%)", sym, qty, buy_price, reasoning, "30min Claude")
+                                if channel:
+                                    await channel.send(
+                                        f"🧠🟢 **CLAUDE AUTO-BUY: {sym}** ({conf}% confidence)\n"
+                                        f"Buy {qty} @ ${buy_price} | {reasoning}")
+                                log.info(f"  🧠 Claude auto-BUY: {sym} {qty}x @ ${buy_price} ({conf}%)")
+                            else:
+                                log.info(f"  🧠 Claude BUY {sym} blocked: {result.error if result else 'no result'}")
+
+                    elif action == 'SELL' and sym in held_syms:
+                        # Auto-sell: sell available qty at market-ish price
+                        pos = next((p for p in positions if p.symbol == sym), None)
+                        if pos and pos.qty_available and pos.qty_available > 0:
+                            sell_qty = pos.qty_available
+                            sell_price = round(pos.current_price * 0.999, 2)
+                            gateway.place_sell(sym, sell_qty, sell_price,
+                                              reason=f"Claude AI SELL {conf}%: {reasoning}",
+                                              entry_price=pos.avg_entry)
+                            _log_trade(f"AI SELL (Claude {conf}%)", sym, sell_qty, sell_price, reasoning, "30min Claude")
+                            if channel:
+                                await channel.send(
+                                    f"🧠🔴 **CLAUDE AUTO-SELL: {sym}** ({conf}% confidence)\n"
+                                    f"Sell {sell_qty} @ ${sell_price} | {reasoning}")
+                            log.info(f"  🧠 Claude auto-SELL: {sym} {sell_qty}x @ ${sell_price} ({conf}%)")
+
+                except Exception as e:
+                    log.warning(f"Claude auto-execute {sym}: {e}")
+
         log.info(f"Claude MEGA-SCAN complete: {len(deep_results)} analyzed, {len(all_intel)} intel packages")
 
     except Exception as e:

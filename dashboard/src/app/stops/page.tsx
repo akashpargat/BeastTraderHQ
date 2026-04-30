@@ -52,7 +52,7 @@ export default function StopsPage() {
           const current = s.current_price ?? s.price ?? 0
           const hwm = s.hwm ?? s.high_water_mark ?? current
           const stop = s.stop_price ?? s.stop ?? 0
-          const gap = s.gap_to_stop ?? ((current - stop) / current * 100)
+          const gap = s.gap_to_stop ?? (current > 0 && stop > 0 ? ((current - stop) / current * 100) : 0)
           const trail = s.trail_percent ?? s.trail_pct ?? 0
 
           // Bar positions as % of range (stop → hwm)
@@ -85,12 +85,21 @@ export default function StopsPage() {
                 <div className="absolute right-0 top-0 h-full w-1 bg-white/40 z-10" title={`HWM $${hwm.toFixed(2)}`} />
               </div>
 
-              {/* Labels */}
-              <div className="flex justify-between text-xs mt-1 text-slate-500">
-                <span className="text-red-400">Stop ${stop.toFixed(2)}</span>
-                <span className="text-blue-400">Entry ${entry.toFixed(2)}</span>
-                <span>Current ${current.toFixed(2)}</span>
-                <span className="text-slate-400">HWM ${hwm.toFixed(2)}</span>
+              {/* Gap to stop visual bar */}
+              <div className="mt-3">
+                <div className="flex justify-between text-xs mb-1">
+                  <span className="text-slate-400">Gap to Stop</span>
+                  <span className={`font-bold ${gapColor(gap)}`}>{gap.toFixed(1)}%</span>
+                </div>
+                <div className="w-full bg-slate-700 rounded-full h-2">
+                  <div className={`h-2 rounded-full transition-all ${gapBg(gap)}`}
+                    style={{ width: `${Math.min(100, gap * 10)}%` }} />
+                </div>
+                <div className="flex justify-between text-[10px] mt-0.5">
+                  <span className="text-red-400">Danger &lt;3%</span>
+                  <span className="text-yellow-400">Caution 3-5%</span>
+                  <span className="text-green-400">Safe &gt;5%</span>
+                </div>
               </div>
             </div>
           )

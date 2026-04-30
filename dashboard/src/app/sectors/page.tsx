@@ -15,15 +15,23 @@ function heatColor(pct: number): string {
 export default function SectorsPage() {
   const [sectors, setSectors] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
 
   const fetchData = useCallback(() => {
     fetch(`${API}/api/sectors`)
-      .then(r => r.json())
+      .then(r => {
+        if (!r.ok) throw new Error(`API returned ${r.status}`)
+        return r.json()
+      })
       .then(data => {
         setSectors(Array.isArray(data) ? data : data.sectors || [])
+        setError('')
         setLoading(false)
       })
-      .catch(() => setLoading(false))
+      .catch((e) => {
+        setError(e.message || 'Failed to load sector data')
+        setLoading(false)
+      })
   }, [])
 
   useEffect(() => {
@@ -45,7 +53,16 @@ export default function SectorsPage() {
     <div className="space-y-6">
       <h1 className="text-2xl font-bold">🗺️ Sector Heatmap</h1>
 
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+      {error && (
+        <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-6 text-center">
+          <p className="text-yellow-400 text-lg mb-1">⚠️ Sector Data Unavailable</p>
+          <p className="text-slate-400 text-sm">Market may be closed or data is loading. Will retry automatically.</p>
+          <p className="text-slate-500 text-xs mt-2">{error}</p>
+        </div>
+      )}
+
+      {!error && (
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
         {sectors.map((s: any) => {
           const pct = s.avg_change ?? s.change_pct ?? 0
           const positive = pct >= 0
@@ -61,9 +78,10 @@ export default function SectorsPage() {
             </div>
           )
         })}
-      </div>
+        </div>
+      )}
 
-      {sectors.length === 0 && (
+      {!error && sectors.length === 0 && (
         <p className="text-center text-slate-500 py-8">No sector data available</p>
       )}
 

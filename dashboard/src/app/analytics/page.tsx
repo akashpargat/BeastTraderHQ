@@ -1,21 +1,21 @@
 'use client'
 import { useEffect, useState } from 'react'
 
-const API = typeof window !== 'undefined' ? 'https://api.beast-trader.com' : 'http://localhost:8080'
+const API = 'https://api.beast-trader.com'
 
 export default function AnalyticsPage() {
   const [data, setData] = useState<any>(null)
-  const [equity, setEquity] = useState<any[]>([])
 
   useEffect(() => {
-    fetch(`${API}/api/analytics`).then(r => r.json()).then(setData)
-    fetch(`${API}/api/equity?limit=100`).then(r => r.json()).then(d => setEquity(d.data || []))
+    fetch(`${API}/api/analytics`).then(r => r.json()).then(setData).catch(() => {})
   }, [])
 
   if (!data) return <div className="text-center py-20 text-slate-400">Loading analytics...</div>
 
-  const stats = data.overall || {}
+  // Support both nested (data.overall) and flat (data.total_trades) formats
+  const stats = data.overall || data
   const streak = data.streak || {}
+  const equityCurve: any[] = data.equity_curve || []
 
   return (
     <div className="space-y-6">
@@ -29,7 +29,7 @@ export default function AnalyticsPage() {
         </div>
         <div className="bg-slate-800 rounded-xl p-6 border border-slate-700 text-center">
           <p className="text-slate-400 text-xs">Win Rate</p>
-          <p className="text-3xl font-bold text-amber-400">{((stats.win_rate || 0) * 100).toFixed(0)}%</p>
+          <p className="text-3xl font-bold text-amber-400">{(stats.win_rate || 0) > 1 ? (stats.win_rate || 0).toFixed(1) : ((stats.win_rate || 0) * 100).toFixed(0)}%</p>
         </div>
         <div className="bg-slate-800 rounded-xl p-6 border border-slate-700 text-center">
           <p className="text-slate-400 text-xs">Total P&L</p>
@@ -38,34 +38,50 @@ export default function AnalyticsPage() {
           </p>
         </div>
         <div className="bg-slate-800 rounded-xl p-6 border border-slate-700 text-center">
-          <p className="text-slate-400 text-xs">Streak</p>
+          <p className="text-slate-400 text-xs">W / L</p>
           <p className="text-3xl font-bold">
-            {streak.count || 0}x {streak.type === 'win' ? '🟢' : '🔴'}
+            <span className="text-green-400">{stats.wins ?? streak.count ?? 0}</span>
+            <span className="text-slate-500 mx-1">/</span>
+            <span className="text-red-400">{stats.losses ?? 0}</span>
           </p>
         </div>
       </div>
 
+      {/* Best / Worst Day */}
+      {(stats.best_day != null || stats.worst_day != null) && (
+        <div className="grid grid-cols-2 gap-4">
+          <div className="bg-slate-800 rounded-xl p-6 border border-slate-700 text-center">
+            <p className="text-slate-400 text-xs">Best Day</p>
+            <p className="text-2xl font-bold text-green-400">+${(stats.best_day ?? 0).toFixed(2)}</p>
+          </div>
+          <div className="bg-slate-800 rounded-xl p-6 border border-slate-700 text-center">
+            <p className="text-slate-400 text-xs">Worst Day</p>
+            <p className="text-2xl font-bold text-red-400">${(stats.worst_day ?? 0).toFixed(2)}</p>
+          </div>
+        </div>
+      )}
+
       {/* Equity Curve */}
-      {equity.length > 0 && (
+      {equityCurve.length > 0 && (
         <div className="bg-slate-800 rounded-xl p-6 border border-slate-700">
           <h2 className="text-lg font-semibold mb-4">📈 Equity Curve</h2>
           <div className="h-48 flex items-end gap-0.5">
-            {equity.slice(-60).map((e, i) => {
-              const min = Math.min(...equity.map(x => x.equity))
-              const max = Math.max(...equity.map(x => x.equity))
+            {equityCurve.slice(-60).map((e: any, i: number) => {
+              const vals = equityCurve.map((x: any) => x.equity)
+              const min = Math.min(...vals); const max = Math.max(...vals)
               const range = max - min || 1
               const height = ((e.equity - min) / range) * 100
               return (
                 <div key={i} className="flex-1 bg-green-500/60 hover:bg-green-400 rounded-t transition-colors"
                   style={{ height: `${Math.max(2, height)}%` }}
-                  title={`$${e.equity?.toLocaleString()} | ${e.timestamp?.slice(0,16)}`}
+                  title={`$${e.equity?.toLocaleString()}`}
                 />
               )
             })}
           </div>
           <div className="flex justify-between text-xs text-slate-500 mt-1">
-            <span>${Math.min(...equity.map(x => x.equity)).toLocaleString()}</span>
-            <span>${Math.max(...equity.map(x => x.equity)).toLocaleString()}</span>
+            <span>${Math.min(...equityCurve.map((x: any) => x.equity)).toLocaleString()}</span>
+            <span>${Math.max(...equityCurve.map((x: any) => x.equity)).toLocaleString()}</span>
           </div>
         </div>
       )}

@@ -20,6 +20,7 @@ const navLinks = [
   { href: '/news', label: '📰 News' },
   { href: '/ai', label: '🧠 AI' },
   { href: '/activity', label: '📋 Activity' },
+  { href: '/decisions', label: '🎯 Decisions' },
 ]
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

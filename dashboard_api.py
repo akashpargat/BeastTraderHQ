@@ -45,11 +45,34 @@ def portfolio():
     acct = gw.get_account()
     orders = gw.get_open_orders()
 
+    # Load cached TV/sentiment/AI data from trade_db
+    db = _get_db()
+    cached_tv = {}
+    cached_sent = {}
+    cached_ai = {}
+    if db:
+        try:
+            import sqlite3
+            conn = sqlite3.connect(db.db_path)
+            conn.row_factory = sqlite3.Row
+            for row in conn.execute("SELECT symbol, data, timestamp FROM tv_cache ORDER BY timestamp DESC"):
+                if row['symbol'] not in cached_tv:
+                    cached_tv[row['symbol']] = {'data': row['data'], 'time': row['timestamp']}
+            for row in conn.execute("SELECT symbol, total_score, yahoo_score, reddit_score, analyst_score, timestamp FROM sentiment_cache ORDER BY timestamp DESC"):
+                if row['symbol'] not in cached_sent:
+                    cached_sent[row['symbol']] = dict(row)
+            for row in conn.execute("SELECT symbol, action, confidence, reasoning, ai_source, timestamp FROM ai_cache ORDER BY timestamp DESC"):
+                if row['symbol'] not in cached_ai:
+                    cached_ai[row['symbol']] = dict(row)
+            conn.close()
+        except Exception:
+            pass
+
     pos_data = []
     for p in positions:
         cost = p.avg_entry * p.qty
         pct = (p.unrealized_pl / cost * 100) if cost > 0 else 0
-        pos_data.append({
+        entry = {
             'symbol': p.symbol,
             'qty': p.qty,
             'avg_entry': p.avg_entry,
@@ -58,7 +81,11 @@ def portfolio():
             'unrealized_pl': p.unrealized_pl,
             'pct': round(pct, 2),
             'is_green': p.unrealized_pl >= 0,
-        })
+            'last_tv_data': cached_tv.get(p.symbol),
+            'last_sentiment': cached_sent.get(p.symbol),
+            'last_ai_verdict': cached_ai.get(p.symbol),
+        }
+        pos_data.append(entry)
 
     total_pl = sum(p.unrealized_pl for p in positions)
     return jsonify({
@@ -78,19 +105,74 @@ def portfolio():
 
 @app.route('/api/trades')
 def trades():
-    """Trade history with reasoning."""
+    """Trade history with reasoning. Falls back to Alpaca orders if DB is empty."""
     db = _get_db()
     limit = request.args.get('limit', 50, type=int)
-    all_trades = db.get_all_trades(limit)
-    db.close()
+    all_trades = []
+    if db:
+        try:
+            all_trades = db.get_all_trades(limit)
+            db.close()
+        except Exception:
+            pass
+    # Fallback: read from Alpaca closed orders
+    if not all_trades:
+        try:
+            gw = _get_gateway()
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=limit)
+            orders = gw.client.get_orders(req)
+            for o in orders:
+                if o.filled_at:
+                    all_trades.append({
+                        'symbol': o.symbol,
+                        'side': o.side.value,
+                        'qty': str(o.filled_qty),
+                        'price': str(o.filled_avg_price) if o.filled_avg_price else '?',
+                        'time': o.filled_at.isoformat() if o.filled_at else '',
+                        'status': o.status.value,
+                        'client_order_id': str(o.client_order_id or ''),
+                        'order_type': str(o.type.value) if o.type else 'unknown',
+                    })
+        except Exception:
+            pass
     return jsonify({'trades': all_trades, 'count': len(all_trades)})
 
 @app.route('/api/trades/today')
 def trades_today():
     db = _get_db()
-    today = db.get_trades_today()
-    db.close()
-    return jsonify({'trades': today, 'count': len(today)})
+    today_trades = []
+    if db:
+        try:
+            today_trades = db.get_trades_today()
+            db.close()
+        except Exception:
+            pass
+    # Fallback: Alpaca closed orders filled today
+    if not today_trades:
+        try:
+            from datetime import date
+            gw = _get_gateway()
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100,
+                                   after=datetime.combine(date.today(), datetime.min.time()).isoformat() + 'Z')
+            orders = gw.client.get_orders(req)
+            for o in orders:
+                if o.filled_at:
+                    today_trades.append({
+                        'symbol': o.symbol,
+                        'side': o.side.value,
+                        'qty': str(o.filled_qty),
+                        'price': str(o.filled_avg_price) if o.filled_avg_price else '?',
+                        'time': o.filled_at.isoformat() if o.filled_at else '',
+                        'status': o.status.value,
+                        'client_order_id': str(o.client_order_id or ''),
+                    })
+        except Exception:
+            pass
+    return jsonify({'trades': today_trades, 'count': len(today_trades)})
 
 
 # ── SCANS ──────────────────────────────────────────────
@@ -122,18 +204,72 @@ def equity():
 
 @app.route('/api/analytics')
 def analytics():
-    """Full analytics: overall, by strategy, stock, regime, day."""
+    """Full analytics: tries DB first, falls back to Alpaca portfolio history."""
     db = _get_db()
-    result = {
-        'overall': db.get_overall_stats(),
-        'by_strategy': db.get_stats_by_strategy(),
-        'by_stock': db.get_stats_by_stock(),
-        'by_regime': db.get_stats_by_regime(),
-        'by_day': db.get_stats_by_day(30),
-        'streak': db.get_streak(),
-    }
-    db.close()
-    return jsonify(result)
+    db_result = None
+    if db:
+        try:
+            db_result = {
+                'overall': db.get_overall_stats(),
+                'by_strategy': db.get_stats_by_strategy(),
+                'by_stock': db.get_stats_by_stock(),
+                'by_regime': db.get_stats_by_regime(),
+                'by_day': db.get_stats_by_day(30),
+                'streak': db.get_streak(),
+            }
+            db.close()
+            # Check if DB data is actually populated
+            overall = db_result.get('overall', {})
+            if overall and overall.get('total_trades', 0) > 0:
+                return jsonify(db_result)
+        except Exception:
+            pass
+
+    # Fallback: compute from Alpaca portfolio history + orders
+    try:
+        gw = _get_gateway()
+        from alpaca.trading.requests import GetPortfolioHistoryRequest
+        hist = gw.client.get_portfolio_history(period='1M', timeframe='1D')
+
+        equity_data = []
+        pnl_data = []
+        if hist and hist.timestamp:
+            for i, ts in enumerate(hist.timestamp):
+                equity_data.append({'time': ts, 'equity': hist.equity[i]})
+                if hist.profit_loss:
+                    pnl_data.append(hist.profit_loss[i])
+
+        total_pnl = sum(pnl_data) if pnl_data else 0
+        wins = sum(1 for p in pnl_data if p > 0)
+        losses = sum(1 for p in pnl_data if p < 0)
+        win_rate = wins / (wins + losses) * 100 if (wins + losses) > 0 else 0
+
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+        req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=200)
+        closed = gw.client.get_orders(req)
+        filled = [o for o in closed if o.filled_at]
+
+        return jsonify({
+            'total_trades': len(filled),
+            'win_rate': round(win_rate, 1),
+            'total_pnl': round(total_pnl, 2),
+            'wins': wins,
+            'losses': losses,
+            'equity_curve': equity_data[-30:],
+            'best_day': round(max(pnl_data), 2) if pnl_data else 0,
+            'worst_day': round(min(pnl_data), 2) if pnl_data else 0,
+            # Preserve expected structure
+            'overall': {'total_trades': len(filled), 'win_rate': round(win_rate, 1), 'total_pnl': round(total_pnl, 2)},
+            'by_strategy': db_result.get('by_strategy', {}) if db_result else {},
+            'by_stock': db_result.get('by_stock', {}) if db_result else {},
+            'by_regime': db_result.get('by_regime', {}) if db_result else {},
+            'by_day': db_result.get('by_day', []) if db_result else [],
+            'streak': db_result.get('streak', {}) if db_result else {},
+        })
+    except Exception as e:
+        return jsonify({'error': str(e), 'total_trades': 0, 'win_rate': 0, 'total_pnl': 0,
+                        'overall': {}, 'by_strategy': {}, 'by_stock': {}, 'by_regime': {}, 'by_day': [], 'streak': {}})
 
 
 # ── SYSTEM STATUS ──────────────────────────────────────
@@ -230,35 +366,72 @@ def intraday_pnl():
 
 @app.route('/api/actions')
 def action_feed():
-    """Live feed of all bot actions: trades, alerts, scans."""
+    """Live feed of all bot actions: trades, alerts, scans + Alpaca fills."""
+    limit = request.args.get('limit', 50, type=int)
+    all_actions = []
+
+    # DB-based actions (trades, alerts, scans)
     db = _get_db()
-    limit = request.args.get('limit', 30, type=int)
+    if db:
+        try:
+            trades = db.conn.execute("""
+                SELECT created_at as timestamp, 'TRADE' as type,
+                       side || ' ' || symbol || ' x' || qty || ' @ $' || printf('%.2f', price) as title,
+                       reason as detail
+                FROM trades ORDER BY created_at DESC LIMIT ?
+            """, (limit,)).fetchall()
 
-    # Combine trades + alerts into one timeline
-    trades = db.conn.execute("""
-        SELECT created_at as timestamp, 'TRADE' as type,
-               side || ' ' || symbol || ' x' || qty || ' @ $' || printf('%.2f', price) as title,
-               reason as detail
-        FROM trades ORDER BY created_at DESC LIMIT ?
-    """, (limit,)).fetchall()
+            alerts = db.conn.execute("""
+                SELECT timestamp, alert_type as type, symbol as title, message as detail
+                FROM alerts_log ORDER BY timestamp DESC LIMIT ?
+            """, (limit,)).fetchall()
 
-    alerts = db.conn.execute("""
-        SELECT timestamp, alert_type as type, symbol as title, message as detail
-        FROM alerts_log ORDER BY timestamp DESC LIMIT ?
-    """, (limit,)).fetchall()
+            scans = db.conn.execute("""
+                SELECT timestamp, 'SCAN' as type,
+                       scan_type || ' | ' || regime || ' | SPY:' || printf('%.2f%%', spy_change*100) as title,
+                       'TV:' || tv_reads || ' Sent:' || sentiments || ' AI:' || ai_calls || ' Trump:' || trump_score as detail
+                FROM scan_log ORDER BY timestamp DESC LIMIT ?
+            """, (limit,)).fetchall()
 
-    scans = db.conn.execute("""
-        SELECT timestamp, 'SCAN' as type,
-               scan_type || ' | ' || regime || ' | SPY:' || printf('%.2f%%', spy_change*100) as title,
-               'TV:' || tv_reads || ' Sent:' || sentiments || ' AI:' || ai_calls || ' Trump:' || trump_score as detail
-        FROM scan_log ORDER BY timestamp DESC LIMIT ?
-    """, (limit,)).fetchall()
+            all_actions = [dict(r) for r in trades] + [dict(r) for r in alerts] + [dict(r) for r in scans]
+            db.close()
+        except Exception:
+            pass
 
-    # Merge and sort by time
-    all_actions = [dict(r) for r in trades] + [dict(r) for r in alerts] + [dict(r) for r in scans]
-    all_actions.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+    # Alpaca fills as fallback/supplement
+    try:
+        gw = _get_gateway()
+        activities = gw.client.get_account_activities(activity_types=['FILL'])
+        for a in (activities or [])[:limit]:
+            action_type = 'BUY' if getattr(a, 'side', '') == 'buy' else 'SELL'
+            cid = str(getattr(a, 'order_id', '') or '')
+            if 'scalp' in cid: icon = 'SCALP'
+            elif 'runner' in cid: icon = 'RUNNER'
+            elif 'trail' in cid: icon = 'STOP'
+            elif 'dip' in cid or 'quickbuy' in cid: icon = 'DIP-BUY'
+            elif 'protect' in cid: icon = 'PROTECT'
+            else: icon = action_type
 
-    db.close()
+            tx_time = ''
+            if hasattr(a, 'transaction_time') and a.transaction_time:
+                tx_time = a.transaction_time.isoformat()
+
+            all_actions.append({
+                'timestamp': tx_time,
+                'type': icon,
+                'title': f"{icon} {getattr(a, 'symbol', '?')} x{getattr(a, 'qty', '?')} @ ${getattr(a, 'price', '?')}",
+                'detail': cid,
+                'symbol': getattr(a, 'symbol', ''),
+                'side': getattr(a, 'side', ''),
+                'qty': str(getattr(a, 'qty', '')),
+                'price': str(getattr(a, 'price', '')),
+                'time': tx_time,
+                'reason': cid,
+            })
+    except Exception:
+        pass
+
+    all_actions.sort(key=lambda x: x.get('timestamp', '') or x.get('time', ''), reverse=True)
     return jsonify({'actions': all_actions[:limit]})
 
 
@@ -304,6 +477,7 @@ def index():
             '/api/intraday', '/api/actions', '/api/sentiment',
             '/api/runners', '/api/sectors', '/api/trailing-stops', '/api/news',
             '/api/sharpe', '/api/correlation', '/api/daily-pnl',
+            '/api/ai-verdicts', '/api/decision-log',
         ]
     })
 
@@ -354,7 +528,22 @@ def runners():
         runners.sort(key=lambda x: x['change_pct'], reverse=True)
         now = datetime.now(ET)
         session = 'pre-market' if now.hour < 9 else ('after-hours' if now.hour >= 16 else 'market')
-        
+
+        # Also include our held positions that are running today
+        try:
+            gw = _get_gateway()
+            for p in gw.get_positions():
+                pct = ((p.current_price - p.avg_entry) / p.avg_entry * 100) if p.avg_entry > 0 else 0
+                if pct > 2:
+                    runners.append({
+                        'symbol': p.symbol, 'price': round(p.current_price, 2),
+                        'change_pct': round(pct, 1), 'prev_close': round(p.avg_entry, 2),
+                        'held': True,
+                    })
+            runners.sort(key=lambda x: x['change_pct'], reverse=True)
+        except Exception:
+            pass
+
         return jsonify({
             'session': session,
             'runners': runners[:15],
@@ -422,7 +611,7 @@ def trailing_stops():
         
         trails = []
         for o in orders:
-            if o.get('type') == 'trailing_stop':
+            if 'trailing' in str(o.get('type', '')).lower() or o.get('trail_percent'):
                 sym = o.get('symbol', '')
                 pos = next((p for p in positions if p.symbol == sym), None)
                 trails.append({
@@ -533,6 +722,80 @@ def daily_pnl_api():
     result = db.get_daily_pnl()
     db.close()
     return jsonify(result)
+
+
+# ── AI VERDICTS ───────────────────────────────────────
+
+@app.route('/api/ai-verdicts')
+def ai_verdicts():
+    """AI analysis verdicts for all positions."""
+    try:
+        gw = _get_gateway()
+        positions = gw.get_positions()
+
+        from ai_brain import AIBrain
+        brain = AIBrain()
+
+        verdicts = []
+        for p in positions:
+            cached = brain.get_cached_analysis(p.symbol) if hasattr(brain, 'get_cached_analysis') else None
+            verdicts.append({
+                'symbol': p.symbol,
+                'price': p.current_price,
+                'pnl': round(p.unrealized_pl, 2),
+                'pct': round(((p.current_price - p.avg_entry) / p.avg_entry * 100) if p.avg_entry > 0 else 0, 1),
+                'ai_action': cached.get('action', 'NO DATA') if cached else 'NO DATA',
+                'ai_confidence': cached.get('confidence', 0) if cached else 0,
+                'ai_reasoning': cached.get('reasoning', '') if cached else 'No analysis yet — wait for next scan cycle',
+                'ai_source': cached.get('ai_source', '') if cached else '',
+                'scan_type': cached.get('scan_type', '') if cached else '',
+            })
+        return jsonify({'verdicts': verdicts, 'count': len(verdicts)})
+    except Exception as e:
+        return jsonify({'error': str(e), 'verdicts': [], 'count': 0})
+
+
+# ── DECISION LOG ──────────────────────────────────────
+
+@app.route('/api/decision-log')
+def decision_log():
+    """Complete decision history — what the bot did and WHY."""
+    try:
+        gw = _get_gateway()
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+        req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100)
+        orders = gw.client.get_orders(req)
+
+        decisions = []
+        for o in orders:
+            if not o.filled_at:
+                continue
+            cid = str(o.client_order_id or '')
+            strategy = 'manual'
+            if 'scalp' in cid: strategy = 'Auto-Scalp (+2%)'
+            elif 'runner' in cid: strategy = 'Auto-Runner (+5%)'
+            elif 'trail' in cid: strategy = 'Trailing Stop'
+            elif 'dip' in cid or 'quickbuy' in cid: strategy = 'Akash Method (Dip Buy)'
+            elif 'protect' in cid: strategy = 'Auto-Protect'
+            elif 'earnings' in cid: strategy = 'Earnings Play'
+            elif 'beast' in cid: strategy = 'Beast Engine'
+
+            decisions.append({
+                'symbol': o.symbol,
+                'side': o.side.value,
+                'qty': str(o.filled_qty),
+                'price': str(o.filled_avg_price) if o.filled_avg_price else '?',
+                'time': o.filled_at.isoformat(),
+                'strategy': strategy,
+                'order_id': cid,
+                'order_type': str(o.type.value) if o.type else '?',
+            })
+
+        decisions.sort(key=lambda x: x['time'], reverse=True)
+        return jsonify({'decisions': decisions})
+    except Exception as e:
+        return jsonify({'error': str(e), 'decisions': []})
 
 
 if __name__ == '__main__':

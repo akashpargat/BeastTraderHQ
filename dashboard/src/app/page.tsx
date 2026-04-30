@@ -9,6 +9,8 @@ export default function Dashboard() {
   const [sentiment, setSentiment] = useState<any>({})
   const [intraday, setIntraday] = useState<any[]>([])
   const [system, setSystem] = useState<any>(null)
+  const [aiVerdicts, setAiVerdicts] = useState<any[]>([])
+  const [decisionLog, setDecisionLog] = useState<any[]>([])
   const [lastUpdate, setLastUpdate] = useState('')
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [tick, setTick] = useState(0)
@@ -16,16 +18,20 @@ export default function Dashboard() {
   const fetchAll = useCallback(async () => {
     setIsRefreshing(true)
     try {
-      const [pRes, aRes, sRes, iRes, sysRes] = await Promise.all([
+      const [pRes, aRes, sRes, iRes, sysRes, aiRes, dlRes] = await Promise.all([
         fetch(`${API}/api/portfolio`), fetch(`${API}/api/actions?limit=20`),
         fetch(`${API}/api/sentiment`), fetch(`${API}/api/intraday`),
         fetch(`${API}/api/system`),
+        fetch(`${API}/api/ai-verdicts`).catch(() => new Response('{"verdicts":[]}')),
+        fetch(`${API}/api/decision-log`).catch(() => new Response('{"decisions":[]}')),
       ])
       setPortfolio(await pRes.json())
       setActions((await aRes.json()).actions || [])
       setSentiment(await sRes.json())
       setIntraday((await iRes.json()).data || [])
       setSystem(await sysRes.json())
+      const aiData = await aiRes.json(); setAiVerdicts(aiData.verdicts || [])
+      const dlData = await dlRes.json(); setDecisionLog(dlData.decisions || dlData.log || [])
       setLastUpdate(new Date().toLocaleTimeString())
       setTick(t => t + 1)
     } catch (e) { console.error('Fetch failed:', e) }
@@ -171,6 +177,57 @@ export default function Dashboard() {
               </table>
             </div>
           </Card>
+
+          {/* 🧠 LATEST AI VERDICTS */}
+          {aiVerdicts.filter((v: any) => v.ai_action !== 'HOLD').length > 0 && (
+            <Card title="🧠 Latest AI Verdict" animate>
+              <div className="space-y-2">
+                {aiVerdicts.filter((v: any) => v.ai_action !== 'HOLD').slice(0, 3).map((v: any) => {
+                  const isBuy = v.ai_action === 'BUY'
+                  return (
+                    <div key={v.symbol} className={`flex items-center justify-between p-2 rounded-lg border ${
+                      isBuy ? 'border-green-500/30 bg-green-500/5' : 'border-red-500/30 bg-red-500/5'
+                    }`}>
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono font-bold text-white">{v.symbol}</span>
+                        <span className={`text-xs font-bold px-2 py-0.5 rounded ${
+                          isBuy ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
+                        }`}>{v.ai_action}</span>
+                        <span className="text-[10px] text-slate-500">{v.ai_confidence}%</span>
+                      </div>
+                      <span className="text-xs text-slate-400 truncate max-w-[200px]">{v.ai_reasoning}</span>
+                    </div>
+                  )
+                })}
+              </div>
+            </Card>
+          )}
+
+          {/* 📋 RECENT DECISIONS */}
+          {decisionLog.length > 0 && (
+            <Card title="📋 Recent Decisions" animate>
+              <div className="space-y-1">
+                {decisionLog.slice(0, 5).map((d: any, i: number) => {
+                  const side = (d.side || '').toLowerCase()
+                  const cid = d.client_order_id || d.reason || ''
+                  const strat = cid.includes('scalp') ? 'Scalp' : cid.includes('runner') ? 'Runner' :
+                    cid.includes('dip') ? 'Dip' : cid.includes('protect') ? 'Protect' : cid.split('-')[0] || '—'
+                  return (
+                    <div key={i} className="flex items-center justify-between py-1.5 border-b border-slate-700/20 text-xs">
+                      <div className="flex items-center gap-2">
+                        <span className={side === 'buy' ? 'text-green-400' : 'text-red-400'}>
+                          {side === 'buy' ? '🟢' : '🔴'}
+                        </span>
+                        <span className="font-mono font-bold text-white">{d.symbol}</span>
+                        <span className="text-slate-500">x{d.qty} @ ${Number(d.price || 0).toFixed(2)}</span>
+                      </div>
+                      <span className="bg-slate-700 px-1.5 py-0.5 rounded text-slate-300">{strat}</span>
+                    </div>
+                  )
+                })}
+              </div>
+            </Card>
+          )}
 
           {/* SENTIMENT HEATMAP */}
           <Card title="📰 Sentiment Heatmap" animate>

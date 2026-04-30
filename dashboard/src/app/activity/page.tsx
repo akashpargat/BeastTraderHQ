@@ -4,18 +4,12 @@ import { useEffect, useState, useCallback } from 'react'
 const API = 'https://api.beast-trader.com'
 
 const ACTION_ICONS: Record<string, string> = {
-  scalp: '🎯',
-  runner: '🏃',
-  'dip-buy': '📉',
-  'dip_buy': '📉',
-  protect: '🛡️',
-  sell: '💰',
-  buy: '🟢',
-  stop: '🔴',
-  trail: '📐',
+  scalp: '🎯', runner: '🏃', 'dip-buy': '📉', 'dip_buy': '📉',
+  protect: '🛡️', sell: '💰', buy: '🟢', stop: '🔴', trail: '📐',
+  BUY: '🟢', SELL: '💰', FILL: '✅', CANCEL: '❌',
 }
 
-const ACTION_TYPES = ['all', 'scalp', 'runner', 'dip-buy', 'protect', 'sell', 'buy', 'stop']
+const ACTION_TYPES = ['all', 'buy', 'sell', 'scalp', 'runner', 'dip-buy', 'protect', 'stop']
 
 export default function ActivityPage() {
   const [actions, setActions] = useState<any[]>([])
@@ -40,7 +34,10 @@ export default function ActivityPage() {
 
   const filtered = filter === 'all'
     ? actions
-    : actions.filter((a: any) => (a.action_type ?? a.type ?? '').toLowerCase().includes(filter))
+    : actions.filter((a: any) => {
+        const t = (a.action_type ?? a.type ?? a.side ?? '').toLowerCase()
+        return t.includes(filter)
+      })
 
   if (loading) return (
     <div className="space-y-4">
@@ -73,16 +70,21 @@ export default function ActivityPage() {
       {/* Timeline */}
       <div className="space-y-2">
         {filtered.map((a: any, idx: number) => {
-          const type = (a.action_type ?? a.type ?? 'unknown').toLowerCase()
-          const icon = ACTION_ICONS[type] || '⚡'
+          const type = (a.action_type ?? a.type ?? a.side ?? 'unknown').toLowerCase()
+          const icon = ACTION_ICONS[type] || ACTION_ICONS[type.toUpperCase()] || '⚡'
           const time = a.timestamp ?? a.time
+          const isBuy = type === 'buy'
+          const isSell = type === 'sell'
+          const borderCls = isBuy ? 'border-green-500/30' : isSell ? 'border-red-500/30' : 'border-slate-700'
           return (
-            <div key={idx} className="bg-slate-800 rounded-xl p-4 border border-slate-700 flex items-center gap-4">
+            <div key={idx} className={`bg-slate-800 rounded-xl p-4 border ${borderCls} flex items-center gap-4`}>
               <span className="text-2xl">{icon}</span>
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="font-mono font-bold text-white">{a.symbol}</span>
-                  <span className="text-xs bg-slate-700 text-slate-300 px-2 py-0.5 rounded">{type.toUpperCase()}</span>
+                  <span className={`text-xs px-2 py-0.5 rounded font-bold ${
+                    isBuy ? 'bg-green-500/20 text-green-400' : isSell ? 'bg-red-500/20 text-red-400' : 'bg-slate-700 text-slate-300'
+                  }`}>{type.toUpperCase()}</span>
                 </div>
                 <p className="text-xs text-slate-400 mt-0.5 truncate">{a.reason || a.note || '—'}</p>
               </div>
@@ -92,7 +94,7 @@ export default function ActivityPage() {
                   {a.price ? `$${Number(a.price).toFixed(2)}` : ''}
                 </p>
                 {time && (
-                  <p className="text-xs text-slate-500">{new Date(time).toLocaleTimeString()}</p>
+                  <p className="text-xs text-slate-500">{new Date(time).toLocaleString()}</p>
                 )}
               </div>
             </div>

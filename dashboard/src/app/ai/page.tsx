@@ -3,22 +3,22 @@ import { useEffect, useState, useCallback } from 'react'
 
 const API = 'https://api.beast-trader.com'
 
-function verdictStyle(v: string): { bg: string; text: string } {
-  const verdict = (v || '').toUpperCase()
-  if (verdict.includes('BUY')) return { bg: 'bg-green-500/20 border-green-500/40', text: 'text-green-400' }
-  if (verdict.includes('SELL')) return { bg: 'bg-red-500/20 border-red-500/40', text: 'text-red-400' }
-  return { bg: 'bg-yellow-500/10 border-yellow-500/30', text: 'text-yellow-400' }
+function actionStyle(action: string) {
+  const a = (action || '').toUpperCase()
+  if (a === 'BUY') return { bg: 'bg-green-500/20 border-green-500/40', text: 'text-green-400', bar: 'bg-green-500' }
+  if (a === 'SELL') return { bg: 'bg-red-500/20 border-red-500/40', text: 'text-red-400', bar: 'bg-red-500' }
+  return { bg: 'bg-yellow-500/10 border-yellow-500/30', text: 'text-yellow-400', bar: 'bg-yellow-500' }
 }
 
 export default function AIPage() {
-  const [positions, setPositions] = useState<any[]>([])
+  const [verdicts, setVerdicts] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
 
   const fetchData = useCallback(() => {
-    fetch(`${API}/api/portfolio`)
+    fetch(`${API}/api/ai-verdicts`)
       .then(r => r.json())
       .then(data => {
-        setPositions(data.positions || [])
+        setVerdicts(data.verdicts || [])
         setLoading(false)
       })
       .catch(() => setLoading(false))
@@ -37,32 +37,31 @@ export default function AIPage() {
     </div>
   )
 
-  const withAI = positions.filter((p: any) => p.ai_verdict || p.ai_action || p.ai_recommendation)
-
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold">🧠 AI Panel</h1>
-        <span className="text-xs text-slate-500">{withAI.length} positions analyzed</span>
+        <span className="text-xs text-slate-500">{verdicts.length} positions analyzed</span>
       </div>
 
-      {withAI.length > 0 ? (
+      {verdicts.length > 0 ? (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {withAI.map((p: any) => {
-            const verdict = p.ai_verdict || p.ai_action || p.ai_recommendation || 'HOLD'
-            const confidence = p.ai_confidence ?? p.confidence ?? 50
-            const reasoning = p.ai_reasoning || p.ai_reason || p.reason || 'No reasoning provided'
-            const style = verdictStyle(verdict)
+          {verdicts.map((v: any) => {
+            const style = actionStyle(v.ai_action)
+            const confidence = v.ai_confidence ?? 50
 
             return (
-              <div key={p.symbol} className={`bg-slate-800 rounded-xl p-4 border ${style.bg}`}>
+              <div key={v.symbol} className={`bg-slate-800 rounded-xl p-4 border ${style.bg}`}>
                 <div className="flex items-center justify-between mb-3">
                   <div className="flex items-center gap-3">
-                    <span className="font-mono font-bold text-white text-lg">{p.symbol}</span>
-                    <span className="text-xs text-slate-400">${(p.current_price ?? 0).toFixed(2)}</span>
+                    <span className="font-mono font-bold text-white text-lg">{v.symbol}</span>
+                    <span className="text-xs text-slate-400">${(v.price ?? 0).toFixed(2)}</span>
+                    <span className={`text-xs font-mono ${(v.pnl ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      {(v.pnl ?? 0) >= 0 ? '+' : ''}${(v.pnl ?? 0).toFixed(2)} ({(v.pct ?? 0).toFixed(1)}%)
+                    </span>
                   </div>
                   <span className={`text-sm font-bold px-3 py-1 rounded-full ${style.text} bg-slate-900/50`}>
-                    {verdict.toUpperCase()}
+                    {(v.ai_action || 'HOLD').toUpperCase()}
                   </span>
                 </div>
 
@@ -73,24 +72,18 @@ export default function AIPage() {
                     <span className={style.text}>{confidence}%</span>
                   </div>
                   <div className="w-full bg-slate-700 rounded-full h-2">
-                    <div
-                      className={`h-2 rounded-full transition-all ${
-                        confidence >= 70 ? 'bg-green-500' : confidence >= 40 ? 'bg-yellow-500' : 'bg-red-500'
-                      }`}
-                      style={{ width: `${confidence}%` }}
-                    />
+                    <div className={`h-2 rounded-full transition-all ${style.bar}`}
+                      style={{ width: `${confidence}%` }} />
                   </div>
                 </div>
 
                 {/* Reasoning */}
-                <p className="text-xs text-slate-400 leading-relaxed">{reasoning}</p>
+                <p className="text-xs text-slate-400 leading-relaxed">{v.ai_reasoning || 'No reasoning provided'}</p>
 
-                {/* Position info */}
+                {/* Source info */}
                 <div className="flex gap-4 mt-3 text-xs text-slate-500">
-                  <span>{p.qty} shares</span>
-                  <span className={p.unrealized_pl >= 0 ? 'text-green-400' : 'text-red-400'}>
-                    P&L: ${(p.unrealized_pl ?? 0).toFixed(2)}
-                  </span>
+                  <span className="bg-slate-700/60 px-2 py-0.5 rounded">🤖 {v.ai_source || 'Unknown'}</span>
+                  <span className="bg-slate-700/60 px-2 py-0.5 rounded">⏱ {v.scan_type || 'N/A'}</span>
                 </div>
               </div>
             )
