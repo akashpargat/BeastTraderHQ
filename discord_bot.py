@@ -2318,9 +2318,19 @@ async def full_scan():
         # ── STEP 1: TV INDICATORS (MANDATORY) ──
         tv_data = {}
         def _read_all_tv(syms):
+            """Read TV indicators for all stocks. Sequential (one Chrome instance)
+            but smart: skip 5-min cached stocks, prioritize held positions."""
             d = {}
             timings = {}
+            skipped = 0
             for sym in syms:
+                # Check 5-min cache — skip if fresh
+                cached = _tv_cache.get(sym)
+                if cached and time.time() - cached[0] < 300:
+                    d[sym] = cached[1]
+                    timings[sym] = 0
+                    skipped += 1
+                    continue
                 t0 = time.time()
                 ind = _get_tv_indicators(sym)
                 elapsed = int((time.time() - t0) * 1000)
@@ -2330,9 +2340,13 @@ async def full_scan():
                     log.info(f"  TV {sym}: RSI={ind.get('rsi','?'):.0f} MACD={ind.get('macd_hist','?')} VWAP={'above' if ind.get('vwap_above') else 'BELOW'} [{elapsed}ms]")
                 else:
                     log.info(f"  TV {sym}: NO DATA [{elapsed}ms]")
+            if skipped:
+                log.info(f"  TV: {skipped} cached (skipped), {len(syms)-skipped} fresh reads")
             return d, timings
         t_step = time.time()
-        tv_data, tv_timings = await asyncio.to_thread(_read_all_tv, scan_symbols[:16])
+        # Prioritize: held first (need real-time), then watchlist movers
+        tv_priority = held[:12] + [s for s in scan_symbols if s not in held][:4]
+        tv_data, tv_timings = await asyncio.to_thread(_read_all_tv, tv_priority)
         tv_total = int((time.time() - t_step) * 1000)
         perf['tv'] = {'total_ms': tv_total, 'stocks': len(scan_symbols[:16]), 'loaded': len(tv_data), 'per_stock': tv_timings}
         log.info(f"  📊 TV: {len(tv_data)}/{len(held)} stocks in {tv_total}ms (avg {tv_total//max(len(scan_symbols[:16]),1)}ms/stock)")
@@ -4014,6 +4028,128 @@ async def before_ah_pm():
     await asyncio.sleep(60)
 
 
+# ══════════════════════════════════════════════════════════
+#  FILL TRACKER: Monitors order fills, records realized P&L
+#  Runs every 5 min, checks Alpaca for recently filled orders
+#  Stores profit/loss per trade for the learning engine
+# ══════════════════════════════════════════════════════════
+
+@tasks.loop(minutes=5)
+async def fill_tracker():
+    """Every 5 min: check for filled orders and record realized P&L.
+    This closes the learning loop: buy→fill→sell→fill→profit/loss recorded."""
+    try:
+        pg = _get_pg()
+        if not pg:
+            return
+
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+
+        def _check_fills():
+            try:
+                req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=20)
+                orders = gateway.client.get_orders(req)
+                fills = []
+                for o in orders:
+                    if o.filled_at and o.status.value == 'filled':
+                        # Check if we already logged this fill
+                        fill_key = f"fill_{o.id}"
+                        if pg.get_state(fill_key):
+                            continue
+
+                        filled_price = float(o.filled_avg_price) if o.filled_avg_price else 0
+                        qty = int(float(o.filled_qty)) if o.filled_qty else 0
+                        side = o.side.value if o.side else 'unknown'
+                        sym = o.symbol
+
+                        # Calculate realized P&L for sells
+                        realized_pnl = None
+                        if side == 'sell' and filled_price > 0:
+                            # Check price_memory for entry price
+                            mem = pg.get_price_memory(sym)
+                            buy_price = mem.get('last_buy_price', 0)
+                            if buy_price and buy_price > 0:
+                                realized_pnl = (filled_price - buy_price) * qty
+
+                        fills.append({
+                            'order_id': str(o.id),
+                            'symbol': sym,
+                            'side': side,
+                            'qty': qty,
+                            'filled_price': filled_price,
+                            'filled_at': str(o.filled_at),
+                            'realized_pnl': realized_pnl,
+                            'order_type': o.type.value if o.type else 'unknown',
+                            'client_order_id': str(o.client_order_id or ''),
+                        })
+
+                        # Mark as processed
+                        pg.set_state(fill_key, True, 'fills')
+
+                        # Record sell in price memory
+                        if side == 'sell':
+                            pg.record_sell(sym, filled_price)
+
+                        # Update trade_log if we have a matching entry
+                        if realized_pnl is not None:
+                            pg._exec(
+                                """UPDATE trade_log SET filled_price = %s, filled_at = NOW(),
+                                   pnl_eod = %s, was_profitable = %s
+                                   WHERE symbol = %s AND side = 'buy' AND filled_price IS NULL
+                                   ORDER BY created_at DESC LIMIT 1""",
+                                (filled_price, realized_pnl, realized_pnl > 0, sym)
+                            )
+
+                        # Update session stats
+                        pg.update_session_stats(trades=1, pnl=realized_pnl or 0)
+
+                return fills
+            except Exception as e:
+                log.warning(f"Fill tracker error: {e}")
+                return []
+
+        fills = await asyncio.to_thread(_check_fills)
+
+        if fills:
+            log.info(f"  💰 Fill tracker: {len(fills)} new fills")
+            channel = bot.get_channel(SCAN_CHANNEL_ID)
+            for f in fills:
+                pnl_str = ""
+                if f['realized_pnl'] is not None:
+                    pnl_str = f" | P&L: ${f['realized_pnl']:+.2f}"
+                log.info(f"    FILLED: {f['side'].upper()} {f['symbol']} {f['qty']}x @${f['filled_price']:.2f}{pnl_str}")
+
+                # Log to activity
+                _pg_log("FILL", symbol=f['symbol'], side=f['side'], qty=f['qty'],
+                        price=f['filled_price'], reason=f"Order filled{pnl_str}",
+                        source="fill_tracker", data=f)
+
+                # Notify dashboard
+                if pg:
+                    severity = 'success' if (f['realized_pnl'] or 0) >= 0 else 'warning'
+                    pg.notify(
+                        f"FILLED: {f['side'].upper()} {f['symbol']}",
+                        f"{f['qty']}x @${f['filled_price']:.2f}{pnl_str}",
+                        severity=severity, symbol=f['symbol'], category='fill')
+
+                # Discord alert for realized P&L
+                if channel and f['realized_pnl'] is not None:
+                    icon = "💰" if f['realized_pnl'] > 0 else "💸"
+                    await channel.send(
+                        f"{icon} **REALIZED: {f['symbol']}** "
+                        f"Sold {f['qty']}x @${f['filled_price']:.2f} "
+                        f"— P&L: **${f['realized_pnl']:+.2f}**")
+
+    except Exception as e:
+        log.warning(f"Fill tracker error: {e}")
+
+@fill_tracker.before_loop
+async def before_fill_tracker():
+    await bot.wait_until_ready()
+    await asyncio.sleep(120)
+
+
 @bot.event
 async def on_ready():
     log.info(f"🦍 Beast Discord Bot online as {bot.user}")
@@ -4026,9 +4162,26 @@ async def on_ready():
     except:
         pass
     log.info(f"   TradingView: {'✅' if tv_ok else '❌'}")
-    pg_ok = _get_pg() and _get_pg().conn
+    pg = _get_pg()
+    pg_ok = pg and pg.conn
     log.info(f"   PostgreSQL: {'✅' if pg_ok else '❌'}")
     log.info(f"   Watchlist: {len(DIP_BUY_WATCHLIST)} stocks")
+
+    # Register this bot session in DB (tracks version, uptime, crashes)
+    if pg:
+        try:
+            session_id = pg.start_session(
+                build_version=BOT_BUILD,
+                git_hash=_git_hash,
+                loops_config={
+                    'position_monitor': '60s', 'fast_runner': '2min', 'full_scan': '5min',
+                    'decision_report': '10min', 'claude_deep': '30min', 'outcome_grader': '30min',
+                    'ah_pm_scanner': '15min', 'bg_learning': '1hr', 'daily_learn': '3AM',
+                }
+            )
+            log.info(f"   📦 Bot session #{session_id} started")
+        except Exception as e:
+            log.warning(f"   Session start failed: {e}")
 
     if not position_monitor.is_running():
         position_monitor.start()
@@ -4054,6 +4207,9 @@ async def on_ready():
     if not ah_pm_scanner.is_running():
         ah_pm_scanner.start()
         log.info("   ✅ AH/PM scanner: every 15 min (earnings movers + gaps)")
+    if not fill_tracker.is_running():
+        fill_tracker.start()
+        log.info("   ✅ Fill tracker: every 5 min (realized P&L + session stats)")
     if not claude_daily_deep_learn.is_running():
         claude_daily_deep_learn.start()
         log.info("   ✅ Claude daily deep learn: once/day at 3 AM ET")
