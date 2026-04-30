@@ -1701,6 +1701,10 @@ async def position_monitor():
         held_symbols = {p.symbol for p in positions}
 
         # ── ACTIVE SCALPER: only protect RED, actively trade GREEN ──
+        # NON-BLUE-CHIP LOSS CUT: -5% = cut half, -10% = cut all
+        BLUE_CHIPS = {'AAPL','MSFT','GOOGL','AMZN','META','NVDA','TSLA','JPM','V','MA',
+                      'JNJ','UNH','WMT','PG','HD','DIS','NFLX','ADBE','CRM','ORCL',
+                      'COST','PEP','KO','AVGO','AMD','INTC','MU','QCOM'}
         if _is_trading_hours() and _cycle_count % 3 == 0:
             try:
                 open_orders = await asyncio.to_thread(gateway.get_open_orders)
@@ -1710,10 +1714,35 @@ async def position_monitor():
                         protected.add(o.get('symbol', ''))
                 for p in positions:
                     pct = _pct(p)
+                    avail = p.qty_available or 0
+
+                    # NON-BLUE-CHIP LOSS CUT (Buffett rule: only hold quality)
+                    if pct <= -5.0 and p.symbol not in BLUE_CHIPS and avail > 0:
+                        cut_key = f"_cut_{p.symbol}"
+                        if not _prev_prices.get(cut_key):
+                            if pct <= -10.0:
+                                cut_qty = avail  # Cut ALL at -10%
+                            else:
+                                cut_qty = max(1, avail // 2)  # Cut HALF at -5%
+                            try:
+                                sell_price = round(p.current_price * 0.999, 2)
+                                gateway.place_sell(p.symbol, cut_qty, sell_price,
+                                    reason=f"Loss cut {pct:.1f}% (non-blue-chip)", entry_price=p.avg_entry)
+                                _prev_prices[cut_key] = True
+                                if pg: pg.record_sell(p.symbol, sell_price)
+                                _log_trade("LOSS CUT", p.symbol, cut_qty, sell_price,
+                                    f"Non-blue-chip at {pct:.1f}% — cutting losses", "60s LossCut")
+                                if channel:
+                                    await channel.send(f"🔪 **LOSS CUT: {p.symbol}** {pct:.1f}% — selling {cut_qty} (not blue chip)")
+                                _tg(f"🔪 LOSS CUT: {p.symbol} {pct:.1f}%\nSelling {cut_qty} shares (non-blue-chip)")
+                            except:
+                                pass
+                            continue
+
                     # Only trail RED positions that aren't already protected
-                    if pct < 0 and p.symbol not in protected and p.qty_available and p.qty_available > 0:
+                    if pct < 0 and p.symbol not in protected and avail > 0:
                         try:
-                            trail_qty = max(1, p.qty_available // 2)
+                            trail_qty = max(1, avail // 2)
                             gateway.place_trailing_stop(p.symbol, trail_qty, trail_percent=3.0,
                                                         reason=f"Protect RED {pct:.1f}%",
                                                         entry_price=p.avg_entry)
@@ -1973,6 +2002,31 @@ async def full_scan():
         held = [p.symbol for p in positions]
         heat_pct = round((1 - cash / equity) * 100, 1) if equity > 0 else 0
 
+        # SCAN COVERAGE FIX: Add top watchlist movers (not just held positions)
+        # This catches opportunities we DON'T own yet
+        scan_symbols = list(held)  # Start with held
+        if _is_trading_hours() and pg:
+            try:
+                from alpaca.data.historical import StockHistoricalDataClient
+                from alpaca.data.requests import StockSnapshotRequest as SSR2
+                dc2 = StockHistoricalDataClient(os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'))
+                # Get top past winners + recent watchlist additions not already held
+                watch_check = [s for s in PAST_WINNERS[:15] if s not in held]
+                if watch_check:
+                    snaps2 = dc2.get_stock_snapshot(SSR2(symbol_or_symbols=watch_check[:10], feed='iex'))
+                    for sym, s in snaps2.items():
+                        try:
+                            price = float(s.latest_trade.price)
+                            prev = float(s.previous_daily_bar.close)
+                            pct = (price - prev) / prev * 100
+                            if abs(pct) > 1.5 and sym not in scan_symbols:
+                                scan_symbols.append(sym)
+                        except:
+                            pass
+            except:
+                pass
+        log.info(f"  Scan coverage: {len(held)} held + {len(scan_symbols)-len(held)} watchlist movers = {len(scan_symbols)} total")
+
         # Track for snapshot
         scan_decisions = []
 
@@ -2017,10 +2071,10 @@ async def full_scan():
                     log.info(f"  TV {sym}: NO DATA [{elapsed}ms]")
             return d, timings
         t_step = time.time()
-        tv_data, tv_timings = await asyncio.to_thread(_read_all_tv, held[:10])
+        tv_data, tv_timings = await asyncio.to_thread(_read_all_tv, scan_symbols[:16])
         tv_total = int((time.time() - t_step) * 1000)
-        perf['tv'] = {'total_ms': tv_total, 'stocks': len(held[:10]), 'loaded': len(tv_data), 'per_stock': tv_timings}
-        log.info(f"  📊 TV: {len(tv_data)}/{len(held)} stocks in {tv_total}ms (avg {tv_total//max(len(held[:10]),1)}ms/stock)")
+        perf['tv'] = {'total_ms': tv_total, 'stocks': len(scan_symbols[:16]), 'loaded': len(tv_data), 'per_stock': tv_timings}
+        log.info(f"  📊 TV: {len(tv_data)}/{len(held)} stocks in {tv_total}ms (avg {tv_total//max(len(scan_symbols[:16]),1)}ms/stock)")
 
         # ── STEP 2: ALL SENTIMENT (MANDATORY — 5 sources) ──
         sentiments = {}
@@ -2055,7 +2109,7 @@ async def full_scan():
             timings['_market'] = int((time.time() - t0) * 1000)
             return results, timings
         t_step = time.time()
-        sent_raw, sent_timings = await asyncio.to_thread(_read_all_sentiment, held[:10])
+        sent_raw, sent_timings = await asyncio.to_thread(_read_all_sentiment, scan_symbols[:16])
         sent_total = int((time.time() - t_step) * 1000)
         trump_info = sent_raw.pop('_trump', {})
         trump_score = trump_info.get('score', 0)
@@ -2103,7 +2157,7 @@ async def full_scan():
                 timings[sym] = int((time.time() - t0) * 1000)
             return results, timings
         t_step = time.time()
-        confidence_results, conf_timings = await asyncio.to_thread(_run_confidence, held[:10], tv_data, sentiments, regime)
+        confidence_results, conf_timings = await asyncio.to_thread(_run_confidence, scan_symbols[:16], tv_data, sentiments, regime)
         conf_total = int((time.time() - t_step) * 1000)
         perf['confidence'] = {'total_ms': conf_total, 'stocks': len(confidence_results), 'per_stock': conf_timings}
         log.info(f"  📊 Confidence: {len(confidence_results)} scored in {conf_total}ms")
@@ -2118,7 +2172,7 @@ async def full_scan():
         learning_digest = ""
         if pg:
             try:
-                learning_digest = pg.get_learning_digest_for_ai(held[:10])
+                learning_digest = pg.get_learning_digest_for_ai(scan_symbols[:16])
             except:
                 pass
         perf['learning'] = {'total_ms': int((time.time() - t_step) * 1000), 'digest_len': len(learning_digest)}
@@ -3238,6 +3292,79 @@ async def before_learning():
     await asyncio.sleep(300)
 
 
+@tasks.loop(minutes=30)
+async def outcome_grader():
+    """Every 30 min: Grade past trade decisions — did we make the right call?
+    This is what makes the bot ACTUALLY learn. Without this, learning is fake."""
+    try:
+        pg = _get_pg()
+        if not pg:
+            return
+
+        # Grade trade_decisions: check current price vs price_at_decision
+        ungraded = pg._exec(
+            """SELECT id, symbol, action, price_at_decision, created_at
+               FROM trade_decisions
+               WHERE was_correct IS NULL AND price_at_decision IS NOT NULL
+                 AND created_at < NOW() - interval '1 hour'
+                 AND created_at > NOW() - interval '24 hours'
+               LIMIT 30""",
+            fetch=True
+        ) or []
+
+        if not ungraded:
+            return
+
+        # Get current prices for all ungraded symbols
+        symbols = list(set(d['symbol'] for d in ungraded))
+        current_prices = {}
+        try:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockSnapshotRequest
+            dc = StockHistoricalDataClient(os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'))
+            snaps = dc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbols[:20], feed='iex'))
+            for sym, s in snaps.items():
+                current_prices[sym] = float(s.latest_trade.price)
+        except:
+            return
+
+        graded = 0
+        for d in ungraded:
+            sym = d['symbol']
+            if sym not in current_prices:
+                continue
+            now_price = current_prices[sym]
+            then_price = d['price_at_decision']
+            if not then_price or then_price <= 0:
+                continue
+
+            hours_ago = (datetime.now(timezone.utc) - d['created_at'].replace(tzinfo=timezone.utc)).total_seconds() / 3600
+
+            # Determine the right column
+            if hours_ago >= 4:
+                pg.update_decision_outcome(d['id'], now_price, hours=4)
+            else:
+                pg.update_decision_outcome(d['id'], now_price, hours=1)
+            graded += 1
+
+        if graded > 0:
+            log.info(f"  📝 Outcome grader: graded {graded} decisions")
+            # Log accuracy stats
+            accuracy = pg.get_decision_accuracy(7)
+            for action, stats in accuracy.items():
+                total = stats.get('total', 0)
+                correct = stats.get('correct', 0)
+                if total > 0:
+                    log.info(f"     {action}: {correct}/{total} correct ({correct/total*100:.0f}%)")
+    except Exception as e:
+        log.debug(f"Outcome grader error: {e}")
+
+@outcome_grader.before_loop
+async def before_grader():
+    await bot.wait_until_ready()
+    await asyncio.sleep(600)
+
+
 @tasks.loop(hours=24)
 async def claude_daily_deep_learn():
     """Once per day (3 AM ET): Claude EXTREME deep analysis on all trends.
@@ -3480,6 +3607,9 @@ async def on_ready():
     if not ai_background_learning.is_running():
         ai_background_learning.start()
         log.info("   ✅ AI background learning: every 1 hour (all watchlist stocks)")
+    if not outcome_grader.is_running():
+        outcome_grader.start()
+        log.info("   ✅ Outcome grader: every 30 min (grades past decisions)")
     if not claude_daily_deep_learn.is_running():
         claude_daily_deep_learn.start()
         log.info("   ✅ Claude daily deep learn: once/day at 3 AM ET")
