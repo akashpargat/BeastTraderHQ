@@ -42,21 +42,31 @@ AZURE_API_VERSION = '2024-10-21'
 CLAUDE_URL = os.getenv('AI_API_URL', 'https://ai.beast-trader.com')
 CLAUDE_API_KEY = os.getenv('AI_API_KEY', 'beast-v3-sk-7f3a9e2b4d1c8f5e6a0b3d9c')
 
-# ── Rate limiting — prevent 429 errors ──
-_ai_last_call = 0  # timestamp of last GPT-4o call
+# ── Rate limiting + AI health tracking ──
+_ai_last_call = 0
 _ai_lock = threading.Lock()
-AI_MIN_INTERVAL = 3  # minimum seconds between GPT-4o calls
+_ai_stats = {
+    'gpt_calls': 0, 'gpt_success': 0, 'gpt_errors': 0, 'gpt_429s': 0,
+    'gpt_total_ms': 0, 'gpt_last_error': '', 'gpt_last_success': '',
+    'claude_calls': 0, 'claude_success': 0, 'claude_errors': 0,
+    'claude_total_ms': 0, 'claude_last_error': '',
+}
+AI_MIN_INTERVAL = 2  # 2 seconds between calls (300 RPM = 5/sec, but be safe)
 
 def _rate_limit_gpt():
-    """Wait if needed to avoid 429s. 3 second minimum between calls."""
+    """Wait if needed to avoid 429s."""
     global _ai_last_call
     with _ai_lock:
         elapsed = _time.time() - _ai_last_call
         if elapsed < AI_MIN_INTERVAL:
             wait = AI_MIN_INTERVAL - elapsed
-            log.debug(f"AI rate limit: waiting {wait:.1f}s")
+            log.info(f"  [AI RATE] Waiting {wait:.1f}s before GPT call")
             _time.sleep(wait)
         _ai_last_call = _time.time()
+
+def get_ai_stats() -> dict:
+    """Get AI health stats (for dashboard/logging)."""
+    return dict(_ai_stats)
 
 # ── Shared state ──
 _last_deep_briefing = {}  # symbol -> last Claude analysis (for GPT-4o to reference)
@@ -168,56 +178,100 @@ class AIBrain:
         return self._deterministic_fallback(symbol, data)
 
     def analyze_batch(self, stocks_data: dict) -> dict:
-        """BATCH analyze all stocks in ONE API call. 10x faster than per-stock.
-        stocks_data = {symbol: {price, rsi, macd_hist, sentiment, ...}}
-        Returns {symbol: {action, confidence, reasoning}}"""
+        """EXTREME ANALYSIS: All stocks in ONE GPT-5.4 call.
+        Sends EVERY data point: TV, 9 sentiment sources, learning history,
+        earnings, short interest, sector context, macro/Trump, Claude briefing.
+        GPT-5.4 has 300 RPM — we can afford deep prompts."""
         if not stocks_data:
             return {}
         if not self._gpt_available:
-            # Fallback to per-stock
             return {sym: self.analyze_stock(sym, data) for sym, data in stocks_data.items()}
 
         try:
-            # Build compact portfolio summary for ONE prompt
+            # Build EXTREME per-stock data
             lines = []
             for sym, d in stocks_data.items():
                 pnl = d.get('unrealized_pl', d.get('pnl', 0))
                 lines.append(
-                    f"{sym}: ${d.get('price',0):.2f} entry=${d.get('entry',0):.2f} "
-                    f"P&L=${pnl:.2f} RSI={d.get('rsi',50):.0f} MACD={d.get('macd_hist',0):.2f} "
-                    f"VWAP={'above' if d.get('vwap_above') else 'below'} Conf={d.get('confluence',5)}/10 "
-                    f"Sent={d.get('sentiment',0):+d} EngScore={d.get('confidence_engine',50)}% "
-                    f"Signal={d.get('signal','?')} {d.get('learning_context','')}"
+                    f"\n--- {sym} ---\n"
+                    f"  Price: ${d.get('price',0):.2f} | Entry: ${d.get('entry',0):.2f} | P&L: ${pnl:.2f}\n"
+                    f"  TECHNICALS: RSI={d.get('rsi',50):.0f} MACD={d.get('macd_hist',0):.3f} "
+                    f"VWAP={'ABOVE' if d.get('vwap_above') else 'BELOW'} "
+                    f"EMA9={d.get('ema_9',0):.1f} EMA21={d.get('ema_21',0):.1f} "
+                    f"Confluence={d.get('confluence',5)}/10 Vol={d.get('volume_ratio',1):.1f}x\n"
+                    f"  SENTIMENT: Total={d.get('sentiment',0):+d} Yahoo={d.get('yahoo_score',0)} "
+                    f"Reddit={d.get('reddit_score',0)} Analyst={d.get('analyst_score',0)} "
+                    f"StockTwits={d.get('stocktwits_score',0)} Trump={d.get('trump_score',0)}\n"
+                    f"  ENGINE: Score={d.get('confidence_engine',50)}% Strategy={d.get('signal','?')}\n"
+                    f"  LEARNING: {d.get('learning_context','No history')}"
                 )
 
+            # Claude deep analysis references
             deep_refs = []
             for sym in stocks_data:
                 if sym in _last_deep_briefing:
                     b = _last_deep_briefing[sym]
-                    deep_refs.append(f"{sym}: {b.get('action','?')} ({b.get('confidence',0)}%) — {str(b.get('reasoning',''))[:60]}")
+                    deep_refs.append(f"  {sym}: {b.get('action','?')} ({b.get('confidence',0)}%) - {str(b.get('reasoning',''))[:80]}")
 
-            user_msg = f"""Analyze ALL these positions for day trading. Regime: {list(stocks_data.values())[0].get('regime','?')}
+            # Portfolio-wide learning
+            portfolio_learn = list(stocks_data.values())[0].get('portfolio_learning', '') if stocks_data else ''
 
-PORTFOLIO:
-{chr(10).join(lines)}
+            regime = list(stocks_data.values())[0].get('regime', '?') if stocks_data else '?'
+            trump = list(stocks_data.values())[0].get('trump_score', 0) if stocks_data else 0
 
-{'LAST CLAUDE DEEP ANALYSIS:' + chr(10) + chr(10).join(deep_refs) if deep_refs else ''}
+            user_msg = f"""EXTREME ANALYSIS — Analyze ALL positions for day trading decisions.
 
-For EACH stock, respond with a JSON object:
+MARKET CONTEXT:
+  Regime: {regime} | Trump/Tariff Score: {trump:+d} | VIX: {list(stocks_data.values())[0].get('vix', 18) if stocks_data else 18}
+
+PORTFOLIO ({len(stocks_data)} positions):
+{''.join(lines)}
+
+{'CLAUDE DEEP ANALYSIS (30-min institutional scan):' + chr(10) + chr(10).join(deep_refs) if deep_refs else 'No Claude analysis available yet.'}
+
+{'STRATEGY PERFORMANCE (from learning DB):' + chr(10) + portfolio_learn if portfolio_learn else ''}
+
+INSTRUCTIONS:
+For EACH stock, provide an EXTREME analysis. Consider:
+1. TECHNICAL SETUP: Is RSI overbought/oversold? MACD momentum direction? Above/below VWAP?
+2. SENTIMENT: What are Reddit, Yahoo, analysts, StockTwits saying? Is there a catalyst?
+3. RISK: How much are we down? Is this a blue chip that recovers or a speculative play?
+4. SECTOR: Is the sector rotating in or out? Macro headwinds?
+5. LEARNING: What happened LAST TIME we traded this stock? Did we win or lose?
+6. EARNINGS: Is earnings coming? Did it just report? How did it react?
+7. TRUMP/TARIFF: Is this stock affected by geopolitical risk?
+8. MOMENTUM: Is price trending up, down, or sideways? Volume confirming?
+9. CONVICTION: How sure are you? USE THE FULL RANGE 30-100.
+
+Respond with JSON:
 {{"results": {{
-  "SYMBOL": {{"action": "BUY/SELL/HOLD/ADD_MORE", "confidence": 30-100, "reasoning": "why in 30 words"}},
+  "SYMBOL": {{
+    "action": "BUY/SELL/HOLD/ADD_MORE",
+    "confidence": 30-100,
+    "reasoning": "2-3 sentences with specific numbers from the data",
+    "target_price": 0.00,
+    "stop_price": 0.00,
+    "risk_level": "LOW/MEDIUM/HIGH",
+    "urgency": "IMMEDIATE/WAIT/NO_RUSH",
+    "key_signal": "the single most important factor driving this decision"
+  }},
   ...
 }}}}
 
-IMPORTANT RULES:
-- confidence MUST be between 30-100. NEVER return 0. If unsure, use 40-50.
-- 30-49 = low conviction. 50-69 = moderate. 70-84 = high. 85-100 = very high.
-- RSI>70=overbought consider SELL, RSI<30=oversold consider BUY
-- Winners running +3%+ with momentum = ADD_MORE or HOLD with high confidence
-- Losers -5%+ with bad sentiment = SELL
-- Be AGGRESSIVE on winners. Be DECISIVE. Every stock gets a real analysis."""
+RULES:
+- confidence MUST be 30-100. NEVER 0. Use full range.
+- RSI>75 without catalyst = SELL. RSI<30 with support = BUY.
+- Winners +3%+ with momentum and volume = ADD_MORE with high confidence.
+- Losers -5%+ with bad sentiment and no catalyst = SELL.
+- Blue chips (AAPL,MSFT,GOOGL,AMZN,META,NVDA,TSLA) at loss = HOLD, they recover.
+- If learning says we lose on this stock = lower confidence, smaller size.
+- Be AGGRESSIVE. Be SPECIFIC. Every stock gets a real verdict with real numbers."""
 
             _rate_limit_gpt()
+            t0 = _time.time()
+            _ai_stats['gpt_calls'] += 1
+            log.info(f"  [AI GPT-5.4] BATCH call starting — {len(stocks_data)} stocks, model={AZURE_DEPLOYMENT}")
+            
             response = self._azure_client.chat.completions.create(
                 model=AZURE_DEPLOYMENT,
                 messages=[
@@ -225,26 +279,54 @@ IMPORTANT RULES:
                     {"role": "user", "content": user_msg}
                 ],
                 temperature=0.3,
-                max_tokens=1200,
+                max_tokens=2000,
                 response_format={"type": "json_object"},
             )
+            
+            elapsed_ms = int((_time.time() - t0) * 1000)
+            _ai_stats['gpt_success'] += 1
+            _ai_stats['gpt_total_ms'] += elapsed_ms
+            _ai_stats['gpt_last_success'] = _time.strftime('%H:%M:%S')
+            
+            # Token usage tracking
+            usage = response.usage if hasattr(response, 'usage') and response.usage else None
+            tokens_in = usage.prompt_tokens if usage else 0
+            tokens_out = usage.completion_tokens if usage else 0
+            log.info(f"  [AI GPT-5.4] BATCH complete — {elapsed_ms}ms | tokens: {tokens_in} in + {tokens_out} out = {tokens_in+tokens_out} total")
 
             result = json.loads(response.choices[0].message.content)
             verdicts = result.get('results', result)
 
-            # Normalize output
+            # Normalize + log each verdict
             for sym in list(verdicts.keys()):
                 if isinstance(verdicts[sym], dict):
-                    verdicts[sym]['ai_source'] = 'Azure GPT-4o'
+                    verdicts[sym]['ai_source'] = f'Azure {AZURE_DEPLOYMENT}'
                     verdicts[sym]['scan_type'] = '5min_batch'
+                    verdicts[sym]['response_ms'] = elapsed_ms
+                    verdicts[sym]['tokens_used'] = tokens_in + tokens_out
+                    action = verdicts[sym].get('action', '?')
+                    conf = verdicts[sym].get('confidence', 0)
+                    key_sig = str(verdicts[sym].get('key_signal', ''))[:40]
+                    log.info(f"    {sym}: {action} ({conf}%) — {key_sig}")
                 else:
                     del verdicts[sym]
 
-            log.info(f"GPT-4o BATCH: {len(verdicts)} stocks in 1 call")
+            avg_ms = _ai_stats['gpt_total_ms'] // max(_ai_stats['gpt_success'], 1)
+            log.info(f"  [AI STATS] GPT calls: {_ai_stats['gpt_success']}/{_ai_stats['gpt_calls']} ok | "
+                     f"429s: {_ai_stats['gpt_429s']} | avg: {avg_ms}ms | this: {elapsed_ms}ms")
             return verdicts
 
         except Exception as e:
-            log.warning(f"GPT-4o batch failed: {e} — falling back to per-stock")
+            elapsed_ms = int((_time.time() - t0) * 1000) if 't0' in dir() else 0
+            _ai_stats['gpt_errors'] += 1
+            _ai_stats['gpt_last_error'] = f"{e}"[:100]
+            if '429' in str(e):
+                _ai_stats['gpt_429s'] += 1
+                log.warning(f"  [AI GPT-5.4] 429 RATE LIMITED after {elapsed_ms}ms — "
+                            f"total 429s: {_ai_stats['gpt_429s']}/{_ai_stats['gpt_calls']} calls")
+            else:
+                log.warning(f"  [AI GPT-5.4] BATCH FAILED after {elapsed_ms}ms — {e}")
+            log.warning(f"  [AI GPT-5.4] Falling back to per-stock for top 5")
             return {sym: self.analyze_stock(sym, data) for sym, data in list(stocks_data.items())[:5]}
 
     def deep_analysis(self, symbol: str, data: dict) -> dict:
@@ -259,52 +341,56 @@ IMPORTANT RULES:
         return self._deterministic_fallback(symbol, data)
 
     def _gpt4o_analyze(self, symbol: str, data: dict) -> dict:
-        """Azure GPT-4o: fast but thorough analysis."""
+        """GPT-5.4: EXTREME per-stock analysis with all data sources."""
         try:
-            # Include last Claude deep briefing if available
             deep_ref = ""
             if symbol in _last_deep_briefing:
                 brief = _last_deep_briefing[symbol]
-                deep_ref = f"\n\nLAST CLAUDE DEEP ANALYSIS (30-min ago):\n{json.dumps(brief, indent=2)[:800]}\nFactor this into your analysis — it's from a deeper scan."
+                deep_ref = f"\n\nCLAUDE DEEP ANALYSIS (institutional scan):\n{json.dumps(brief, indent=2)[:800]}"
 
-            user_msg = f"""Analyze {symbol} for day trading. Use TradingView data as PRIMARY signal.
+            user_msg = f"""EXTREME ANALYSIS for {symbol}. Use ALL data below.
 
-TRADINGVIEW INDICATORS:
-- RSI: {data.get('rsi', 'N/A')}
-- MACD Histogram: {data.get('macd_hist', 'N/A')}
-- VWAP: {'ABOVE (institutional buying)' if data.get('vwap_above') else 'BELOW (institutional selling)'}
-- Bollinger Band: {data.get('bb_position', 'N/A')}
-- EMA 9/21: {data.get('ema_9', 'N/A')} / {data.get('ema_21', 'N/A')}
-- Volume Ratio: {data.get('volume_ratio', 'N/A')}x vs average
-- Confluence: {data.get('confluence', 'N/A')}/10
+TRADINGVIEW INDICATORS (LIVE):
+  RSI: {data.get('rsi', 'N/A')} | MACD Histogram: {data.get('macd_hist', 'N/A')}
+  VWAP: {'ABOVE - institutional buying' if data.get('vwap_above') else 'BELOW - institutional selling'}
+  Bollinger Band: {data.get('bb_position', 'N/A')} | Volume: {data.get('volume_ratio', 'N/A')}x avg
+  EMA 9/21: {data.get('ema_9', 'N/A')} / {data.get('ema_21', 'N/A')}
+  Confluence Score: {data.get('confluence', 'N/A')}/10
 
 POSITION:
-- Current Price: ${data.get('price', 0):.2f}
-- Entry Price: ${data.get('entry', 0):.2f}
-- P&L: ${data.get('unrealized_pl', data.get('pnl', 0)):.2f}
-- Shares: {data.get('qty', 0)}
-- Holding: {data.get('holding', False)}
+  Price: ${data.get('price', 0):.2f} | Entry: ${data.get('entry', 0):.2f}
+  P&L: ${data.get('unrealized_pl', data.get('pnl', 0)):.2f} | Shares: {data.get('qty', 0)}
+  Day Change: {data.get('day_change_pct', 0):+.1f}%
 
-SENTIMENT (5 sources):
-- Yahoo News: {data.get('yahoo_score', 'N/A')}/5
-- Reddit WSB: {data.get('reddit_score', 'N/A')}/5
-- Wall St Analysts: {data.get('analyst_score', 'N/A')}/5
-- Trump/Tariff Risk: {data.get('trump_score', 'N/A')}/5
-- Overall Sentiment: {data.get('sentiment', 'N/A')}
+SENTIMENT (9 SOURCES):
+  Yahoo News: {data.get('yahoo_score', 0)}/5 | Reddit WSB: {data.get('reddit_score', 0)}/5
+  Wall St Analysts: {data.get('analyst_score', 0)}/5 | StockTwits: {data.get('stocktwits_score', 0)}/5
+  Trump/Tariff Risk: {data.get('trump_score', 0):+d} | Overall: {data.get('sentiment', 0):+d}
 
 CONFIDENCE ENGINE:
-- Engine Score: {data.get('confidence_engine', 'N/A')}%
-- Best Strategy: {data.get('best_strategy', 'N/A')}
-- Signal: {data.get('signal', 'N/A')}
+  Score: {data.get('confidence_engine', 'N/A')}% | Best Strategy: {data.get('best_strategy', 'N/A')}
+  Signal: {data.get('signal', 'N/A')}
 
-MARKET:
-- Regime: {data.get('regime', 'N/A')}
-- Sector: {data.get('sector', 'N/A')}
+MARKET: Regime={data.get('regime', 'N/A')} | Sector={data.get('sector', 'N/A')}
+
+LEARNING HISTORY: {data.get('learning_context', 'No prior trades')}
+PORTFOLIO CONTEXT: {data.get('portfolio_learning', '')[:300]}
 {deep_ref}
 
-Give me your COMPLETE TradingView analysis and trading verdict. Be specific with numbers."""
+Give your EXTREME analysis:
+1. What do the technicals say? (RSI trend, MACD direction, VWAP position)
+2. What does sentiment say? (bullish/bearish consensus across sources)
+3. What does our trading history say? (past wins/losses on this stock)
+4. What's the risk? (earnings, sector rotation, macro headwinds)
+5. FINAL VERDICT with specific target and stop prices.
+
+Respond with JSON. confidence MUST be 30-100, never 0."""
 
             _rate_limit_gpt()
+            t0 = _time.time()
+            _ai_stats['gpt_calls'] += 1
+            log.info(f"  [AI GPT-5.4] Per-stock {symbol} — calling model={AZURE_DEPLOYMENT}")
+            
             response = self._azure_client.chat.completions.create(
                 model=AZURE_DEPLOYMENT,
                 messages=[
@@ -312,19 +398,40 @@ Give me your COMPLETE TradingView analysis and trading verdict. Be specific with
                     {"role": "user", "content": user_msg}
                 ],
                 temperature=0.3,
-                max_tokens=600,
+                max_tokens=800,
                 response_format={"type": "json_object"},
             )
+            
+            elapsed_ms = int((_time.time() - t0) * 1000)
+            _ai_stats['gpt_success'] += 1
+            _ai_stats['gpt_total_ms'] += elapsed_ms
+            _ai_stats['gpt_last_success'] = _time.strftime('%H:%M:%S')
+            
+            usage = response.usage if hasattr(response, 'usage') and response.usage else None
+            tokens_in = usage.prompt_tokens if usage else 0
+            tokens_out = usage.completion_tokens if usage else 0
 
             result = json.loads(response.choices[0].message.content)
-            result['ai_source'] = 'Azure GPT-4o'
+            result['ai_source'] = f'Azure {AZURE_DEPLOYMENT}'
             result['scan_type'] = '5min'
-            log.info(f"GPT-4o {symbol}: {result.get('action')} ({result.get('confidence')}%)")
+            result['response_ms'] = elapsed_ms
+            result['tokens_used'] = tokens_in + tokens_out
+            log.info(f"  [AI GPT-5.4] {symbol}: {result.get('action')} ({result.get('confidence')}%) "
+                     f"[{elapsed_ms}ms, {tokens_in+tokens_out} tokens] — {str(result.get('key_signal',''))[:50]}")
             return result
 
         except Exception as e:
-            log.warning(f"GPT-4o failed for {symbol}: {e}")
+            elapsed_ms = int((_time.time() - t0) * 1000) if 't0' in dir() else 0
+            _ai_stats['gpt_errors'] += 1
+            _ai_stats['gpt_last_error'] = f"{symbol}: {e}"[:100]
+            if '429' in str(e):
+                _ai_stats['gpt_429s'] += 1
+                log.warning(f"  [AI GPT-5.4] 429 RATE LIMITED on {symbol} [{elapsed_ms}ms] — "
+                            f"429s today: {_ai_stats['gpt_429s']}")
+            else:
+                log.warning(f"  [AI GPT-5.4] FAILED on {symbol} [{elapsed_ms}ms] — {e}")
             if self._claude_available:
+                log.info(f"  [AI] Falling back to Claude quick for {symbol}")
                 return self._claude_quick(symbol, data)
             return self._deterministic_fallback(symbol, data)
 
