@@ -204,13 +204,17 @@ PORTFOLIO:
 
 For EACH stock, respond with a JSON object:
 {{"results": {{
-  "SYMBOL": {{"action": "BUY/SELL/HOLD", "confidence": 0-100, "reasoning": "why in 30 words"}},
+  "SYMBOL": {{"action": "BUY/SELL/HOLD/ADD_MORE", "confidence": 30-100, "reasoning": "why in 30 words"}},
   ...
 }}}}
 
-Rules: RSI>70=overbought consider SELL, RSI<30=oversold consider BUY, 
-winners running +3%+ with momentum=BUY MORE/HOLD, losers -5%+ with bad sentiment=SELL.
-Be AGGRESSIVE on winners. Be DECISIVE — no wishy-washy 50% holds."""
+IMPORTANT RULES:
+- confidence MUST be between 30-100. NEVER return 0. If unsure, use 40-50.
+- 30-49 = low conviction. 50-69 = moderate. 70-84 = high. 85-100 = very high.
+- RSI>70=overbought consider SELL, RSI<30=oversold consider BUY
+- Winners running +3%+ with momentum = ADD_MORE or HOLD with high confidence
+- Losers -5%+ with bad sentiment = SELL
+- Be AGGRESSIVE on winners. Be DECISIVE. Every stock gets a real analysis."""
 
             _rate_limit_gpt()
             response = self._azure_client.chat.completions.create(
@@ -227,17 +231,12 @@ Be AGGRESSIVE on winners. Be DECISIVE — no wishy-washy 50% holds."""
             result = json.loads(response.choices[0].message.content)
             verdicts = result.get('results', result)
 
-            # Normalize output — fix 0% confidence (GPT sometimes returns 0 for HOLD)
+            # Normalize output
             for sym in list(verdicts.keys()):
                 if isinstance(verdicts[sym], dict):
                     verdicts[sym]['ai_source'] = 'Azure GPT-4o'
                     verdicts[sym]['scan_type'] = '5min_batch'
-                    # GPT-4o sometimes returns 0% for HOLD — set minimum 30%
-                    conf = verdicts[sym].get('confidence', 0)
-                    if isinstance(conf, (int, float)) and conf == 0:
-                        verdicts[sym]['confidence'] = 40  # Minimum meaningful confidence
                 else:
-                    # Bad format — remove
                     del verdicts[sym]
 
             log.info(f"GPT-4o BATCH: {len(verdicts)} stocks in 1 call")
