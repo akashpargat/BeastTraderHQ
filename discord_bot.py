@@ -2849,7 +2849,155 @@ async def before_runner():
 @claude_deep_scan.before_loop
 async def before_claude():
     await bot.wait_until_ready()
-    await asyncio.sleep(120)  # Wait 2 min — let first full_scan run first
+    await asyncio.sleep(120)
+
+
+@tasks.loop(hours=1)
+async def ai_background_learning():
+    """Every hour: AI analyzes historical patterns and stores insights.
+    Uses yfinance for 90-day history, GPT-4o for pattern analysis.
+    Runs in background — doesn't block trading."""
+    try:
+        pg = _get_pg()
+        if not pg:
+            return
+
+        # Get ALL stocks: watchlist + any we've ever traded + any AI has analyzed
+        watchlist = set(pg.get_watchlist())
+        # Add stocks from orders table
+        traded = pg._exec("SELECT DISTINCT symbol FROM orders WHERE symbol IS NOT NULL", fetch=True)
+        for r in (traded or []):
+            watchlist.add(r['symbol'])
+        # Add stocks from AI verdicts
+        analyzed = pg._exec("SELECT DISTINCT symbol FROM ai_verdicts WHERE symbol IS NOT NULL", fetch=True)
+        for r in (analyzed or []):
+            watchlist.add(r['symbol'])
+        # Add stocks from position snapshots
+        held = pg._exec("SELECT DISTINCT symbol FROM position_snapshots WHERE symbol IS NOT NULL", fetch=True)
+        for r in (held or []):
+            watchlist.add(r['symbol'])
+
+        all_stocks = sorted(list(watchlist))
+        if not all_stocks:
+            return
+
+        # Process 20 stocks per hour (rotates through entire list over ~10 hours)
+        _learn_cycle = getattr(ai_background_learning, '_cycle', 0)
+        batch_size = 20
+        start = (_learn_cycle * batch_size) % len(all_stocks)
+        batch = all_stocks[start:start + batch_size]
+        ai_background_learning._cycle = _learn_cycle + 1
+
+        log.info(f"  🧠 Background learning: batch {_learn_cycle+1} — {len(batch)}/{len(all_stocks)} stocks (starting at {batch[0]})")
+
+        def _learn_batch():
+            import yfinance as yf
+            for sym in batch:
+                try:
+                    stock = yf.Ticker(sym)
+                    
+                    # 1. EARNINGS PATTERN: How does this stock react to earnings?
+                    try:
+                        hist = stock.history(period='1y')
+                        cal = stock.calendar
+                        earnings_hist = stock.earnings_history
+                        if earnings_hist is not None and len(earnings_hist) > 0:
+                            for _, row in earnings_hist.iterrows():
+                                try:
+                                    eps_actual = row.get('epsActual', 0)
+                                    eps_estimate = row.get('epsEstimate', 0)
+                                    surprise = eps_actual - eps_estimate if eps_actual and eps_estimate else 0
+                                    beat = 'beat' if surprise > 0 else ('miss' if surprise < 0 else 'inline')
+                                    # Get price around earnings date
+                                    earn_date = row.name if hasattr(row, 'name') else None
+                                    if earn_date and not hist.empty:
+                                        try:
+                                            idx = hist.index.get_indexer([earn_date], method='nearest')[0]
+                                            if 0 < idx < len(hist) - 1:
+                                                pre = float(hist.iloc[idx-1]['Close'])
+                                                post = float(hist.iloc[idx+1]['Close'])
+                                                gap = (post - pre) / pre * 100
+                                                pg.learn_earnings_pattern(sym, str(earn_date)[:10],
+                                                                         pre, post, beat, gap)
+                                        except:
+                                            pass
+                                except:
+                                    pass
+                    except:
+                        pass
+
+                    # 2. PRICE BEHAVIOR: Support/resistance, avg daily range
+                    try:
+                        hist_90d = stock.history(period='3mo')
+                        if not hist_90d.empty and len(hist_90d) > 20:
+                            closes = [float(c) for c in hist_90d['Close']]
+                            highs = [float(h) for h in hist_90d['High']]
+                            lows = [float(l) for l in hist_90d['Low']]
+                            avg_range = sum(h - l for h, l in zip(highs, lows)) / len(highs)
+                            avg_range_pct = avg_range / (sum(closes) / len(closes)) * 100
+                            support = min(lows[-20:])
+                            resistance = max(highs[-20:])
+                            
+                            pg.save_trend(sym, 'price_behavior',
+                                f"90d avg daily range: {avg_range_pct:.1f}%. Support: ${support:.2f}, Resistance: ${resistance:.2f}",
+                                confidence=70,
+                                data={'avg_range_pct': round(avg_range_pct, 1), 
+                                      'support': round(support, 2),
+                                      'resistance': round(resistance, 2),
+                                      'current': closes[-1] if closes else 0})
+                    except:
+                        pass
+
+                    # 3. Get earnings pattern summary and store as trend
+                    try:
+                        pattern = pg.get_earnings_pattern(sym)
+                        if pattern.get('known') and pattern.get('samples', 0) >= 2:
+                            pg.save_trend(sym, 'earnings_pattern',
+                                f"{pattern['tendency']}: avg {pattern['avg_gap_pct']:+.1f}% gap. {pattern['play']}",
+                                confidence=min(90, 50 + pattern['samples'] * 10),
+                                data=pattern)
+                    except:
+                        pass
+
+                    # 4. Ask GPT-4o for deeper insight (if available)
+                    try:
+                        info = stock.info
+                        sector = info.get('sector', '?')
+                        market_cap = info.get('marketCap', 0)
+                        pe = info.get('trailingPE', 0)
+                        
+                        if brain and brain._gpt_available and market_cap and market_cap > 1e9:
+                            data = {
+                                'symbol': sym, 'sector': sector,
+                                'market_cap_b': round(market_cap / 1e9, 1),
+                                'pe_ratio': round(pe, 1) if pe else '?',
+                                'avg_daily_range_pct': round(avg_range_pct, 1) if 'avg_range_pct' in dir() else '?',
+                            }
+                            result = brain.analyze_stock(sym, data)
+                            if result and result.get('reasoning'):
+                                pg.save_trend(sym, 'ai_analysis',
+                                    result.get('reasoning', '')[:500],
+                                    confidence=result.get('confidence', 50),
+                                    data={'action': result.get('action'), 'source': 'background_learning'})
+                    except:
+                        pass
+
+                except Exception as e:
+                    log.debug(f"Background learn {sym}: {e}")
+
+        await asyncio.to_thread(_learn_batch)
+        pg.log_activity('LEARNING', category='ai', reason=f"Analyzed {len(batch)} stocks: {', '.join(batch)}", source='hourly')
+        log.info(f"  🧠 Background learning complete: {len(batch)} stocks analyzed")
+
+    except Exception as e:
+        log.error(f"Background learning error: {e}")
+
+
+@ai_background_learning.before_loop
+async def before_learning():
+    await bot.wait_until_ready()
+    await asyncio.sleep(300)  # Wait 5 min — let everything else start first
+
 
 @bot.event
 async def on_ready():
@@ -2882,6 +3030,9 @@ async def on_ready():
     if not claude_deep_scan.is_running():
         claude_deep_scan.start()
         log.info("   ✅ Claude deep scan: every 30 min")
+    if not ai_background_learning.is_running():
+        ai_background_learning.start()
+        log.info("   ✅ AI background learning: every 1 hour (all watchlist stocks)")
 
     channel = bot.get_channel(SCAN_CHANNEL_ID)
     if channel:

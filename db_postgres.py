@@ -685,6 +685,122 @@ class BeastDB:
         else:
             return {'trade': False, 'reason': f'{win_rate}% win rate, avg ${avg_pnl:.0f} — SKIP this stock', 'size': 'none'}
 
+    # ══════════════════════════════════════════════
+    #  EARNINGS PATTERN LEARNING
+    # ══════════════════════════════════════════════
+
+    def learn_earnings_pattern(self, symbol: str, earnings_date: str, 
+                                pre_price: float, post_price: float,
+                                beat_or_miss: str, gap_pct: float):
+        """Record how a stock reacted to earnings. Builds historical pattern."""
+        self._exec(
+            """INSERT INTO earnings_patterns 
+               (symbol, earnings_date, pre_price, post_price, beat_or_miss, gap_pct)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
+            (symbol, earnings_date, pre_price, post_price, beat_or_miss, round(gap_pct, 2))
+        )
+
+    def get_earnings_pattern(self, symbol: str) -> dict:
+        """What does this stock typically do after earnings?
+        Returns: avg gap, tendency (dip/pop), best time to buy after."""
+        rows = self._exec(
+            """SELECT gap_pct, beat_or_miss FROM earnings_patterns 
+               WHERE symbol = %s ORDER BY earnings_date DESC LIMIT 8""",
+            (symbol,), fetch=True
+        ) or []
+        if not rows:
+            return {'known': False, 'symbol': symbol}
+        
+        gaps = [r['gap_pct'] for r in rows]
+        dips = sum(1 for g in gaps if g < -2)
+        pops = sum(1 for g in gaps if g > 2)
+        avg_gap = sum(gaps) / len(gaps)
+        
+        if dips > pops:
+            tendency = 'DIPS_AFTER_EARNINGS'
+            play = f'Wait for dip, buy {abs(avg_gap):.0f}% below → scalp +2%'
+        elif pops > dips:
+            tendency = 'POPS_AFTER_EARNINGS'
+            play = f'Buy pre-earnings, ride +{avg_gap:.0f}% gap'
+        else:
+            tendency = 'MIXED'
+            play = 'No clear pattern — skip earnings plays'
+        
+        return {
+            'known': True,
+            'symbol': symbol,
+            'samples': len(rows),
+            'avg_gap_pct': round(avg_gap, 1),
+            'dip_count': dips,
+            'pop_count': pops,
+            'tendency': tendency,
+            'play': play,
+            'last_gaps': gaps[:4],
+        }
+
+    def scan_all_earnings_patterns(self) -> list:
+        """Get earnings patterns for ALL stocks we've tracked."""
+        rows = self._exec(
+            """SELECT symbol, 
+                COUNT(*) as samples,
+                AVG(gap_pct) as avg_gap,
+                SUM(CASE WHEN gap_pct < -2 THEN 1 ELSE 0 END) as dips,
+                SUM(CASE WHEN gap_pct > 2 THEN 1 ELSE 0 END) as pops
+               FROM earnings_patterns
+               GROUP BY symbol
+               HAVING COUNT(*) >= 2
+               ORDER BY ABS(AVG(gap_pct)) DESC""",
+            fetch=True
+        ) or []
+        return rows
+
+    # ══════════════════════════════════════════════
+    #  AI TREND STORAGE (gold mine)
+    # ══════════════════════════════════════════════
+
+    def save_trend(self, symbol, trend_type, insight, confidence=50, data=None):
+        """Store an AI-discovered trend. Types: earnings_pattern, price_behavior,
+        sentiment_correlation, sector_rotation, time_pattern, support_resistance."""
+        # Update if same symbol+type exists, else insert
+        existing = self._exec(
+            "SELECT id FROM ai_trends WHERE symbol = %s AND trend_type = %s AND is_active = TRUE",
+            (symbol, trend_type), fetch=True
+        )
+        if existing:
+            self._exec(
+                """UPDATE ai_trends SET insight = %s, confidence = %s, data = %s, 
+                   updated_at = NOW() WHERE id = %s""",
+                (insight, confidence, json.dumps(data) if data else None, existing[0]['id'])
+            )
+        else:
+            self._exec(
+                """INSERT INTO ai_trends (symbol, trend_type, insight, confidence, data)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (symbol, trend_type, insight, confidence, json.dumps(data) if data else None)
+            )
+
+    def get_trends(self, symbol=None, trend_type=None) -> list:
+        """Get stored AI trends. Filter by symbol and/or type."""
+        sql = "SELECT * FROM ai_trends WHERE is_active = TRUE"
+        params = []
+        if symbol:
+            sql += " AND symbol = %s"
+            params.append(symbol)
+        if trend_type:
+            sql += " AND trend_type = %s"
+            params.append(trend_type)
+        sql += " ORDER BY confidence DESC, updated_at DESC"
+        return self._exec(sql, params, fetch=True) or []
+
+    def get_all_insights_for_stock(self, symbol) -> dict:
+        """Get EVERYTHING we know about a stock — trends + earnings + trade history."""
+        return {
+            'trends': self.get_trends(symbol=symbol),
+            'earnings': self.get_earnings_pattern(symbol),
+            'history': self.get_stock_history(symbol),
+            'should_trade': self.should_trade_stock(symbol),
+        }
+
     def close(self):
         if self.conn:
             try:
