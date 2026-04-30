@@ -1188,7 +1188,7 @@ class BeastDB:
             lambda: bool(self._exec(
                 "SELECT 1 FROM blue_chips WHERE symbol = %s AND is_active = TRUE",
                 (symbol,), fetch=True)),
-            ttl_seconds=600)
+            ttl_seconds=300)
 
     def get_blue_chip_info(self, symbol: str) -> dict:
         """Get blue chip details (tier, max_loss_pct, sector)."""
@@ -1209,7 +1209,7 @@ class BeastDB:
             lambda: set(r['symbol'] for r in (self._exec(
                 "SELECT symbol FROM blue_chips WHERE is_active = TRUE",
                 fetch=True) or [])),
-            ttl_seconds=600)
+            ttl_seconds=300)
 
     def add_blue_chip(self, symbol: str, name: str = '', sector: str = '',
                       tier: int = 2, max_loss_pct: float = -10, notes: str = '',
@@ -1971,7 +1971,7 @@ class BeastDB:
         """Get EVERYTHING the bot has learned about a stock - for AI prompts.
         This is what makes the bot smarter over time. Cached 5 min."""
         cache_key = f"learn_{symbol}"
-        return self.cached_get(cache_key, lambda: self._build_learning_context(symbol), ttl_seconds=300)
+        return self.cached_get(cache_key, lambda: self._build_learning_context(symbol), ttl_seconds=60)
 
     def _build_learning_context(self, symbol: str) -> dict:
         """Build comprehensive learning context from all DB sources."""
