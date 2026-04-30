@@ -1831,6 +1831,71 @@ async def full_scan():
             )
         log.info(f"  AI: {len(ai_verdicts)} analyzed")
 
+        # ══════════════════════════════════════════════════
+        # AUTO-EXECUTE: GPT-4o high-confidence verdicts (≥75%)
+        # Same logic as Claude 30-min but runs every 5 min
+        # ══════════════════════════════════════════════════
+        GPT_AUTO_THRESHOLD = 75
+        if _is_market_hours() and ai_verdicts:
+            active_scalps = sum(1 for p in positions if 0 < _pct(p) < 2.0)
+            held_syms = {p.symbol for p in positions}
+
+            for sym, v in ai_verdicts.items():
+                action = v.get('action', 'HOLD')
+                conf = v.get('confidence', 0)
+                reason = v.get('reasoning', '')[:100]
+
+                if conf < GPT_AUTO_THRESHOLD or action == 'HOLD':
+                    continue
+
+                try:
+                    if action == 'BUY' and sym not in held_syms and active_scalps < MAX_ACTIVE_SCALPS:
+                        pos = next((p for p in positions if p.symbol == sym), None)
+                        price = pos.current_price if pos else 0
+                        if price <= 0:
+                            continue
+                        qty = max(1, int(equity * 0.03 / price))
+                        buy_price = round(price * 1.002, 2)
+                        sent = sentiments.get(sym)
+                        sent_score = sent.total_score if sent else 0
+                        result = gateway.quick_buy(
+                            sym, qty, buy_price,
+                            reason=f"GPT-4o BUY {conf}%: {reason}",
+                            day_change_pct=0, sentiment_score=sent_score
+                        )
+                        if result and result.state.value != 'REJECTED':
+                            _log_trade(f"AI BUY (GPT-4o {conf}%)", sym, qty, buy_price, reason, "5min GPT")
+                            if channel:
+                                await channel.send(
+                                    f"🤖🟢 **GPT-4o AUTO-BUY: {sym}** ({conf}%)\n"
+                                    f"Buy {qty} @ ${buy_price} | {reason}")
+
+                    elif action == 'SELL' and sym in held_syms:
+                        pos = next((p for p in positions if p.symbol == sym), None)
+                        if pos and pos.qty_available and pos.qty_available > 0:
+                            sell_qty = pos.qty_available
+                            sell_price = round(pos.current_price * 0.999, 2)
+                            gateway.place_sell(sym, sell_qty, sell_price,
+                                              reason=f"GPT-4o SELL {conf}%: {reason}",
+                                              entry_price=pos.avg_entry)
+                            _log_trade(f"AI SELL (GPT-4o {conf}%)", sym, sell_qty, sell_price, reason, "5min GPT")
+                            if channel:
+                                await channel.send(
+                                    f"🤖🔴 **GPT-4o AUTO-SELL: {sym}** ({conf}%)\n"
+                                    f"Sell {sell_qty} @ ${sell_price} | {reason}")
+                except Exception as e:
+                    log.warning(f"GPT-4o auto-execute {sym}: {e}")
+
+        # ── Save AI verdicts to PostgreSQL ──
+        pg = _get_pg()
+        if pg:
+            for sym, v in ai_verdicts.items():
+                try:
+                    pg.save_ai_verdict(sym, v.get('action','HOLD'), v.get('confidence',0),
+                                      v.get('reasoning',''), v.get('ai_source','GPT-4o'), '5min')
+                except:
+                    pass
+
         # ── MARKET CONTEXT ──
         market_status = "MARKET" if _is_market_hours() else ("EXTENDED" if _is_extended_hours() else "CLOSED")
 
@@ -2069,6 +2134,106 @@ async def decision_report():
 
     except Exception as e:
         log.error(f"Decision report error: {e}")
+
+
+@tasks.loop(seconds=120)
+async def fast_runner_scan():
+    """Every 2 min: scan for hot movers + past winners running.
+    Finds stocks running >3%, checks sentiment, auto-buys if confidence high.
+    This is the FASTEST money-making loop — catches runners before they're gone."""
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+        if not _is_market_hours():
+            return
+
+        channel = bot.get_channel(SCAN_CHANNEL_ID)
+        positions = gateway.get_positions()
+        held_syms = {p.symbol for p in positions}
+        active_scalps = sum(1 for p in positions if 0 < _pct(p) < 2.0)
+
+        if active_scalps >= MAX_ACTIVE_SCALPS:
+            return
+
+        # Scan past winners + watchlist for runners
+        scan_list = [s for s in (PAST_WINNERS + DIP_BUY_WATCHLIST[:10]) if s not in held_syms]
+        scan_list = list(dict.fromkeys(scan_list))[:15]  # dedupe, max 15
+
+        if not scan_list:
+            return
+
+        def _scan_runners():
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockSnapshotRequest
+            dc = StockHistoricalDataClient(os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'))
+            snaps = dc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=scan_list, feed='iex'))
+            runners = []
+            for sym, s in snaps.items():
+                try:
+                    price = float(s.latest_trade.price)
+                    prev = float(s.previous_daily_bar.close)
+                    pct = (price - prev) / prev * 100
+                    vol = int(s.daily_bar.volume) if s.daily_bar else 0
+                    if pct >= 3.0 and price > 5 and vol > 100000:
+                        runners.append({'symbol': sym, 'price': price, 'pct': pct, 'volume': vol, 'prev': prev})
+                except:
+                    pass
+            return sorted(runners, key=lambda x: -x['pct'])
+
+        runners = await asyncio.to_thread(_scan_runners)
+
+        if not runners:
+            return
+
+        log.info(f"  🏃 Runner scan: {len(runners)} stocks running >3%")
+
+        acct = gateway.get_account()
+        equity = float(acct.get('equity', 100000))
+
+        for r in runners[:3]:  # Max 3 candidates per scan
+            sym = r['symbol']
+            if _prev_prices.get(f"_runner_buy_{sym}"):
+                continue  # Already bought this session
+
+            # Quick sentiment check
+            try:
+                sa = SentimentAnalyst()
+                sent = sa.analyze(sym)
+                sent_score = sent.total_score
+            except:
+                sent_score = 0
+
+            # Rule 29: Don't chase +5% without catalyst (sentiment >= 3)
+            if r['pct'] > 5.0 and sent_score < 3:
+                log.info(f"  🏃 {sym} +{r['pct']:.1f}% but sentiment {sent_score:+d} — skipping (Rule 29)")
+                continue
+
+            # Auto-buy: 2% of portfolio
+            qty = max(1, int(equity * 0.02 / r['price']))
+            buy_price = round(r['price'] * 1.002, 2)
+
+            result = gateway.quick_buy(
+                sym, qty, buy_price,
+                reason=f"Fast runner +{r['pct']:.1f}% vol={r['volume']:,}",
+                day_change_pct=r['pct'], sentiment_score=sent_score
+            )
+
+            if result and result.state.value != 'REJECTED':
+                _prev_prices[f"_runner_buy_{sym}"] = True
+                _log_trade(f"RUNNER BUY (+{r['pct']:.1f}%)", sym, qty, buy_price,
+                           f"Running +{r['pct']:.1f}% with {r['volume']:,} volume, sentiment {sent_score:+d}",
+                           "2min Runner")
+                if channel:
+                    await channel.send(
+                        f"🏃🟢 **RUNNER CAUGHT: {sym}** +{r['pct']:.1f}%\n"
+                        f"Buy {qty} @ ${buy_price} | Vol: {r['volume']:,} | Sent: {sent_score:+d}")
+                log.info(f"  🏃 AUTO-BUY runner {sym} {qty}x @ ${buy_price} (+{r['pct']:.1f}%)")
+            else:
+                log.info(f"  🏃 {sym} blocked: {result.error if result else 'no result'}")
+
+    except Exception as e:
+        log.error(f"Fast runner scan error: {e}")
 
 
 @tasks.loop(minutes=30)
@@ -2456,6 +2621,11 @@ async def before_decision():
     await bot.wait_until_ready()
     await asyncio.sleep(30)
 
+@fast_runner_scan.before_loop
+async def before_runner():
+    await bot.wait_until_ready()
+    await asyncio.sleep(60)  # Wait 1 min — let position_monitor run first
+
 @claude_deep_scan.before_loop
 async def before_claude():
     await bot.wait_until_ready()
@@ -2482,6 +2652,9 @@ async def on_ready():
     if not decision_report.is_running():
         decision_report.start()
         log.info("   ✅ Decision report: every 10 min")
+    if not fast_runner_scan.is_running():
+        fast_runner_scan.start()
+        log.info("   ✅ Fast runner scan: every 2 min")
     if not claude_deep_scan.is_running():
         claude_deep_scan.start()
         log.info("   ✅ Claude deep scan: every 30 min")
@@ -2489,16 +2662,17 @@ async def on_ready():
     channel = bot.get_channel(SCAN_CHANNEL_ID)
     if channel:
         await channel.send(
-            "🦍 **BEAST ENGINE V3 ONLINE**\n"
-            f"• Position monitor: every 60s (auto-scalp/runner/dip-buy)\n"
-            f"• Full scan: every 5 min (TV + sentiment + GPT-4o)\n"
-            f"• Decision report: every 10 min\n"
-            f"• Claude deep scan: every 30 min\n"
+            "🦍 **BEAST TERMINAL V4 ONLINE**\n"
+            f"• 60s: Position monitor (auto-scalp/runner/dip-buy/protect)\n"
+            f"• 2min: Fast runner scan (catch movers, auto-buy)\n"
+            f"• 5min: Full scan (TV + sentiment + GPT-4o + auto-execute)\n"
+            f"• 10min: Decision report (risk + signals)\n"
+            f"• 30min: Claude MEGA-SCAN (ultra-deep + auto-execute)\n"
             f"• AI: {'GPT-4o ✅' if brain and brain._gpt_available else '❌'} + {'Claude ✅' if brain and brain._claude_available else 'Claude ❌'}\n"
             f"• TV: {'Connected ✅' if tv_ok else 'Offline ❌'}\n"
-            f"• Iron Laws: HARDCODED ✅\n"
-            f"• Auto-protect: 3% trailing stops ✅\n"
-            f"• Auto-buy dips: ENABLED (Akash Method)\n"
+            f"• Auto-execute: ≥75% confidence = BUY/SELL\n"
+            f"• Iron Laws: 23 HARDCODED ✅\n"
+            f"• PostgreSQL: {'Connected ✅' if _get_pg() and _get_pg().conn else 'Offline ❌'}\n"
             f"• Pre/post market: ENABLED (4AM-8PM)"
         )
 
