@@ -148,6 +148,17 @@ class AIBrain:
             return self._claude_quick(symbol, data)
         return self._deterministic_fallback(symbol, data)
 
+    def deep_analysis(self, symbol: str, data: dict) -> dict:
+        """30-min ultra deep: Claude Opus preferred, GPT-4o fallback."""
+        if self._claude_available:
+            result = self._claude_deep(symbol, data)
+            if result:
+                _last_deep_briefing[symbol] = result
+            return result
+        elif self._gpt_available:
+            return self._gpt4o_analyze(symbol, data)
+        return self._deterministic_fallback(symbol, data)
+
     def _gpt4o_analyze(self, symbol: str, data: dict) -> dict:
         """Azure GPT-4o: fast but thorough analysis."""
         try:
@@ -310,6 +321,10 @@ Give me your COMPLETE TradingView analysis and trading verdict. Be specific with
 
     def get_last_deep_briefing(self, symbol: str) -> dict:
         """Get the cached Claude deep analysis for a symbol."""
+        return _last_deep_briefing.get(symbol, {})
+
+    def get_cached_analysis(self, symbol: str) -> dict:
+        """Get cached analysis for a symbol (alias for dashboard API)."""
         return _last_deep_briefing.get(symbol, {})
 
     def get_deep_briefing_age_minutes(self) -> int:
