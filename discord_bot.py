@@ -2088,28 +2088,47 @@ async def position_monitor():
                     pass
 
             if _is_trading_hours() and avail > 0:
-                # ── SCALP SELL: +2% → sell, but fundamentals-aware ──
-                # If fundamentals show >20% upside, only scalp 1/3 (keep core for swing)
+                # ── SMART SELL: Check trade_style from learning before scalping ──
                 last_scalp = _prev_prices.get(f"_scalp_t_{p.symbol}", 0)
                 if pct >= 2.0 and time.time() - last_scalp > 900:
-                    # Check fundamentals upside
+                    # What style is this stock? SCALP / SWING / CORE
+                    trade_style = 'SCALP'  # default
                     fund_upside = 0
                     if pg:
                         try:
+                            ts = pg.get_trends(symbol=p.symbol, trend_type='trade_style')
+                            if ts:
+                                trade_style = ts[0].get('data', {}).get('classification', 'SCALP')
                             ft = pg.get_trends(symbol=p.symbol, trend_type='fundamentals')
                             if ft:
                                 fund_upside = ft[0].get('data', {}).get('upside', 0)
                         except:
                             pass
                     
-                    if fund_upside > 20 and avail > 2:
-                        # Strong fundamentals — scalp only 1/3, keep 2/3 as core
+                    if trade_style == 'CORE':
+                        # CORE = don't scalp at all, let it ride with trailing stop
+                        log.info(f"    HOLD: {p.symbol} +{pct:.1f}% — CORE position (fund upside {fund_upside:+.0f}%), no scalp")
+                        _pg_log("CORE_HOLD", symbol=p.symbol,
+                                reason=f"CORE: +{pct:.1f}% but upside {fund_upside:+.0f}% — holding", source="60s")
+                        sell_qty = 0
+                    elif trade_style == 'SWING' and pct < 5:
+                        # SWING = don't scalp until +5% minimum
+                        log.info(f"    HOLD: {p.symbol} +{pct:.1f}% — SWING (wait for +5%, upside {fund_upside:+.0f}%)")
+                        sell_qty = 0
+                    elif trade_style == 'SWING' and pct >= 5:
+                        # SWING at +5%+ — sell 1/3, keep 2/3
                         sell_qty = max(1, avail // 3)
-                        log.info(f"    SMART SCALP: {p.symbol} +{pct:.1f}% — only selling {sell_qty}/{avail} (upside {fund_upside:+.0f}%, keeping core)")
+                        log.info(f"    SWING SELL: {p.symbol} +{pct:.1f}% — selling {sell_qty}/{avail} (swing target hit)")
+                    elif fund_upside > 20 and avail > 2:
+                        # Strong fundamentals — scalp only 1/3
+                        sell_qty = max(1, avail // 3)
+                        log.info(f"    SMART SCALP: {p.symbol} +{pct:.1f}% — selling {sell_qty}/{avail} (upside {fund_upside:+.0f}%)")
                     else:
+                        # SCALP = normal quick flip
                         sell_qty = max(1, avail // 2) if avail > 1 else avail
                     
-                    sell_price = round(p.current_price * 0.999, 2)
+                    if sell_qty > 0:
+                        sell_price = round(p.current_price * 0.999, 2)
                     try:
                         gateway.place_sell(p.symbol, sell_qty, sell_price,
                                           reason=f"Scalp +{pct:.1f}%", entry_price=p.avg_entry)
@@ -3670,6 +3689,75 @@ async def ai_background_learning():
                                 })
                             if score >= 40:
                                 log.info(f"    {sym}: {verdict} score={score} PE={fund.get('forward_pe',0)} Rev={fund.get('revenue_growth_pct',0)}%")
+                    except:
+                        pass
+
+                    # 4.5 SCALP vs SWING CLASSIFICATION
+                    # Uses: daily range, fundamentals upside, our win rate, price pattern
+                    # Stored so the bot knows: "GOOGL = swing, NOK = scalp"
+                    try:
+                        classification = 'SCALP'  # default
+                        reasons = []
+                        
+                        # Get price behavior data we just stored
+                        pb = pg.get_trends(symbol=sym, trend_type='price_behavior')
+                        daily_range = 0
+                        if pb:
+                            daily_range = pb[0].get('data', {}).get('avg_range_pct', 0)
+                        
+                        # Get fundamentals we just stored
+                        ft = pg.get_trends(symbol=sym, trend_type='fundamentals')
+                        fund_upside = 0
+                        fund_score = 0
+                        if ft:
+                            fd = ft[0].get('data', {})
+                            fund_upside = fd.get('upside', 0)
+                            fund_score = fd.get('score', 0)
+                        
+                        # Get our trade history
+                        hist_data = pg.get_stock_history(sym)
+                        win_rate = hist_data.get('win_rate', 50)
+                        avg_hold = hist_data.get('avg_hold_minutes', 0)
+                        
+                        # Classification logic:
+                        # SWING: high upside + strong fundamentals + low daily range (steady climber)
+                        # SCALP: high daily range + quick flip history + low upside
+                        # CORE: mega cap + very strong fundamentals (buy and forget)
+                        
+                        if fund_score >= 60 and fund_upside > 30:
+                            classification = 'CORE'
+                            reasons.append(f"Strong fundamentals (score={fund_score}) + {fund_upside:+.0f}% upside")
+                        elif fund_upside > 15 and daily_range < 3:
+                            classification = 'SWING'
+                            reasons.append(f"Good upside ({fund_upside:+.0f}%) + steady price (range={daily_range:.1f}%)")
+                        elif fund_upside > 15 and fund_score >= 30:
+                            classification = 'SWING'
+                            reasons.append(f"Analyst upside {fund_upside:+.0f}% with decent fundamentals")
+                        elif daily_range > 4:
+                            classification = 'SCALP'
+                            reasons.append(f"High volatility (range={daily_range:.1f}%) — quick flips work")
+                        elif avg_hold > 0 and avg_hold < 60:
+                            classification = 'SCALP'
+                            reasons.append(f"History: avg hold {avg_hold:.0f} min — we scalp this")
+                        elif win_rate > 70 and avg_hold < 120:
+                            classification = 'SCALP'
+                            reasons.append(f"High win rate ({win_rate:.0f}%) with quick holds")
+                        else:
+                            classification = 'SWING' if fund_upside > 5 else 'SCALP'
+                            reasons.append(f"Default: upside={fund_upside:+.0f}% range={daily_range:.1f}%")
+                        
+                        pg.save_trend(sym, 'trade_style',
+                            f"{classification}: {', '.join(reasons)}",
+                            confidence=70,
+                            data={
+                                'classification': classification,
+                                'reasons': reasons,
+                                'daily_range_pct': daily_range,
+                                'fund_upside': fund_upside,
+                                'fund_score': fund_score,
+                                'win_rate': win_rate,
+                                'avg_hold_min': avg_hold,
+                            })
                     except:
                         pass
 
