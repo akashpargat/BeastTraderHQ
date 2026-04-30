@@ -1423,7 +1423,7 @@ _pg_db = None
 _cached_vix = 18.0  # Default neutral VIX
 
 
-def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=0, source="bot"):
+def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=0, source="bot", **kwargs):
     """SMART BUY: TV confirm → VIX size → quick_buy. All buys go through here."""
     # HARD LAW: TV must confirm
     confirmed, tv = _tv_confirm_buy(symbol)
