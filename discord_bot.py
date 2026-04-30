@@ -1601,21 +1601,44 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
     # ══════════════════════════════════════════════
     # GATE 3: ANTI-BUYBACK
     # Won't rebuy higher than we sold — prevents round-trip losses
+    # EXCEPTION: Blue chips with strong sentiment (>= +3) bypass this
+    # because they're runners we want to re-enter (GOOGL lesson)
     # ══════════════════════════════════════════════
+    BLUE_CHIPS_SET = {'AAPL','MSFT','GOOGL','AMZN','META','NVDA','TSLA','JPM','V','MA',
+                      'JNJ','UNH','WMT','PG','HD','DIS','NFLX','ADBE','CRM','ORCL',
+                      'COST','PEP','KO','AVGO','AMD','INTC','MU','QCOM'}
     if pg and pg.check_anti_buyback(symbol, price):
         mem = pg.get_price_memory(symbol)
         sold_at = mem.get('last_sell_price', 0)
         diff = price - sold_at
-        log.info(f"    [G3] BLOCKED: Anti-buyback — sold @${sold_at:.2f}, "
-                 f"now @${price:.2f} (+${diff:.2f} higher)")
-        steps.append(f"G3:BLOCKED sold@{sold_at:.2f} rebuy@{price:.2f}")
-        pg.log_decision(symbol, 'BLOCK', 0,
-            block_reason=f"Anti-buyback: sold @${sold_at:.2f}, now ${price:.2f}",
-            sentiment_data=_sent_data, ai_verdict=_ai_data,
-            signals={'pipeline': steps, 'sold_at': sold_at, 'rebuy_at': price},
-            strategy=source, price_at_decision=price)
-        log.info(f"  {'='*50}\n")
-        return None
+        pct_above = (diff / sold_at * 100) if sold_at > 0 else 0
+        
+        # Blue chip + strong sentiment = let it through (GOOGL running +10% lesson)
+        is_blue = symbol in BLUE_CHIPS_SET
+        has_strong_sent = sentiment_score >= 3
+        
+        if is_blue and has_strong_sent:
+            log.info(f"    [G3] BYPASSED: Anti-buyback overridden — {symbol} is BLUE CHIP "
+                     f"with sentiment {sentiment_score:+d} (sold @${sold_at:.2f}, rebuy @${price:.2f} +{pct_above:.1f}%)")
+            steps.append(f"G3:BYPASS blue_chip sent={sentiment_score}")
+        elif is_blue and pct_above > 5:
+            # Blue chip running >5% above sell — it's a real breakout, let it in
+            log.info(f"    [G3] BYPASSED: Anti-buyback overridden — {symbol} BLUE CHIP "
+                     f"breakout +{pct_above:.1f}% above sell price")
+            steps.append(f"G3:BYPASS blue_chip_breakout +{pct_above:.1f}%")
+        else:
+            log.info(f"    [G3] BLOCKED: Anti-buyback — sold @${sold_at:.2f}, "
+                     f"now @${price:.2f} (+${diff:.2f} / +{pct_above:.1f}% higher) "
+                     f"blue_chip={is_blue} sent={sentiment_score}")
+            steps.append(f"G3:BLOCKED sold@{sold_at:.2f} rebuy@{price:.2f}")
+            pg.log_decision(symbol, 'BLOCK', 0,
+                block_reason=f"Anti-buyback: sold @${sold_at:.2f}, now ${price:.2f} (+{pct_above:.1f}%)",
+                sentiment_data=_sent_data, ai_verdict=_ai_data,
+                signals={'pipeline': steps, 'sold_at': sold_at, 'rebuy_at': price,
+                         'pct_above': pct_above, 'is_blue_chip': is_blue},
+                strategy=source, price_at_decision=price)
+            log.info(f"  {'='*50}\n")
+            return None
     log.info(f"    [G3] PASSED: No anti-buyback issue")
     steps.append("G3:PASS")
 
