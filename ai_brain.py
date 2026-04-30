@@ -279,7 +279,7 @@ RULES:
                     {"role": "user", "content": user_msg}
                 ],
                 temperature=0.3,
-                max_tokens=2000,
+                max_completion_tokens=2000,
                 response_format={"type": "json_object"},
             )
             
@@ -398,7 +398,7 @@ Respond with JSON. confidence MUST be 30-100, never 0."""
                     {"role": "user", "content": user_msg}
                 ],
                 temperature=0.3,
-                max_tokens=800,
+                max_completion_tokens=800,
                 response_format={"type": "json_object"},
             )
             
