@@ -1386,7 +1386,8 @@ def _tv_confirm_buy(symbol: str) -> tuple[bool, dict]:
     Cached for 5 min to avoid re-scanning same stock."""
     # Check cache first
     cached = _tv_cache.get(symbol)
-    if cached and time.time() - cached[0] < 300:
+    _tv_ttl = int(_get_pg().get_config('tv_cache_seconds', 300)) if _get_pg() else 300
+    if cached and time.time() - cached[0] < _tv_ttl:
         return cached[1].get('_confirmed', False), cached[1]
 
     # Get fresh TV data
@@ -2326,7 +2327,8 @@ async def full_scan():
             for sym in syms:
                 # Check 5-min cache — skip if fresh
                 cached = _tv_cache.get(sym)
-                if cached and time.time() - cached[0] < 300:
+                _tv_ttl = int(pg.get_config('tv_cache_seconds', 300)) if pg else 300
+                if cached and time.time() - cached[0] < _tv_ttl:
                     d[sym] = cached[1]
                     timings[sym] = 0
                     skipped += 1

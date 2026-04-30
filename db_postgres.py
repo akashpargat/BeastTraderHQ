@@ -1079,6 +1079,7 @@ class BeastDB:
                 ('tv_min_studies', '5', 'number', 'tv', 'Minimum TV studies to confirm'),
                 ('tv_wait_seconds', '7', 'number', 'tv', 'Seconds to wait for TV data'),
                 ('tv_max_retries', '4', 'number', 'tv', 'Max TV load retries'),
+                ('tv_cache_seconds', '300', 'number', 'tv', 'TV indicator cache TTL (seconds)'),
                 ('scan_interval_fast', '120', 'number', 'timing', 'Fast runner scan interval (seconds)'),
                 ('scan_interval_full', '300', 'number', 'timing', 'Full scan interval (seconds)'),
                 ('scan_interval_claude', '1800', 'number', 'timing', 'Claude deep scan interval (seconds)'),
