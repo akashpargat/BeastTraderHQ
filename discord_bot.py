@@ -1328,26 +1328,23 @@ def _get_tv_indicators(symbol: str) -> dict:
         if not switched:
             log.debug(f"  TV: failed to switch to {symbol}")
             return {}
-        time.sleep(5)  # Wait for chart + indicators to load
+        time.sleep(7)  # Wait for chart + ALL indicators to load (increased from 5)
 
-        # Read study values — retry if only Volume shows up or values look stale
+        # Read study values — retry until we get at least 5 studies (RSI+MACD+VWAP+BB+EMA)
         studies = _tv_client.get_study_values()
-        study_names = [s.get('name', '?') for s in (studies or [])]
-
-        # Staleness check: if we only got Volume or less than 3 studies, wait and retry
         retries = 0
-        while len(studies or []) <= 3 and retries < 2:
+        while len(studies or []) <= 5 and retries < 4:  # 4 retries × 3s = 12s max wait
             retries += 1
             time.sleep(3)
             studies = _tv_client.get_study_values()
-            study_names = [s.get('name', '?') for s in (studies or [])]
-            log.debug(f"  TV {symbol} retry {retries}: {len(studies)} studies")
+            log.debug(f"  TV {symbol} retry {retries}: {len(studies or [])} studies")
 
-        if not studies:
-            log.debug(f"  TV: no study values for {symbol}")
+        if not studies or len(studies) < 3:
+            log.warning(f"  TV {symbol}: only {len(studies or [])} studies after {retries} retries — insufficient")
             return {}
 
-        log.info(f"  TV {symbol} raw studies ({len(studies)}): {study_names}")
+        study_names = [s.get('name', '?') for s in studies]
+        log.info(f"  TV {symbol}: {len(studies)} studies loaded ({retries} retries)")
 
         # Parse via TV analyst
         from tv_analyst import TradingViewAnalyst
