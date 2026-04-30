@@ -1410,7 +1410,7 @@ class BeastDB:
         return self._exec(
             """SELECT symbol, action, confidence, block_reason, price_at_decision,
                       price_after_1h, price_after_4h,
-                      ROUND((price_after_4h - price_at_decision) / price_at_decision * 100, 2) as pct_missed
+                      ROUND(((price_after_4h - price_at_decision) / price_at_decision * 100)::numeric, 2) as pct_missed
                FROM trade_decisions
                WHERE action IN ('SKIP', 'BLOCK') AND was_correct = FALSE
                  AND created_at > NOW() - interval '%s days'
@@ -1873,7 +1873,7 @@ class BeastDB:
             'ai_trends': self.get_trends(symbol=symbol),
             'earnings': self.get_earnings_pattern(symbol),
             'watchlist_stats': self._exec(
-                "SELECT times_traded, total_pnl, first_seen_at, source FROM watchlist WHERE symbol = %s",
+                "SELECT times_traded, total_pnl, last_seen_at, source FROM watchlist WHERE symbol = %s",
                 (symbol,), fetch=True
             ) or [],
         }
