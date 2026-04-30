@@ -1,420 +1,469 @@
 'use client'
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 
 const API = 'https://api.beast-trader.com'
 
+// ── Animated number counter hook ──
+function useCounter(target: number, duration = 1000) {
+  const [value, setValue] = useState(0)
+  const prev = useRef(0)
+  useEffect(() => {
+    if (target === prev.current) return
+    const start = prev.current
+    const diff = target - start
+    const startTime = performance.now()
+    const tick = (now: number) => {
+      const elapsed = now - startTime
+      const progress = Math.min(elapsed / duration, 1)
+      const eased = 1 - Math.pow(1 - progress, 3) // ease-out cubic
+      setValue(start + diff * eased)
+      if (progress < 1) requestAnimationFrame(tick)
+    }
+    requestAnimationFrame(tick)
+    prev.current = target
+  }, [target, duration])
+  return value
+}
+
+// ── Format helpers ──
+const fmt = (n: number) => n?.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) ?? '0.00'
+const fmtInt = (n: number) => Math.round(n)?.toLocaleString('en-US') ?? '0'
+const pct = (n: number) => (n >= 0 ? '+' : '') + n?.toFixed(2) + '%'
+const ago = (ts: string) => {
+  if (!ts) return ''
+  const diff = (Date.now() - new Date(ts).getTime()) / 1000
+  if (diff < 60) return `${Math.round(diff)}s ago`
+  if (diff < 3600) return `${Math.round(diff / 60)}m ago`
+  return `${Math.round(diff / 3600)}h ago`
+}
+
+const ACTION_ICONS: Record<string, string> = {
+  buy: '🎯', sell: '💰', trail_update: '🛡️', stop_loss: '📉',
+  runner: '🏃', scan: '🔍', alert: '⚡', default: '📌',
+}
+const STOCK_COLORS = ['#00aaff', '#9b59b6', '#00ff88', '#ff4444', '#f39c12', '#e74c3c', '#1abc9c', '#3498db']
+
+function stockColor(sym: string) {
+  let hash = 0
+  for (let i = 0; i < (sym?.length || 0); i++) hash = sym.charCodeAt(i) + ((hash << 5) - hash)
+  return STOCK_COLORS[Math.abs(hash) % STOCK_COLORS.length]
+}
+
+// ── Circular progress ring ──
+function Ring({ pct: p, size = 56, stroke = 5 }: { pct: number; size?: number; stroke?: number }) {
+  const r = (size - stroke) / 2
+  const circ = 2 * Math.PI * r
+  const offset = circ - (Math.min(p, 100) / 100) * circ
+  return (
+    <svg width={size} height={size} className="transform -rotate-90">
+      <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth={stroke} />
+      <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="#00ff88" strokeWidth={stroke}
+        strokeDasharray={circ} strokeDashoffset={offset} strokeLinecap="round"
+        style={{ transition: 'stroke-dashoffset 1s ease-out' }} />
+    </svg>
+  )
+}
+
+// ── Fear & Greed gauge ──
+function FearGreedGauge({ value }: { value: number }) {
+  const angle = -90 + (Math.min(Math.max(value, 0), 100) / 100) * 180
+  const color = value < 25 ? '#ff4444' : value < 45 ? '#f39c12' : value < 55 ? '#888' : value < 75 ? '#00aaff' : '#00ff88'
+  const label = value < 25 ? 'Extreme Fear' : value < 45 ? 'Fear' : value < 55 ? 'Neutral' : value < 75 ? 'Greed' : 'Extreme Greed'
+  return (
+    <div className="flex flex-col items-center">
+      <svg width="140" height="80" viewBox="0 0 140 80">
+        <path d="M 15 75 A 55 55 0 0 1 125 75" fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="10" strokeLinecap="round" />
+        <path d="M 15 75 A 55 55 0 0 1 125 75" fill="none" stroke={color} strokeWidth="10" strokeLinecap="round"
+          strokeDasharray="173" strokeDashoffset={173 - (value / 100) * 173}
+          style={{ transition: 'stroke-dashoffset 1.5s ease-out' }} />
+        <line x1="70" y1="75" x2="70" y2="30" stroke={color} strokeWidth="2.5" strokeLinecap="round"
+          transform={`rotate(${angle}, 70, 75)`} style={{ transition: 'transform 1.5s ease-out' }} />
+        <circle cx="70" cy="75" r="4" fill={color} />
+      </svg>
+      <span className="text-2xl font-bold mt-1" style={{ color }}>{Math.round(value)}</span>
+      <span className="text-xs text-gray-400">{label}</span>
+    </div>
+  )
+}
+
+// ── Skeleton loader ──
+function Skeleton({ className = '' }: { className?: string }) {
+  return <div className={`skeleton ${className}`} />
+}
+
+function SkeletonDashboard() {
+  return (
+    <div className="min-h-screen p-6 space-y-6">
+      <Skeleton className="h-48 w-full" />
+      <div className="grid grid-cols-4 gap-4">
+        {[...Array(4)].map((_, i) => <Skeleton key={i} className="h-28" />)}
+      </div>
+      <Skeleton className="h-96 w-full" />
+    </div>
+  )
+}
+
+// ═══════════════════════════════════════════
+//  MAIN DASHBOARD
+// ═══════════════════════════════════════════
 export default function Dashboard() {
   const [portfolio, setPortfolio] = useState<any>(null)
+  const [verdicts, setVerdicts] = useState<any[]>([])
   const [actions, setActions] = useState<any[]>([])
-  const [sentiment, setSentiment] = useState<any>({})
-  const [intraday, setIntraday] = useState<any[]>([])
-  const [system, setSystem] = useState<any>(null)
-  const [aiVerdicts, setAiVerdicts] = useState<any[]>([])
-  const [decisionLog, setDecisionLog] = useState<any[]>([])
-  const [lastUpdate, setLastUpdate] = useState('')
-  const [isRefreshing, setIsRefreshing] = useState(false)
-  const [tick, setTick] = useState(0)
+  const [analytics, setAnalytics] = useState<any>(null)
+  const [tradingStatus, setTradingStatus] = useState<any>(null)
+  const [loading, setLoading] = useState(true)
+  const [expandedRow, setExpandedRow] = useState<string | null>(null)
+  const feedRef = useRef<HTMLDivElement>(null)
 
   const fetchAll = useCallback(async () => {
-    setIsRefreshing(true)
     try {
-      const [pRes, aRes, sRes, iRes, sysRes, aiRes, dlRes] = await Promise.all([
-        fetch(`${API}/api/portfolio`), fetch(`${API}/api/actions?limit=20`),
-        fetch(`${API}/api/sentiment`), fetch(`${API}/api/intraday`),
-        fetch(`${API}/api/system`),
-        fetch(`${API}/api/ai-verdicts`).catch(() => new Response('{"verdicts":[]}')),
-        fetch(`${API}/api/decision-log`).catch(() => new Response('{"decisions":[]}')),
+      const [pRes, vRes, aRes, anRes, tRes] = await Promise.all([
+        fetch(`${API}/api/portfolio`).catch(() => null),
+        fetch(`${API}/api/ai-verdicts`).catch(() => null),
+        fetch(`${API}/api/actions?limit=10`).catch(() => null),
+        fetch(`${API}/api/analytics`).catch(() => null),
+        fetch(`${API}/api/trading-status`).catch(() => null),
       ])
-      setPortfolio(await pRes.json())
-      setActions((await aRes.json()).actions || [])
-      setSentiment(await sRes.json())
-      setIntraday((await iRes.json()).data || [])
-      setSystem(await sysRes.json())
-      const aiData = await aiRes.json(); setAiVerdicts(aiData.verdicts || [])
-      const dlData = await dlRes.json(); setDecisionLog(dlData.decisions || dlData.log || [])
-      setLastUpdate(new Date().toLocaleTimeString())
-      setTick(t => t + 1)
-    } catch (e) { console.error('Fetch failed:', e) }
-    setTimeout(() => setIsRefreshing(false), 600)
+      if (pRes?.ok) setPortfolio(await pRes.json())
+      if (vRes?.ok) { const d = await vRes.json(); setVerdicts(d.verdicts || d || []) }
+      if (aRes?.ok) { const d = await aRes.json(); setActions(d.actions || d || []) }
+      if (anRes?.ok) setAnalytics(await anRes.json())
+      if (tRes?.ok) setTradingStatus(await tRes.json())
+    } catch (_) {}
+    setLoading(false)
   }, [])
 
-  useEffect(() => { fetchAll(); const i = setInterval(fetchAll, 60000); return () => clearInterval(i) }, [fetchAll])
+  useEffect(() => {
+    fetchAll()
+    const iv = setInterval(fetchAll, 10_000)
+    return () => clearInterval(iv)
+  }, [fetchAll])
 
-  if (!portfolio) return (
-    <div className="flex items-center justify-center min-h-[60vh]">
-      <div className="text-center animate-fade-in">
-        <div className="text-6xl mb-4 animate-bounce">🦍</div>
-        <p className="text-slate-400 text-lg">Loading Beast Engine...</p>
-        <div className="mt-4 w-48 h-1 bg-slate-700 rounded-full mx-auto overflow-hidden">
-          <div className="h-full bg-green-500 rounded-full animate-loading-bar" />
-        </div>
-      </div>
-    </div>
-  )
+  // ── Derived values ──
+  const positions: any[] = portfolio?.positions || []
+  const totalPnl = portfolio?.total_pnl ?? portfolio?.unrealized_pnl ?? 0
+  const equity = portfolio?.equity ?? portfolio?.portfolio_value ?? 0
+  const cash = portfolio?.cash ?? 0
+  const heat = portfolio?.heat_pct ?? portfolio?.heat ?? 0
+  const winRate = analytics?.win_rate ?? analytics?.winRate ?? 0
+  const posCount = positions.length
+  const greenCount = positions.filter((p: any) => (p.unrealized_pnl ?? p.pnl ?? 0) >= 0).length
+  const redCount = posCount - greenCount
+  const fearGreed = analytics?.fear_greed ?? analytics?.fearGreed ?? 50
+  const spyChange = analytics?.spy_change ?? analytics?.spyChange ?? 0
+  const regime = analytics?.regime ?? 'unknown'
+  const trumpSentiment = analytics?.trump_sentiment ?? analytics?.geoSentiment ?? 0
 
-  const greens = portfolio.positions?.filter((p: any) => p.is_green).length || 0
-  const reds = (portfolio.positions?.length || 0) - greens
-  const trumpData = sentiment['_trump'] || {}
-  const bestStock = portfolio.positions?.[0]
-  const worstStock = portfolio.positions?.[portfolio.positions.length - 1]
+  // Animated counters
+  const animPnl = useCounter(totalPnl, 1200)
+  const animEquity = useCounter(equity, 1000)
+  const animCash = useCounter(cash, 800)
+  const animHeat = useCounter(heat, 800)
+  const animWinRate = useCounter(winRate, 1000)
+
+  if (loading) return <SkeletonDashboard />
+
+  const pnlPositive = totalPnl >= 0
 
   return (
-    <div className={`space-y-4 transition-opacity duration-500 ${isRefreshing ? 'opacity-80' : 'opacity-100'}`}>
+    <div className="min-h-screen bg-[#0a0a0a] text-white">
 
-      {/* ── HERO STATS ── */}
-      <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
-        <GlowCard label="Portfolio" value={`$${portfolio.equity?.toLocaleString()}`} glow="blue" />
-        <GlowCard label="Day P&L" value={`${portfolio.total_pl >= 0 ? '+' : ''}$${portfolio.total_pl?.toFixed(2)}`}
-          glow={portfolio.total_pl >= 0 ? 'green' : 'red'} />
-        <GlowCard label="Positions" value={`${portfolio.positions_count}`} sub={`🟢${greens} 🔴${reds}`} />
-        <GlowCard label="Orders" value={`${portfolio.orders_count}`} />
-        <GlowCard label="Trump" value={`${trumpData.score >= 0 ? '+' : ''}${trumpData.score || 0}/5`}
-          glow={(trumpData.score || 0) >= 0 ? 'green' : 'red'} />
-        <GlowCard label="Updated" value={lastUpdate} sub="⟳ 60s" />
-      </div>
+      {/* ═══ SECTION 1: HERO BANNER ═══ */}
+      <section className="hero-gradient relative overflow-hidden">
+        <div className="max-w-7xl mx-auto px-6 py-10">
+          {/* Live indicator */}
+          <div className="flex items-center gap-2 mb-6">
+            <div className="w-2.5 h-2.5 rounded-full bg-[#00ff88] live-dot" />
+            <span className="text-xs font-medium text-[#00ff88] tracking-widest uppercase">Live Terminal</span>
+            <span className="text-xs text-gray-500 ml-2">{new Date().toLocaleTimeString()}</span>
+          </div>
 
-      {/* ── SYSTEM STATUS ── */}
-      {system && (
-        <div className="flex gap-2 flex-wrap animate-fade-in">
-          <PulsingBadge label="AI Brain" ok={system.ai?.status === 'online'} />
-          <PulsingBadge label="TradingView" ok={system.tv?.status === 'connected'} />
-          <PulsingBadge label="Discord Bot" ok={system.bot?.status === 'running'} />
-          <PulsingBadge label="API" ok={true} />
-          {isRefreshing && <span className="px-2.5 py-1 rounded-full text-[10px] bg-blue-500/15 text-blue-400 border border-blue-500/30 animate-pulse">⟳ Refreshing...</span>}
+          {/* Main P&L */}
+          <div className="animate-count-up">
+            <p className="text-sm text-gray-400 mb-1 tracking-wide uppercase">Total P&L</p>
+            <h1 className={`text-6xl md:text-7xl font-black tracking-tight ${pnlPositive ? 'text-[#00ff88] glow-green' : 'text-[#ff4444] glow-red'}`}>
+              {pnlPositive ? '+' : ''}{fmt(animPnl)}
+            </h1>
+          </div>
+
+          {/* Sub-stats */}
+          <div className="flex flex-wrap gap-8 mt-6">
+            {[
+              { label: 'Portfolio Equity', value: `$${fmtInt(animEquity)}` },
+              { label: 'Cash Available', value: `$${fmtInt(animCash)}` },
+              { label: 'Heat', value: `${animHeat.toFixed(1)}%`, warn: heat > 60 },
+            ].map((s) => (
+              <div key={s.label} className="animate-card-enter" style={{ animationDelay: '0.2s' }}>
+                <p className="text-xs text-gray-500 uppercase tracking-wider">{s.label}</p>
+                <p className={`text-xl font-semibold ${s.warn ? 'text-[#f39c12]' : 'text-white'}`}>{s.value}</p>
+              </div>
+            ))}
+          </div>
         </div>
-      )}
+        {/* Subtle bottom fade */}
+        <div className="absolute bottom-0 left-0 right-0 h-16 bg-gradient-to-t from-[#0a0a0a] to-transparent" />
+      </section>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* ── LEFT COLUMN (2/3) ── */}
-        <div className="lg:col-span-2 space-y-4">
+      <div className="max-w-7xl mx-auto px-6 pb-12 space-y-6">
 
-          {/* P&L CHART */}
-          <Card title="📈 Intraday Equity" animate>
-            {intraday.length > 1 ? (
-              <>
-                <div className="h-36 flex items-end gap-px">
-                  {intraday.slice(-100).map((e: any, i: number) => {
-                    const vals = intraday.map((x: any) => x.equity)
-                    const min = Math.min(...vals); const max = Math.max(...vals)
-                    const h = ((e.equity - min) / (max - min || 1)) * 100
-                    return (
-                      <div key={i} className="flex-1 min-w-[1px] group relative"
-                        title={`$${e.equity?.toLocaleString()}`}>
-                        <div className={`rounded-t transition-all duration-300 group-hover:brightness-150 ${e.total_pl >= 0 ? 'bg-gradient-to-t from-green-600 to-green-400' : 'bg-gradient-to-t from-red-600 to-red-400'}`}
-                          style={{ height: `${Math.max(4, h)}%` }} />
-                      </div>
-                    )
-                  })}
-                </div>
-                <div className="flex justify-between text-[10px] text-slate-500 mt-1 px-1">
-                  <span>{intraday[0]?.timestamp?.slice(11, 16)}</span>
-                  <span className="text-slate-400">
-                    ${Math.min(...intraday.map((x: any) => x.equity)).toLocaleString()} — ${Math.max(...intraday.map((x: any) => x.equity)).toLocaleString()}
-                  </span>
-                  <span>{intraday[intraday.length - 1]?.timestamp?.slice(11, 16)}</span>
-                </div>
-              </>
+        {/* ═══ SECTION 2: QUICK STATS BAR ═══ */}
+        <section className="grid grid-cols-2 lg:grid-cols-4 gap-4 -mt-6 relative z-10 stagger-enter">
+          {/* Total P&L card */}
+          <div className="glass hover-glow p-5">
+            <p className="text-xs text-gray-400 uppercase tracking-wider mb-2">Total P&L</p>
+            <div className="flex items-baseline gap-2">
+              <span className={`text-2xl font-bold ${pnlPositive ? 'text-[#00ff88]' : 'text-[#ff4444]'}`}>
+                {pnlPositive ? '+' : ''}{fmt(animPnl)}
+              </span>
+              <span className={`text-lg ${pnlPositive ? 'text-[#00ff88]' : 'text-[#ff4444]'}`}>
+                {pnlPositive ? '↑' : '↓'}
+              </span>
+            </div>
+          </div>
+
+          {/* Win Rate card */}
+          <div className="glass hover-glow p-5">
+            <p className="text-xs text-gray-400 uppercase tracking-wider mb-2">Win Rate</p>
+            <div className="flex items-center gap-3">
+              <Ring pct={animWinRate} size={48} stroke={4} />
+              <span className="text-2xl font-bold text-white">{animWinRate.toFixed(1)}%</span>
+            </div>
+          </div>
+
+          {/* Positions card */}
+          <div className="glass hover-glow p-5">
+            <p className="text-xs text-gray-400 uppercase tracking-wider mb-2">Positions</p>
+            <div className="flex items-baseline gap-2">
+              <span className="text-2xl font-bold text-white">{posCount}</span>
+              <span className="text-sm">
+                <span className="text-[#00ff88]">{greenCount}↑</span>
+                {' / '}
+                <span className="text-[#ff4444]">{redCount}↓</span>
+              </span>
+            </div>
+          </div>
+
+          {/* AI Status card */}
+          <div className="glass hover-glow p-5">
+            <p className="text-xs text-gray-400 uppercase tracking-wider mb-2">AI Status</p>
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <span className="text-green-400">✅</span>
+                <span className="text-sm text-gray-300">GPT-4o</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-green-400">✅</span>
+                <span className="text-sm text-gray-300">Claude</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* ═══ SECTION 3: LIVE POSITIONS ═══ */}
+          <section className="lg:col-span-2 glass p-0 overflow-hidden">
+            <div className="px-5 py-4 border-b border-white/5 flex items-center justify-between">
+              <h2 className="text-sm font-semibold uppercase tracking-wider text-gray-300">Live Positions</h2>
+              <span className="text-xs text-gray-500">{posCount} open</span>
+            </div>
+
+            {positions.length === 0 ? (
+              <div className="p-8 text-center text-gray-500">No open positions</div>
             ) : (
-              <div className="h-36 flex items-center justify-center text-slate-500 text-sm">
-                Chart populates during market hours
+              <div className="divide-y divide-white/5 stagger-enter">
+                {positions.map((pos: any) => {
+                  const sym = pos.symbol || pos.ticker || '??'
+                  const pnl = pos.unrealized_pnl ?? pos.pnl ?? 0
+                  const pnlPct = pos.unrealized_pnl_pct ?? pos.pnl_pct ?? 0
+                  const price = pos.current_price ?? pos.price ?? 0
+                  const qty = pos.qty ?? pos.quantity ?? 0
+                  const verdict = pos.ai_verdict ?? pos.verdict ?? ''
+                  const hasStop = pos.trailing_stop != null || pos.stop_loss != null
+                  const isGreen = pnl >= 0
+                  const expanded = expandedRow === sym
+
+                  return (
+                    <div key={sym}>
+                      <div
+                        className="position-row flex items-center px-5 py-3.5 cursor-pointer"
+                        style={{ borderLeft: `3px solid ${isGreen ? '#00ff88' : '#ff4444'}` }}
+                        onClick={() => setExpandedRow(expanded ? null : sym)}
+                      >
+                        {/* Symbol badge */}
+                        <div className="w-9 h-9 rounded-full flex items-center justify-center text-white font-bold text-xs mr-3 flex-shrink-0"
+                          style={{ backgroundColor: stockColor(sym) }}>
+                          {sym.charAt(0)}
+                        </div>
+
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2">
+                            <span className="font-semibold text-white">{sym}</span>
+                            {hasStop && <span title="Protected" className="text-[#00aaff] text-xs">🛡️</span>}
+                            {verdict && (
+                              <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium uppercase tracking-wider ${
+                                verdict.toLowerCase().includes('buy') ? 'bg-[#00ff88]/15 text-[#00ff88]' :
+                                verdict.toLowerCase().includes('sell') ? 'bg-[#ff4444]/15 text-[#ff4444]' :
+                                'bg-white/10 text-gray-400'
+                              }`}>{verdict}</span>
+                            )}
+                          </div>
+                          <span className="text-xs text-gray-500">{qty} shares @ ${fmt(price)}</span>
+                        </div>
+
+                        <div className="text-right">
+                          <p className={`font-semibold ${isGreen ? 'text-[#00ff88]' : 'text-[#ff4444]'}`}>
+                            {isGreen ? '+' : ''}{fmt(pnl)}
+                          </p>
+                          <p className={`text-xs ${isGreen ? 'text-[#00ff88]/70' : 'text-[#ff4444]/70'}`}>
+                            {pct(pnlPct)}
+                          </p>
+                        </div>
+
+                        <span className={`ml-3 text-gray-500 text-xs transition-transform duration-200 ${expanded ? 'rotate-180' : ''}`}>▼</span>
+                      </div>
+
+                      {/* Expanded detail */}
+                      {expanded && (
+                        <div className="px-5 py-4 bg-white/[0.02] border-t border-white/5 animate-fade-in text-xs space-y-2">
+                          {pos.ai_reasoning && <p className="text-gray-400"><span className="text-gray-500 font-medium">AI Reasoning:</span> {pos.ai_reasoning}</p>}
+                          {pos.trailing_stop && <p className="text-gray-400"><span className="text-gray-500 font-medium">Trailing Stop:</span> ${fmt(pos.trailing_stop)}</p>}
+                          {pos.indicators && <p className="text-gray-400"><span className="text-gray-500 font-medium">Indicators:</span> {JSON.stringify(pos.indicators)}</p>}
+                          {pos.sentiment && <p className="text-gray-400"><span className="text-gray-500 font-medium">Sentiment:</span> {pos.sentiment}</p>}
+                          {!pos.ai_reasoning && !pos.trailing_stop && <p className="text-gray-500 italic">No additional details</p>}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
               </div>
             )}
-          </Card>
+          </section>
 
-          {/* POSITIONS TABLE */}
-          <Card title="💼 Live Positions" animate>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-slate-500 text-[10px] uppercase tracking-wider border-b border-slate-700">
-                    <th className="text-left py-2 px-2">Stock</th>
-                    <th className="text-right py-2 px-2">Price</th>
-                    <th className="text-right py-2 px-2">P&L</th>
-                    <th className="text-right py-2 px-2">%</th>
-                    <th className="text-right py-2 px-2">Value</th>
-                    <th className="text-center py-2 px-2">Sentiment</th>
-                    <th className="text-center py-2 px-2">Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {portfolio.positions?.map((p: any, idx: number) => {
-                    const s = sentiment[p.symbol] || {}
-                    return (
-                      <tr key={p.symbol}
-                        className="border-b border-slate-700/20 hover:bg-slate-700/40 transition-colors duration-200"
-                        style={{ animationDelay: `${idx * 50}ms` }}>
-                        <td className="py-2 px-2">
-                          <div className="flex items-center gap-1.5">
-                            <span className={`text-lg ${p.is_green ? 'text-green-400' : 'text-red-400'}`}>
-                              {p.is_green ? '▲' : '▼'}
-                            </span>
-                            <div>
-                              <span className="font-mono font-bold text-white">{p.symbol}</span>
-                              <span className="text-slate-500 text-[10px] ml-1">{p.qty}x @ ${p.avg_entry?.toFixed(2)}</span>
-                            </div>
-                          </div>
-                        </td>
-                        <td className="text-right py-2 px-2 font-mono">${p.current_price?.toFixed(2)}</td>
-                        <td className={`text-right py-2 px-2 font-bold ${p.is_green ? 'text-green-400' : 'text-red-400'}`}>
-                          {p.unrealized_pl >= 0 ? '+' : ''}${p.unrealized_pl?.toFixed(2)}
-                        </td>
-                        <td className="text-right py-2 px-2">
-                          <span className={`px-1.5 py-0.5 rounded text-xs font-mono ${p.is_green ? 'bg-green-500/10 text-green-400' : 'bg-red-500/10 text-red-400'}`}>
-                            {p.pct >= 0 ? '+' : ''}{p.pct?.toFixed(1)}%
-                          </span>
-                        </td>
-                        <td className="text-right py-2 px-2 text-slate-400 text-xs">${p.market_value?.toLocaleString()}</td>
-                        <td className="text-center py-2 px-2">
-                          <SentimentDots y={s.yahoo || 0} r={s.reddit || 0} a={s.analyst || 0} />
-                        </td>
-                        <td className="text-center py-2 px-2">
-                          <ActionPill pct={p.pct} />
-                        </td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
+          {/* ═══ SECTION 4: AI COMMAND CENTER ═══ */}
+          <section className="glass p-0 overflow-hidden flex flex-col">
+            <div className="px-5 py-4 border-b border-white/5">
+              <h2 className="text-sm font-semibold uppercase tracking-wider text-gray-300">AI Command Center</h2>
+              <p className="text-xs text-gray-500 mt-0.5">
+                Last scan: {verdicts.length > 0 ? ago(verdicts[0]?.timestamp || verdicts[0]?.created_at || '') : '—'}
+              </p>
             </div>
-          </Card>
 
-          {/* 🧠 LATEST AI VERDICTS */}
-          {aiVerdicts.filter((v: any) => v.ai_action !== 'HOLD').length > 0 && (
-            <Card title="🧠 Latest AI Verdict" animate>
-              <div className="space-y-2">
-                {aiVerdicts.filter((v: any) => v.ai_action !== 'HOLD').slice(0, 3).map((v: any) => {
-                  const isBuy = v.ai_action === 'BUY'
-                  return (
-                    <div key={v.symbol} className={`flex items-center justify-between p-2 rounded-lg border ${
-                      isBuy ? 'border-green-500/30 bg-green-500/5' : 'border-red-500/30 bg-red-500/5'
-                    }`}>
+            <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-3 stagger-enter" style={{ maxHeight: 420 }}>
+              {verdicts.length === 0 && <p className="text-gray-500 text-sm text-center py-8">No recent verdicts</p>}
+              {verdicts.slice(0, 8).map((v: any, i: number) => {
+                const action = (v.verdict || v.action || 'hold').toLowerCase()
+                const conf = v.confidence ?? v.score ?? 50
+                const isBuy = action.includes('buy')
+                const isSell = action.includes('sell')
+                const accent = isBuy ? '#00ff88' : isSell ? '#ff4444' : '#666'
+                return (
+                  <div key={i} className="rounded-xl p-3.5" style={{
+                    background: 'rgba(255,255,255,0.03)',
+                    border: `1px solid ${accent}22`,
+                    boxShadow: `0 0 20px ${accent}10`,
+                  }}>
+                    <div className="flex items-center justify-between mb-2">
                       <div className="flex items-center gap-2">
-                        <span className="font-mono font-bold text-white">{v.symbol}</span>
-                        <span className={`text-xs font-bold px-2 py-0.5 rounded ${
-                          isBuy ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
-                        }`}>{v.ai_action}</span>
-                        <span className="text-[10px] text-slate-500">{v.ai_confidence}%</span>
-                      </div>
-                      <span className="text-xs text-slate-400 truncate max-w-[200px]">{v.ai_reasoning}</span>
-                    </div>
-                  )
-                })}
-              </div>
-            </Card>
-          )}
-
-          {/* 📋 RECENT DECISIONS */}
-          {decisionLog.length > 0 && (
-            <Card title="📋 Recent Decisions" animate>
-              <div className="space-y-1">
-                {decisionLog.slice(0, 5).map((d: any, i: number) => {
-                  const side = (d.side || '').toLowerCase()
-                  const cid = d.client_order_id || d.reason || ''
-                  const strat = cid.includes('scalp') ? 'Scalp' : cid.includes('runner') ? 'Runner' :
-                    cid.includes('dip') ? 'Dip' : cid.includes('protect') ? 'Protect' : cid.split('-')[0] || '—'
-                  return (
-                    <div key={i} className="flex items-center justify-between py-1.5 border-b border-slate-700/20 text-xs">
-                      <div className="flex items-center gap-2">
-                        <span className={side === 'buy' ? 'text-green-400' : 'text-red-400'}>
-                          {side === 'buy' ? '🟢' : '🔴'}
+                        <span className="font-semibold text-white text-sm">{v.symbol || v.ticker || '—'}</span>
+                        <span className="text-[10px] px-2 py-0.5 rounded-full font-bold uppercase tracking-wider"
+                          style={{ color: accent, background: `${accent}18` }}>
+                          {action}
                         </span>
-                        <span className="font-mono font-bold text-white">{d.symbol}</span>
-                        <span className="text-slate-500">x{d.qty} @ ${Number(d.price || 0).toFixed(2)}</span>
                       </div>
-                      <span className="bg-slate-700 px-1.5 py-0.5 rounded text-slate-300">{strat}</span>
+                      <span className="text-[10px] text-gray-500 flex items-center gap-1">
+                        {v.source === 'claude' || v.model?.includes('claude') ? '🟣' : '🟢'}
+                        {v.source || v.model || 'AI'}
+                      </span>
                     </div>
-                  )
-                })}
-              </div>
-            </Card>
-          )}
-
-          {/* SENTIMENT HEATMAP */}
-          <Card title="📰 Sentiment Heatmap" animate>
-            <div className="grid grid-cols-5 gap-1 text-xs">
-              <div className="text-slate-500 font-bold p-1">Stock</div>
-              <div className="text-slate-500 text-center p-1">Yahoo</div>
-              <div className="text-slate-500 text-center p-1">Reddit</div>
-              <div className="text-slate-500 text-center p-1">Analyst</div>
-              <div className="text-slate-500 text-center p-1 font-bold">Total</div>
-              {portfolio.positions?.map((p: any) => {
-                const s = sentiment[p.symbol] || {}
-                return [
-                  <div key={`${p.symbol}-n`} className="font-mono font-bold p-1 flex items-center">
-                    <span className={`w-1.5 h-1.5 rounded-full mr-1.5 ${p.is_green ? 'bg-green-400' : 'bg-red-400'}`} />
-                    {p.symbol}
-                  </div>,
-                  <HeatCell key={`${p.symbol}-y`} v={s.yahoo || 0} />,
-                  <HeatCell key={`${p.symbol}-r`} v={s.reddit || 0} />,
-                  <HeatCell key={`${p.symbol}-a`} v={s.analyst || 0} />,
-                  <HeatCell key={`${p.symbol}-t`} v={s.total || 0} bold />,
-                ]
+                    {/* Confidence bar */}
+                    <div className="h-1.5 rounded-full bg-white/5 overflow-hidden">
+                      <div className="h-full rounded-full confidence-bar-fill" style={{
+                        width: `${conf}%`, backgroundColor: accent,
+                      }} />
+                    </div>
+                    <p className="text-[10px] text-gray-500 mt-1.5">{conf}% confidence{v.reason ? ` · ${v.reason}` : ''}</p>
+                  </div>
+                )
               })}
             </div>
-            {trumpData.headlines?.length > 0 && (
-              <div className="mt-3 pt-3 border-t border-slate-700/50">
-                <div className="flex items-center gap-2 mb-1">
-                  <span className="text-xs">🏛️</span>
-                  <span className="text-xs text-slate-400">Trump/Geo:</span>
-                  <span className={`text-xs font-bold ${(trumpData.score || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                    {trumpData.score >= 0 ? '+' : ''}{trumpData.score}/5
-                  </span>
-                </div>
-                {trumpData.headlines.slice(0, 2).map((h: string, i: number) => (
-                  <p key={i} className="text-[10px] text-slate-500 truncate pl-5">• {h}</p>
-                ))}
-              </div>
-            )}
-          </Card>
+          </section>
         </div>
 
-        {/* ── RIGHT COLUMN (1/3) ── */}
-        <div className="space-y-4">
+        {/* ═══ SECTION 5 & 6: FEED + MARKET PULSE ═══ */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
 
-          {/* LIVE ACTION FEED */}
-          <Card title="⚡ Live Feed" animate>
-            <div className="space-y-1 max-h-[420px] overflow-y-auto scrollbar-thin">
-              {actions.length === 0 ? (
-                <div className="text-center py-8">
-                  <div className="text-2xl mb-2 animate-pulse">📡</div>
-                  <p className="text-slate-500 text-xs">Waiting for first scan...</p>
-                </div>
-              ) : actions.map((a: any, i: number) => (
-                <div key={i} className="flex gap-2 py-1.5 border-b border-slate-700/20 hover:bg-slate-700/20 transition-colors rounded px-1"
-                  style={{ animationDelay: `${i * 30}ms` }}>
-                  <span className="text-[9px] text-slate-600 w-12 shrink-0 font-mono mt-0.5">
-                    {a.timestamp?.slice(11, 19)}
-                  </span>
-                  <div className="min-w-0">
-                    <ActionTypeBadge type={a.type} />
-                    <span className="text-[11px] text-slate-300 ml-1">{a.title}</span>
-                    {a.detail && <p className="text-[9px] text-slate-600 mt-0.5 truncate">{a.detail}</p>}
-                  </div>
-                </div>
-              ))}
+          {/* Activity Feed */}
+          <section className="glass p-0 overflow-hidden">
+            <div className="px-5 py-4 border-b border-white/5">
+              <h2 className="text-sm font-semibold uppercase tracking-wider text-gray-300">Live Activity</h2>
             </div>
-          </Card>
-
-          {/* OPEN ORDERS */}
-          {portfolio.open_orders?.length > 0 && (
-            <Card title={`📋 Orders (${portfolio.orders_count})`} animate>
-              <div className="space-y-1">
-                {portfolio.open_orders.slice(0, 8).map((o: any, i: number) => (
-                  <div key={i} className="flex justify-between text-xs py-1.5 border-b border-slate-700/20 hover:bg-slate-700/20 transition-colors rounded px-1">
-                    <span className={`font-mono font-bold ${o.side === 'buy' ? 'text-green-400' : 'text-red-400'}`}>
-                      {o.side === 'buy' ? '🟢' : '🔴'} {o.symbol}
-                    </span>
-                    <span className="text-slate-400">x{o.qty} @ ${o.limit_price}</span>
+            <div ref={feedRef} className="overflow-y-auto scrollbar-thin p-4 space-y-2" style={{ maxHeight: 340 }}>
+              {actions.length === 0 && <p className="text-gray-500 text-sm text-center py-6">No recent activity</p>}
+              {actions.slice(0, 10).map((a: any, i: number) => {
+                const icon = ACTION_ICONS[a.action_type || a.type || ''] || ACTION_ICONS.default
+                return (
+                  <div key={i} className="flex items-start gap-3 py-2 animate-feed-enter" style={{ animationDelay: `${i * 0.04}s` }}>
+                    <span className="text-lg flex-shrink-0">{icon}</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm text-gray-200 leading-snug">
+                        <span className="font-medium text-white">{a.symbol || a.ticker || ''}</span>{' '}
+                        {a.description || a.message || a.action_type || a.type || ''}
+                      </p>
+                      <p className="text-[10px] text-gray-500 mt-0.5">{ago(a.timestamp || a.created_at || '')}</p>
+                    </div>
+                    {a.pnl != null && (
+                      <span className={`text-xs font-semibold flex-shrink-0 ${a.pnl >= 0 ? 'text-[#00ff88]' : 'text-[#ff4444]'}`}>
+                        {a.pnl >= 0 ? '+' : ''}{fmt(a.pnl)}
+                      </span>
+                    )}
                   </div>
-                ))}
+                )
+              })}
+            </div>
+          </section>
+
+          {/* Market Pulse */}
+          <section className="glass p-5">
+            <h2 className="text-sm font-semibold uppercase tracking-wider text-gray-300 mb-5">Market Pulse</h2>
+
+            <div className="flex items-start justify-between">
+              {/* Fear & Greed */}
+              <FearGreedGauge value={fearGreed} />
+
+              {/* Market stats */}
+              <div className="space-y-4 text-right">
+                <div>
+                  <p className="text-xs text-gray-500 uppercase tracking-wider">SPY</p>
+                  <p className={`text-lg font-bold ${spyChange >= 0 ? 'text-[#00ff88]' : 'text-[#ff4444]'}`}>
+                    {pct(spyChange)}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-500 uppercase tracking-wider">Regime</p>
+                  <span className={`inline-block text-xs px-3 py-1 rounded-full font-medium ${
+                    regime === 'bull' ? 'bg-[#00ff88]/15 text-[#00ff88]' :
+                    regime === 'bear' ? 'bg-[#ff4444]/15 text-[#ff4444]' :
+                    'bg-white/10 text-gray-400'
+                  }`}>{regime}</span>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-500 uppercase tracking-wider">Geo Sentiment</p>
+                  <p className={`text-lg font-bold ${
+                    trumpSentiment > 0 ? 'text-[#00ff88]' :
+                    trumpSentiment < 0 ? 'text-[#ff4444]' : 'text-gray-400'
+                  }`}>{trumpSentiment > 0 ? '+' : ''}{trumpSentiment}</p>
+                </div>
               </div>
-            </Card>
-          )}
-
-          {/* QUICK STATS */}
-          <Card title="📊 Portfolio Stats" animate>
-            <div className="space-y-2.5 text-xs">
-              <StatRow label="Buying Power" value={`$${portfolio.buying_power?.toLocaleString()}`} />
-              <StatRow label="Cash" value={`$${portfolio.cash?.toLocaleString()}`} />
-              <div className="border-t border-slate-700/30 pt-2" />
-              <StatRow label="Best" value={`${bestStock?.symbol} +${bestStock?.pct?.toFixed(1)}%`} color="green" />
-              <StatRow label="Worst" value={`${worstStock?.symbol} ${worstStock?.pct?.toFixed(1)}%`} color="red" />
-              <div className="border-t border-slate-700/30 pt-2" />
-              <StatRow label="Winners" value={`${greens} stocks`} color="green" />
-              <StatRow label="Losers" value={`${reds} stocks`} color="red" />
             </div>
-          </Card>
+          </section>
+        </div>
+
+        {/* Footer tagline */}
+        <div className="text-center py-6">
+          <p className="text-xs text-gray-600">Beast Trader Terminal · AI-Powered · Real-Time</p>
         </div>
       </div>
-    </div>
-  )
-}
-
-/* ── COMPONENTS ── */
-
-function Card({ title, children, animate }: { title: string; children: React.ReactNode; animate?: boolean }) {
-  return (
-    <div className={`bg-gradient-to-br from-slate-800 to-slate-800/80 rounded-xl p-4 border border-slate-700/60 shadow-lg shadow-black/20 ${animate ? 'animate-fade-in' : ''}`}>
-      <h2 className="text-sm font-semibold text-slate-400 mb-3 flex items-center gap-2">
-        {title}
-      </h2>
-      {children}
-    </div>
-  )
-}
-
-function GlowCard({ label, value, sub, glow }: { label: string; value: string; sub?: string; glow?: string }) {
-  const glowMap: Record<string, string> = {
-    green: 'shadow-green-500/10 border-green-500/20',
-    red: 'shadow-red-500/10 border-red-500/20',
-    blue: 'shadow-blue-500/10 border-blue-500/20',
-  }
-  const textMap: Record<string, string> = {
-    green: 'text-green-400', red: 'text-red-400', blue: 'text-blue-400',
-  }
-  return (
-    <div className={`bg-slate-800 rounded-xl p-3 border border-slate-700 text-center shadow-lg transition-all duration-300 hover:scale-[1.02] hover:shadow-xl ${glow ? glowMap[glow] || '' : ''}`}>
-      <p className="text-slate-500 text-[10px] uppercase tracking-wider">{label}</p>
-      <p className={`text-lg font-bold ${glow ? textMap[glow] || 'text-white' : 'text-white'}`}>{value}</p>
-      {sub && <p className="text-slate-600 text-[10px]">{sub}</p>}
-    </div>
-  )
-}
-
-function PulsingBadge({ label, ok }: { label: string; ok: boolean }) {
-  return (
-    <span className={`px-2.5 py-1 rounded-full text-[10px] font-medium transition-all duration-300 ${ok ? 'bg-green-500/10 text-green-400 border border-green-500/25' : 'bg-red-500/10 text-red-400 border border-red-500/25'}`}>
-      <span className={`inline-block w-1.5 h-1.5 rounded-full mr-1 ${ok ? 'bg-green-400 animate-pulse' : 'bg-red-400'}`} />
-      {label}
-    </span>
-  )
-}
-
-function SentimentDots({ y, r, a }: { y: number; r: number; a: number }) {
-  const dot = (v: number, label: string) => (
-    <span title={`${label}: ${v >= 0 ? '+' : ''}${v}`}
-      className={`inline-block w-2 h-2 rounded-full mx-px transition-colors ${v >= 2 ? 'bg-green-400' : v <= -2 ? 'bg-red-400' : 'bg-slate-600'}`} />
-  )
-  return <div className="flex justify-center gap-0.5">{dot(y, 'Yahoo')}{dot(r, 'Reddit')}{dot(a, 'Analyst')}</div>
-}
-
-function HeatCell({ v, bold }: { v: number; bold?: boolean }) {
-  const bg = v >= 3 ? 'bg-green-500/40' : v >= 1 ? 'bg-green-500/15' : v <= -3 ? 'bg-red-500/40' : v <= -1 ? 'bg-red-500/15' : 'bg-slate-700/20'
-  return (
-    <div className={`${bg} rounded p-1 text-center transition-all duration-300 hover:brightness-125 ${bold ? 'font-bold' : ''} ${v > 0 ? 'text-green-400' : v < 0 ? 'text-red-400' : 'text-slate-500'}`}>
-      {v >= 0 ? '+' : ''}{v}
-    </div>
-  )
-}
-
-function ActionPill({ pct }: { pct: number }) {
-  const configs: Record<string, [string, string]> = {
-    runner: ['RUNNER', 'bg-purple-500/20 text-purple-400 border-purple-500/30'],
-    scalp: ['SCALP', 'bg-green-500/15 text-green-400 border-green-500/25'],
-    hold_g: ['HOLD', 'bg-slate-600/20 text-slate-300 border-slate-600/30'],
-    hold_y: ['HOLD', 'bg-yellow-500/15 text-yellow-400 border-yellow-500/25'],
-    deep: ['DEEP RED', 'bg-red-500/15 text-red-400 border-red-500/25'],
-  }
-  const key = pct >= 5 ? 'runner' : pct >= 2 ? 'scalp' : pct >= 0 ? 'hold_g' : pct > -5 ? 'hold_y' : 'deep'
-  const [text, cls] = configs[key]
-  return <span className={`px-1.5 py-0.5 rounded-full text-[9px] font-medium border ${cls}`}>{text}</span>
-}
-
-function ActionTypeBadge({ type }: { type: string }) {
-  const map: Record<string, string> = {
-    TRADE: 'bg-green-500/15 text-green-400',
-    SCAN: 'bg-blue-500/15 text-blue-400',
-    DROP: 'bg-red-500/15 text-red-400',
-    KILL_SWITCH: 'bg-red-500/30 text-red-300',
-  }
-  return <span className={`text-[9px] px-1.5 py-0.5 rounded ${map[type] || 'bg-slate-600/20 text-slate-400'}`}>{type}</span>
-}
-
-function StatRow({ label, value, color }: { label: string; value: string; color?: string }) {
-  return (
-    <div className="flex justify-between items-center">
-      <span className="text-slate-500">{label}</span>
-      <span className={color === 'green' ? 'text-green-400' : color === 'red' ? 'text-red-400' : 'text-slate-300'}>{value}</span>
     </div>
   )
 }

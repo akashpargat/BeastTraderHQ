@@ -3,104 +3,159 @@ import { useEffect, useState, useCallback } from 'react'
 
 const API = 'https://api.beast-trader.com'
 
+const STRATEGY_STYLES: Record<string, string> = {
+  scalp: 'bg-blue-500/15 text-blue-400 border border-blue-500/30',
+  runner: 'bg-green-500/15 text-green-400 border border-green-500/30',
+  dip: 'bg-orange-500/15 text-orange-400 border border-orange-500/30',
+  ai: 'bg-purple-500/15 text-purple-400 border border-purple-500/30',
+  protect: 'bg-rose-500/15 text-rose-400 border border-rose-500/30',
+  earnings: 'bg-amber-500/15 text-amber-400 border border-amber-500/30',
+}
+
+function extractStrategy(t: any): string {
+  if (t.strategy) return t.strategy
+  const cid = (t.client_order_id || '').toLowerCase()
+  if (cid.includes('scalp')) return 'Scalp'
+  if (cid.includes('runner')) return 'Runner'
+  if (cid.includes('dip')) return 'DipBuy'
+  if (cid.includes('ai') || cid.includes('claude') || cid.includes('gpt')) return 'AI'
+  if (cid.includes('protect')) return 'Protect'
+  return cid.split('-')[0] || 'Manual'
+}
+
+function strategyStyle(name: string): string {
+  const n = name.toLowerCase()
+  for (const key of Object.keys(STRATEGY_STYLES)) {
+    if (n.includes(key)) return STRATEGY_STYLES[key]
+  }
+  return 'bg-slate-500/15 text-slate-400 border border-slate-500/30'
+}
+
+type Filter = 'ALL' | 'BUY' | 'SELL' | 'TODAY'
+
 export default function TradesPage() {
   const [trades, setTrades] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
+  const [filter, setFilter] = useState<Filter>('ALL')
 
   const fetchData = useCallback(() => {
-    fetch(`${API}/api/trades?limit=50`)
+    fetch(`${API}/api/trades?limit=100`)
       .then(r => r.json())
-      .then(d => {
-        setTrades(d.trades || [])
-        setLoading(false)
-      })
+      .then(d => { setTrades(d.trades || []); setLoading(false) })
       .catch(() => setLoading(false))
   }, [])
 
   useEffect(() => {
     fetchData()
-    const interval = setInterval(fetchData, 30000)
+    const interval = setInterval(fetchData, 10000)
     return () => clearInterval(interval)
   }, [fetchData])
 
-  function extractStrategy(t: any): string {
-    if (t.strategy) return t.strategy
-    const cid = t.client_order_id || ''
-    if (cid.includes('scalp')) return 'Scalp'
-    if (cid.includes('runner')) return 'Runner'
-    if (cid.includes('dip')) return 'Dip'
-    if (cid.includes('protect')) return 'Protect'
-    if (cid.includes('earn')) return 'Earnings'
-    return cid.split('-')[0] || '—'
-  }
+  const todayStr = new Date().toISOString().slice(0, 10)
+  const filtered = trades.filter((t: any) => {
+    const side = (t.side || '').toLowerCase()
+    if (filter === 'BUY' && side !== 'buy') return false
+    if (filter === 'SELL' && side !== 'sell') return false
+    if (filter === 'TODAY') {
+      const d = t.filled_at || t.created_at || t.time || ''
+      if (!d.startsWith(todayStr)) return false
+    }
+    return true
+  })
+
+  const filters: Filter[] = ['ALL', 'BUY', 'SELL', 'TODAY']
 
   if (loading) return (
-    <div className="space-y-4">
-      <div className="h-8 bg-slate-800 rounded animate-pulse w-48" />
-      {[...Array(6)].map((_, i) => <div key={i} className="h-12 bg-slate-800 rounded-xl animate-pulse" />)}
+    <div className="min-h-screen flex items-center justify-center">
+      <div className="flex flex-col items-center gap-4">
+        <div className="w-12 h-12 border-2 border-[#00ff88]/30 border-t-[#00ff88] rounded-full animate-spin" />
+        <p className="text-slate-500 text-sm">Loading trade history...</p>
+      </div>
     </div>
   )
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-8">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">📋 Trade History</h1>
-        <span className="text-xs text-slate-500">{trades.length} fills</span>
+        <div>
+          <h1 className="text-3xl font-bold tracking-tight">📋 Trade History</h1>
+          <p className="text-slate-500 text-sm mt-1">{trades.length} total fills · Auto-refresh 10s</p>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <div className="w-2 h-2 rounded-full bg-[#00ff88] live-dot" />
+          <span className="text-xs text-[#00ff88]/70">LIVE</span>
+        </div>
       </div>
 
-      {trades.length === 0 ? (
-        <div className="bg-slate-800 rounded-xl p-6 border border-slate-700 text-center py-10">
-          <p className="text-slate-400">No trades logged yet. Trades appear as the bot auto-executes.</p>
+      {/* Filter Tabs */}
+      <div className="flex gap-2">
+        {filters.map(f => (
+          <button key={f} onClick={() => setFilter(f)}
+            className={`px-5 py-2 rounded-xl text-xs font-semibold transition-all ${
+              filter === f
+                ? 'bg-[#00ff88]/15 text-[#00ff88] border border-[#00ff88]/30 shadow-[0_0_15px_rgba(0,255,136,0.15)]'
+                : 'glass-card text-slate-400 hover:text-white'
+            }`}>
+            {f}
+          </button>
+        ))}
+      </div>
+
+      {/* Timeline */}
+      {filtered.length === 0 ? (
+        <div className="glass-card p-12 text-center">
+          <p className="text-slate-400 text-lg">No trades {filter !== 'ALL' ? `for "${filter}"` : 'recorded yet'}</p>
         </div>
       ) : (
-        <div className="bg-slate-800 rounded-xl border border-slate-700 overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-slate-400 border-b border-slate-700 text-xs uppercase">
-                <th className="text-left py-3 px-3">Time</th>
-                <th className="text-left py-3 px-3">Symbol</th>
-                <th className="text-left py-3 px-3">Side</th>
-                <th className="text-right py-3 px-3">Qty</th>
-                <th className="text-right py-3 px-3">Price</th>
-                <th className="text-left py-3 px-3">Strategy</th>
-                <th className="text-left py-3 px-3">Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {trades.map((t: any, idx: number) => {
-                const side = (t.side || '').toLowerCase()
-                const time = t.filled_at || t.created_at || t.time || ''
-                return (
-                  <tr key={t.id || idx} className="hover:bg-slate-700/50 border-b border-slate-700/50">
-                    <td className="py-2 px-3 text-slate-400 text-xs font-mono">{time ? new Date(time).toLocaleString() : '—'}</td>
-                    <td className="py-2 px-3 font-mono font-bold text-white">{t.symbol}</td>
-                    <td className="py-2 px-3">
-                      <span className={`px-2 py-0.5 rounded text-xs font-bold ${
-                        side === 'buy' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
-                      }`}>
-                        {side === 'buy' ? '🟢 BUY' : '🔴 SELL'}
+        <div className="relative timeline-line pl-10 space-y-1 stagger-enter">
+          {filtered.map((t: any, idx: number) => {
+            const side = (t.side || '').toLowerCase()
+            const isBuy = side === 'buy'
+            const time = t.filled_at || t.created_at || t.time || ''
+            const strategy = extractStrategy(t)
+
+            return (
+              <div key={t.id || idx} className="relative flex items-start gap-4 pb-4">
+                {/* Dot */}
+                <div className={`absolute left-[-24px] top-2 w-3.5 h-3.5 rounded-full border-2 z-10 ${
+                  isBuy ? 'bg-[#00ff88] border-[#00ff88]/50 shadow-[0_0_8px_rgba(0,255,136,0.5)]' : 'bg-red-500 border-red-500/50 shadow-[0_0_8px_rgba(255,68,68,0.5)]'
+                }`} />
+
+                {/* Card */}
+                <div className="glass-card p-4 flex-1 flex items-center gap-4 hover:border-white/15 transition-all">
+                  {/* Time */}
+                  <div className="shrink-0 w-20">
+                    <p className="text-[10px] text-slate-500 font-mono">{time ? new Date(time).toLocaleDateString() : ''}</p>
+                    <p className="text-xs text-slate-400 font-mono">{time ? new Date(time).toLocaleTimeString() : '—'}</p>
+                  </div>
+
+                  {/* Symbol Avatar */}
+                  <div className={`w-9 h-9 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${isBuy ? 'bg-[#00ff88]/15 text-[#00ff88]' : 'bg-red-500/15 text-red-400'}`}>
+                    {(t.symbol || '??').slice(0, 2)}
+                  </div>
+
+                  {/* Info */}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-mono font-bold text-white">{t.symbol}</span>
+                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${isBuy ? 'bg-[#00ff88]/15 text-[#00ff88]' : 'bg-red-500/15 text-red-400'}`}>
+                        {isBuy ? 'BUY' : 'SELL'}
                       </span>
-                    </td>
-                    <td className="text-right py-2 px-3 font-mono">{t.qty || t.filled_qty || '—'}</td>
-                    <td className="text-right py-2 px-3 font-mono">${Number(t.filled_avg_price || t.price || 0).toFixed(2)}</td>
-                    <td className="py-2 px-3">
-                      <span className="text-xs bg-slate-700 px-2 py-0.5 rounded text-slate-300">{extractStrategy(t)}</span>
-                    </td>
-                    <td className="py-2 px-3">
-                      <span className={`text-xs px-2 py-0.5 rounded ${
-                        t.status === 'filled' ? 'bg-green-500/15 text-green-400' :
-                        t.status === 'partially_filled' ? 'bg-yellow-500/15 text-yellow-400' :
-                        'bg-slate-700 text-slate-400'
-                      }`}>{(t.status || 'filled').toUpperCase()}</span>
-                    </td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full ${strategyStyle(strategy)}`}>{strategy}</span>
+                    </div>
+                  </div>
+
+                  {/* Qty + Price */}
+                  <div className="text-right shrink-0">
+                    <p className="text-sm font-mono text-white">{t.qty || t.filled_qty || '—'} × ${Number(t.filled_avg_price || t.price || 0).toFixed(2)}</p>
+                    <p className="text-[10px] text-slate-500">${(Number(t.qty || 0) * Number(t.filled_avg_price || t.price || 0)).toFixed(0)} total</p>
+                  </div>
+                </div>
+              </div>
+            )
+          })}
         </div>
       )}
-      <p className="text-xs text-slate-600 text-center">Auto-refreshes every 30s</p>
     </div>
   )
 }

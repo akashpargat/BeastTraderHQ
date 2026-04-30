@@ -1,106 +1,169 @@
 'use client'
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 
-const API = typeof window !== 'undefined' ? 'https://api.beast-trader.com' : 'http://localhost:8080'
+const API = 'https://api.beast-trader.com'
+
+interface ServiceCard {
+  icon: string
+  name: string
+  statusKey: string
+  getStatus: (sys: any) => boolean
+  getDetail: (sys: any) => string
+  getSubDetail: (sys: any) => string
+}
+
+const SERVICES: ServiceCard[] = [
+  {
+    icon: '🤖', name: 'GPT-4o',
+    statusKey: 'gpt',
+    getStatus: (s) => s?.ai?.status === 'online' || s?.gpt?.status === 'online',
+    getDetail: (s) => s?.gpt?.endpoint || s?.ai?.url || 'api.openai.com',
+    getSubDetail: (s) => s?.gpt?.last_call ? `Last call: ${new Date(s.gpt.last_call).toLocaleTimeString()}` : '',
+  },
+  {
+    icon: '🧠', name: 'Claude',
+    statusKey: 'claude',
+    getStatus: (s) => s?.claude?.status === 'online' || s?.ai?.status === 'online',
+    getDetail: (s) => s?.claude?.tunnel_url || s?.ai?.url || 'ai.beast-trader.com',
+    getSubDetail: (s) => s?.claude?.last_deep_scan ? `Deep scan: ${new Date(s.claude.last_deep_scan).toLocaleTimeString()}` : '',
+  },
+  {
+    icon: '📺', name: 'TradingView',
+    statusKey: 'tv',
+    getStatus: (s) => s?.tv?.status === 'connected' || s?.tv?.status === 'online',
+    getDetail: (s) => `CDP :${s?.tv?.port || 9222}`,
+    getSubDetail: (s) => s?.tv?.indicators ? `${s.tv.indicators} indicators` : '',
+  },
+  {
+    icon: '💬', name: 'Discord Bot',
+    statusKey: 'bot',
+    getStatus: (s) => s?.bot?.status === 'running' || s?.bot?.status === 'online',
+    getDetail: (s) => s?.bot?.username || 'Beast Trader#5020',
+    getSubDetail: (s) => s?.bot?.uptime || '',
+  },
+  {
+    icon: '🗄️', name: 'PostgreSQL',
+    statusKey: 'db',
+    getStatus: (s) => s?.db?.status === 'online' || s?.db?.status !== 'offline',
+    getDetail: (s) => s?.db?.host || 'localhost:5432',
+    getSubDetail: (s) => s?.db?.tables ? `${s.db.tables} tables` : '',
+  },
+  {
+    icon: '🌐', name: 'Dashboard API',
+    statusKey: 'api',
+    getStatus: () => true,
+    getDetail: () => ':8080',
+    getSubDetail: (s) => s?.api?.endpoints ? `${s.api.endpoints} endpoints` : '',
+  },
+]
+
+const LOOPS = [
+  { name: 'Position Monitor', interval: '60s' },
+  { name: 'Full Scan (TV+AI)', interval: '5min' },
+  { name: 'Decision Report', interval: '10min' },
+  { name: 'Trailing Stop Check', interval: '30s' },
+  { name: 'Portfolio Sync', interval: '2min' },
+]
 
 export default function SystemPage() {
   const [system, setSystem] = useState<any>(null)
-  const [debug, setDebug] = useState<any[]>([])
-  const [alerts, setAlerts] = useState<any[]>([])
 
-  useEffect(() => {
-    fetch(`${API}/api/system`).then(r => r.json()).then(setSystem)
-    fetch(`${API}/api/debug?limit=20`).then(r => r.json()).then(d => setDebug(d.entries || []))
-    fetch(`${API}/api/alerts`).then(r => r.json()).then(d => setAlerts(d.alerts || []))
+  const fetchData = useCallback(() => {
+    fetch(`${API}/api/system`).then(r => r.json()).then(setSystem).catch(() => {})
   }, [])
 
+  useEffect(() => {
+    fetchData()
+    const interval = setInterval(fetchData, 10000)
+    return () => clearInterval(interval)
+  }, [fetchData])
+
+  if (!system) return (
+    <div className="min-h-screen flex items-center justify-center">
+      <div className="flex flex-col items-center gap-4">
+        <div className="w-12 h-12 border-2 border-[#00ff88]/30 border-t-[#00ff88] rounded-full animate-spin" />
+        <p className="text-slate-500 text-sm">Checking systems...</p>
+      </div>
+    </div>
+  )
+
   return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-bold">⚙️ System Status</h1>
-
-      {/* Health Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <HealthCard name="AI Brain" status={system?.ai?.status} detail={system?.ai?.url} icon="🧠" />
-        <HealthCard name="TradingView" status={system?.tv?.status === 'connected' ? 'online' : 'offline'} detail="CDP :9222" icon="📺" />
-        <HealthCard name="Discord Bot" status={system?.bot?.status === 'running' ? 'online' : 'offline'} detail="Beast Trader#5020" icon="🤖" />
-        <HealthCard name="Dashboard API" status="online" detail=":8080" icon="🌐" />
+    <div className="space-y-8">
+      <div>
+        <h1 className="text-3xl font-bold tracking-tight">⚙️ System Status</h1>
+        <p className="text-slate-500 text-sm mt-1">All services · Auto-refresh 10s</p>
       </div>
 
-      {/* Architecture */}
-      <div className="bg-slate-800 rounded-xl p-6 border border-slate-700">
-        <h2 className="text-lg font-semibold mb-3">🏗️ Architecture</h2>
-        <pre className="text-xs text-slate-400 font-mono leading-relaxed">{`
-  Work Laptop                     Azure VM (beast-trader-vm)
-  ┌──────────────┐               ┌──────────────────────────────┐
-  │ copilot-api  │◄──Cloudflare──│ Discord Bot (autonomous)     │
-  │ Claude 4.7   │   Tunnel      │ ├─ 60s position monitor      │
-  │ Flask :5555  │   (permanent) │ ├─ 5min full scan (TV+AI)    │
-  └──────────────┘               │ ├─ 10min decision report     │
-  ai.beast-trader.com            │ ├─ Auto-scalp/runner/dip     │
-                                 │ TradingView Desktop (CDP)    │
-                                 │ Dashboard API (:8080)        │
-                                 │ Dashboard UI (:3000)         │
-                                 └──────────────────────────────┘
-        `}</pre>
-      </div>
+      {/* 6 Service Cards */}
+      <div className="grid grid-cols-2 lg:grid-cols-3 gap-5 stagger-enter">
+        {SERVICES.map((svc) => {
+          const online = svc.getStatus(system)
+          const detail = svc.getDetail(system)
+          const sub = svc.getSubDetail(system)
 
-      {/* Recent Alerts */}
-      {alerts.length > 0 && (
-        <div className="bg-slate-800 rounded-xl p-6 border border-slate-700">
-          <h2 className="text-lg font-semibold mb-3">🔔 Recent Alerts</h2>
-          <div className="space-y-1 max-h-64 overflow-y-auto">
-            {alerts.map((a: any, i: number) => (
-              <div key={i} className="flex gap-3 text-sm py-1.5 border-b border-slate-700/50">
-                <span className="text-slate-500 text-xs w-16">{a.timestamp?.slice(11, 19)}</span>
-                <span className={`px-2 py-0.5 rounded text-xs ${
-                  a.alert_type === 'TRADE' ? 'bg-green-500/20 text-green-400' :
-                  a.alert_type === 'DROP' ? 'bg-red-500/20 text-red-400' :
-                  'bg-yellow-500/20 text-yellow-400'
-                }`}>{a.alert_type}</span>
-                <span className="font-mono">{a.symbol}</span>
-                <span className="text-slate-400 truncate">{a.message?.slice(0, 60)}</span>
+          return (
+            <div key={svc.name} className={`glass-card hover-scale-glow p-5 relative overflow-hidden ${online ? '' : 'opacity-60'}`}>
+              <div className={`absolute top-0 left-0 w-full h-0.5 ${online ? 'bg-[#00ff88]' : 'bg-red-500'}`} />
+              <div className="flex items-center gap-3 mb-3">
+                <span className="text-2xl">{svc.icon}</span>
+                <div>
+                  <h3 className="font-semibold text-white">{svc.name}</h3>
+                  <div className="flex items-center gap-1.5 mt-0.5">
+                    <div className={`w-2 h-2 rounded-full ${online ? 'bg-[#00ff88] live-dot' : 'bg-red-500'}`} />
+                    <span className={`text-xs font-medium ${online ? 'text-[#00ff88]' : 'text-red-400'}`}>
+                      {online ? 'Online' : 'Offline'}
+                    </span>
+                  </div>
+                </div>
               </div>
-            ))}
-          </div>
+              <p className="text-xs text-slate-400 font-mono truncate">{detail}</p>
+              {sub && <p className="text-[10px] text-slate-600 mt-1">{sub}</p>}
+            </div>
+          )
+        })}
+      </div>
+
+      {/* Architecture Diagram */}
+      <div className="glass-card p-6">
+        <h2 className="text-lg font-semibold mb-4">🏗️ Architecture</h2>
+        <pre className="text-[11px] text-slate-400 font-mono leading-relaxed overflow-x-auto">{`
+  Work Laptop                          Azure VM (beast-trader-vm)
+  ┌────────────────┐                  ┌──────────────────────────────────┐
+  │  copilot-api   │◄──Cloudflare────│  Discord Bot (autonomous)        │
+  │  Claude 4.7    │   Tunnel        │  ├─ 60s  position monitor        │
+  │  Flask :5555   │   (permanent)   │  ├─ 5min full scan (TV+AI)       │
+  └────────────────┘                 │  ├─ 10min decision report        │
+  ai.beast-trader.com                │  ├─ Auto-scalp / runner / dip    │
+                                     │                                  │
+                                     │  TradingView Desktop (CDP:9222)  │
+                                     │  Dashboard API (:8080)           │
+                                     │  Dashboard UI  (:3000)           │
+                                     │  PostgreSQL    (:5432)           │
+                                     └──────────────────────────────────┘`}</pre>
+      </div>
+
+      {/* Loop Status */}
+      <div className="glass-card p-6">
+        <h2 className="text-lg font-semibold mb-4">🔄 Autonomous Loops</h2>
+        <div className="space-y-3">
+          {LOOPS.map((loop, i) => {
+            const loopData = system?.loops?.[i] || system?.loops?.find?.((l: any) => l.name?.includes(loop.name.split(' ')[0].toLowerCase()))
+
+            return (
+              <div key={loop.name} className="flex items-center gap-4 py-2 border-b border-white/[0.04] last:border-0">
+                <div className="w-2 h-2 rounded-full bg-[#00ff88] live-dot shrink-0" />
+                <div className="flex-1">
+                  <p className="text-sm text-white font-medium">{loop.name}</p>
+                  <p className="text-[10px] text-slate-500">Every {loop.interval}</p>
+                </div>
+                <span className="text-xs text-slate-500 font-mono">
+                  {loopData?.last_run ? new Date(loopData.last_run).toLocaleTimeString() : '—'}
+                </span>
+              </div>
+            )
+          })}
         </div>
-      )}
-
-      {/* Debug Log */}
-      <div className="bg-slate-800 rounded-xl p-6 border border-slate-700">
-        <h2 className="text-lg font-semibold mb-3">🔧 Debug Log</h2>
-        {debug.length === 0 ? (
-          <p className="text-slate-400">No debug entries. System is clean.</p>
-        ) : (
-          <div className="space-y-1 max-h-64 overflow-y-auto font-mono text-xs">
-            {debug.map((d: any, i: number) => (
-              <div key={i} className={`py-1 ${
-                d.level === 'ERROR' ? 'text-red-400' :
-                d.level === 'WARNING' ? 'text-yellow-400' : 'text-slate-400'
-              }`}>
-                [{d.timestamp?.slice(11, 19)}] {d.level} {d.component}: {d.message?.slice(0, 80)}
-              </div>
-            ))}
-          </div>
-        )}
       </div>
     </div>
   )
 }
-
-function HealthCard({ name, status, detail, icon }: { name: string; status: string; detail?: string; icon: string }) {
-  const isOnline = status === 'online'
-  return (
-    <div className={`card border ${isOnline ? 'border-green-500/30' : 'border-red-500/30'}`}>
-      <div className="flex items-center gap-2 mb-2">
-        <span className="text-xl">{icon}</span>
-        <span className="font-semibold">{name}</span>
-      </div>
-      <div className={`text-sm font-bold ${isOnline ? 'text-green-400' : 'text-red-400'}`}>
-        {isOnline ? '● Online' : '○ Offline'}
-      </div>
-      {detail && <p className="text-xs text-slate-500 mt-1 truncate">{detail}</p>}
-    </div>
-  )
-}
-
-
