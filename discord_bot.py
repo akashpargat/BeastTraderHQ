@@ -1468,7 +1468,8 @@ async def position_monitor():
                 for p in positions:
                     if p.symbol not in protected and p.qty_available and p.qty_available > 0:
                         try:
-                            trail_qty = p.qty_available
+                            # Iron Law 14: trail only HALF — keep other half free for active scalping
+                            trail_qty = max(1, p.qty_available // 2)
                             gateway.place_trailing_stop(p.symbol, trail_qty, trail_percent=3.0,
                                                         reason="Auto-protect (no trailing stop found)",
                                                         entry_price=p.avg_entry)
@@ -1551,51 +1552,43 @@ async def position_monitor():
 
             _prev_prices[p.symbol] = p.current_price
 
-        # ── LAW 9: Count active scalps (positions < +2%) ──
-        active_scalps = sum(1 for p in positions if 0 < _pct(p) < 2.0)
-
-        # ── AUTO-BUY DIPS (Akash Method) ──
+        # ── AUTO-BUY DIPS (Akash Method) — no limits, Beast mode ──
         if _is_trading_hours() and _cycle_count % 5 == 0:
-            # Law 9: Max 3 active scalps at a time
-            if active_scalps >= MAX_ACTIVE_SCALPS:
-                log.info(f"  Law 9: {active_scalps} active scalps (max {MAX_ACTIVE_SCALPS}). Skipping new buys.")
-                _pg_log("BLOCKED", reason=f"Law 9: {active_scalps} scalps (max {MAX_ACTIVE_SCALPS})", source="60s")
-            else:
-                try:
-                    from alpaca.data.historical import StockHistoricalDataClient
-                    from alpaca.data.requests import StockSnapshotRequest
-                    dc = StockHistoricalDataClient(os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'))
-                    watch = [s for s in DIP_BUY_WATCHLIST if s not in held_symbols][:8]
-                    if watch:
-                        snaps = dc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=watch, feed='iex'))
-                        for sym, snap in snaps.items():
-                            try:
-                                price = float(snap.latest_trade.price)
-                                prev_close = float(snap.previous_daily_bar.close)
-                                day_change = (price - prev_close) / prev_close * 100
-                                # Akash Method: buy if >5% daily drop
-                                if day_change <= -5.0 and not _prev_prices.get(f"_dipbuy_{sym}"):
-                                    acct = gateway.get_account()
-                                    equity = float(acct.get('equity', 100000))
-                                    qty = max(1, int(equity * 0.03 / price))
-                                    buy_price = round(price * 0.998, 2)
-                                    gateway.quick_buy(sym, qty, buy_price,
-                                                      reason=f"Akash Method: {day_change:+.1f}% dip",
-                                                      day_change_pct=day_change)
-                                    _prev_prices[f"_dipbuy_{sym}"] = True
-                                    _log_trade("LIMIT BUY (Akash Method)", sym, qty, buy_price,
-                                               f"{day_change:+.1f}% daily drop. Oversold dip buy.", "60s Monitor")
-                                    if channel:
-                                        await channel.send(
-                                            f"📉 **[60s] AKASH DIP BUY: {sym}** {day_change:+.1f}%\n"
-                                            f"Buy {qty} @ ${buy_price} | Exit: +2% (${buy_price * 1.02:.2f})")
-                            except:
-                                pass
-                except Exception as e:
-                    log.debug(f"Dip scan: {e}")
+            try:
+                from alpaca.data.historical import StockHistoricalDataClient
+                from alpaca.data.requests import StockSnapshotRequest
+                dc = StockHistoricalDataClient(os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'))
+                watch = [s for s in DIP_BUY_WATCHLIST if s not in held_symbols][:8]
+                if watch:
+                    snaps = dc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=watch, feed='iex'))
+                    for sym, snap in snaps.items():
+                        try:
+                            price = float(snap.latest_trade.price)
+                            prev_close = float(snap.previous_daily_bar.close)
+                            day_change = (price - prev_close) / prev_close * 100
+                            # Akash Method: buy if >5% daily drop
+                            if day_change <= -5.0 and not _prev_prices.get(f"_dipbuy_{sym}"):
+                                acct = gateway.get_account()
+                                equity = float(acct.get('equity', 100000))
+                                qty = max(1, int(equity * 0.03 / price))
+                                buy_price = round(price * 0.998, 2)
+                                gateway.quick_buy(sym, qty, buy_price,
+                                                  reason=f"Akash Method: {day_change:+.1f}% dip",
+                                                  day_change_pct=day_change)
+                                _prev_prices[f"_dipbuy_{sym}"] = True
+                                _log_trade("LIMIT BUY (Akash Method)", sym, qty, buy_price,
+                                           f"{day_change:+.1f}% daily drop. Oversold dip buy.", "60s Monitor")
+                                if channel:
+                                    await channel.send(
+                                        f"📉 **[60s] AKASH DIP BUY: {sym}** {day_change:+.1f}%\n"
+                                        f"Buy {qty} @ ${buy_price} | Exit: +2% (${buy_price * 1.02:.2f})")
+                        except:
+                            pass
+            except Exception as e:
+                log.debug(f"Dip scan: {e}")
 
-        # ── PHASE 0: Past Winners scan (Rule #21) ──
-        if _is_trading_hours() and _cycle_count % 10 == 0 and active_scalps < MAX_ACTIVE_SCALPS:
+        # ── PHASE 0: Past Winners scan (Rule #21) — no limits ──
+        if _is_trading_hours() and _cycle_count % 10 == 0:
             try:
                 from alpaca.data.historical import StockHistoricalDataClient
                 from alpaca.data.requests import StockSnapshotRequest
@@ -1863,7 +1856,7 @@ async def full_scan():
                     continue
 
                 try:
-                    if action == 'BUY' and sym not in held_syms and active_scalps < MAX_ACTIVE_SCALPS:
+                    if action == 'BUY' and sym not in held_syms:
                         pos = next((p for p in positions if p.symbol == sym), None)
                         price = pos.current_price if pos else 0
                         if price <= 0:
@@ -2176,12 +2169,9 @@ async def fast_runner_scan():
         channel = bot.get_channel(SCAN_CHANNEL_ID)
         positions = gateway.get_positions()
         held_syms = {p.symbol for p in positions}
-        active_scalps = sum(1 for p in positions if 0 < _pct(p) < 2.0)
+        # No scalp limit — Beast mode, let it roll
 
-        if active_scalps >= MAX_ACTIVE_SCALPS:
-            return
-
-        # Scan past winners + watchlist for runners
+        # Scan past winners + watchlist — INCLUDE stocks we hold that are dipping (add to position)
         scan_list = [s for s in (PAST_WINNERS + DIP_BUY_WATCHLIST[:10]) if s not in held_syms]
         scan_list = list(dict.fromkeys(scan_list))[:15]  # dedupe, max 15
 
@@ -2219,8 +2209,10 @@ async def fast_runner_scan():
 
         for r in runners[:3]:  # Max 3 candidates per scan
             sym = r['symbol']
-            if _prev_prices.get(f"_runner_buy_{sym}"):
-                continue  # Already bought this session
+            # Allow re-buying after 30 min cooldown (Akash Method: buy → sell → rebuy)
+            last_buy_time = _prev_prices.get(f"_runner_buy_time_{sym}", 0)
+            if time.time() - last_buy_time < 1800:  # 30 min cooldown
+                continue
 
             # Quick sentiment check
             try:
@@ -2246,7 +2238,7 @@ async def fast_runner_scan():
             )
 
             if result and result.state.value != 'REJECTED':
-                _prev_prices[f"_runner_buy_{sym}"] = True
+                _prev_prices[f"_runner_buy_time_{sym}"] = time.time()  # 30min cooldown
                 _log_trade(f"RUNNER BUY (+{r['pct']:.1f}%)", sym, qty, buy_price,
                            f"Running +{r['pct']:.1f}% with {r['volume']:,} volume, sentiment {sent_score:+d}",
                            "2min Runner")
@@ -2583,7 +2575,7 @@ async def claude_deep_scan():
                     continue
 
                 try:
-                    if action == 'BUY' and sym not in held_syms and active_scalps < MAX_ACTIVE_SCALPS:
+                    if action == 'BUY' and sym not in held_syms:
                         # Auto-buy: 3% of portfolio, limit at current price
                         pos_data = next((pd for pd in mega_data['positions'] if pd['symbol'] == sym), None)
                         price = pos_data['price'] if pos_data else 0
