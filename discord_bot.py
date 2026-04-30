@@ -1252,15 +1252,25 @@ _last_full_scan = 0
 _tv_client = None
 
 # Watchlist for auto-buy dips (Akash Method)
+# Watchlist — starts with hardcoded, then loads from PostgreSQL (grows forever)
 DIP_BUY_WATCHLIST = ['AAPL', 'AMZN', 'GOOGL', 'META', 'MSFT', 'NVDA', 'TSLA',
                      'AMD', 'TSM', 'INTC', 'CRM', 'PLTR', 'OXY', 'DVN', 'LMT',
-                     'SOFI', 'COIN', 'ROKU', 'SQ', 'SNAP', 'UBER', 'SHOP',
-                     'MU', 'MRVL', 'ARM', 'SMCI', 'NOK', 'PLUG', 'NIO', 'RIVN',
-                     'AVGO', 'QCOM', 'HOOD', 'MSTR', 'F', 'ORCL', 'NOW',
-                     'CRWD', 'PANW', 'NET', 'DDOG', 'ZS',  # cybersecurity/cloud
-                     'XOM', 'CVX', 'SLB', 'HAL',            # energy
-                     'BA', 'RTX', 'GD', 'NOC',              # defense
-                     'TQQQ', 'SOXL']                         # leveraged for momentum
+                     'SOFI', 'COIN', 'AVGO', 'QCOM', 'HOOD', 'MSTR', 'NOK', 'MU']
+
+# Load full watchlist from PostgreSQL (213+ stocks, grows with every scan)
+try:
+    from db_postgres import BeastDB
+    _wl_db = BeastDB()
+    if _wl_db.conn:
+        _db_watchlist = _wl_db.get_watchlist()
+        if _db_watchlist:
+            for sym in _db_watchlist:
+                if sym not in DIP_BUY_WATCHLIST:
+                    DIP_BUY_WATCHLIST.append(sym)
+            log.info(f"📋 Watchlist loaded: {len(DIP_BUY_WATCHLIST)} stocks from PostgreSQL")
+        _wl_db.close()
+except Exception as e:
+    log.debug(f"Watchlist DB load: {e}")
 
 # Past winners — scan these FIRST (Phase 0, Rule #21)
 PAST_WINNERS = ['NOK', 'GOOGL', 'CRM', 'META', 'MSFT', 'NOW', 'AMD', 'NVDA',
@@ -1268,12 +1278,8 @@ PAST_WINNERS = ['NOK', 'GOOGL', 'CRM', 'META', 'MSFT', 'NOW', 'AMD', 'NVDA',
                 'AVGO', 'AMZN', 'TSLA', 'PLTR', 'MU', 'TSM']
 
 # Rule #29: Don't chase stocks already up >5% WITHOUT catalyst
-# NOK +18% with NVIDIA deal = OK. Random +5% no news = BLOCK.
 MAX_CHASE_PCT = 5.0
-CATALYST_SENTIMENT_THRESHOLD = 3  # sentiment >= +3 = has catalyst, allow chase
-
-# Law 9: Max simultaneous scalp positions (< 2% profit)
-MAX_ACTIVE_SCALPS = 3
+CATALYST_SENTIMENT_THRESHOLD = 3
 
 # Telegram notifier (sends to BOTH Telegram + Discord)
 _notifier = None
@@ -2203,9 +2209,12 @@ async def fast_runner_scan():
                             vol = int(s.daily_bar.volume) if s.daily_bar else 0
                             if price > 5 and vol > 100000 and abs(pct) > 2:
                                 runners.append({'symbol': sym, 'price': price, 'pct': pct, 'volume': vol, 'prev': prev})
-                                # Auto-add to our memory — never forget a mover
+                                # Persist to PostgreSQL — watchlist grows forever
                                 if sym not in DIP_BUY_WATCHLIST:
                                     DIP_BUY_WATCHLIST.append(sym)
+                                pg = _get_pg()
+                                if pg:
+                                    pg.add_to_watchlist(sym, source='most_active', pct=round(pct, 1), volume=vol)
                         except:
                             pass
             except Exception as e:

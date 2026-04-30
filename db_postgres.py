@@ -557,6 +557,38 @@ class BeastDB:
             return result
         return {'error': f'Unknown: {action}. Use /buy /sell /cancel /status /kill /resume /debug'}
 
+    # ══════════════════════════════════════════════
+    #  WATCHLIST (grows forever, never shrinks)
+    # ══════════════════════════════════════════════
+
+    def add_to_watchlist(self, symbol, source='market_scan', pct=None, volume=None):
+        """Add a symbol to watchlist. If exists, update last_seen. Never removes."""
+        self._exec(
+            """INSERT INTO watchlist (symbol, source, first_seen_pct, first_seen_volume)
+               VALUES (%s, %s, %s, %s)
+               ON CONFLICT (symbol) DO UPDATE SET last_seen_at = NOW()""",
+            (symbol.upper(), source, pct, volume)
+        )
+
+    def get_watchlist(self):
+        """Get all watchlist symbols."""
+        rows = self._exec("SELECT symbol FROM watchlist WHERE is_active = TRUE ORDER BY last_seen_at DESC", fetch=True)
+        return [r['symbol'] for r in rows] if rows else []
+
+    def get_watchlist_full(self):
+        """Get full watchlist with stats."""
+        return self._exec(
+            "SELECT * FROM watchlist WHERE is_active = TRUE ORDER BY last_seen_at DESC",
+            fetch=True
+        ) or []
+
+    def update_watchlist_stats(self, symbol, pnl=0):
+        """Update trade count and P&L for a watchlist symbol."""
+        self._exec(
+            "UPDATE watchlist SET times_traded = times_traded + 1, total_pnl = total_pnl + %s, last_seen_at = NOW() WHERE symbol = %s",
+            (pnl, symbol.upper())
+        )
+
     def close(self):
         if self.conn:
             try:
