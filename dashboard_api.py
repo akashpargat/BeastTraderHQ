@@ -1703,6 +1703,55 @@ def v4_signals():
         return jsonify({'error': str(e)})
 
 
+@app.route('/api/v4/blue-chips')
+@require_auth
+def v4_blue_chips():
+    """Get all blue chips."""
+    try:
+        db = _get_v4_db()
+        return jsonify(db.get_all_blue_chips())
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/blue-chips', methods=['POST'])
+@require_auth
+def v4_blue_chips_add():
+    """Add or update a blue chip."""
+    try:
+        db = _get_v4_db()
+        data = request.get_json() or {}
+        symbol = (data.get('symbol') or '').upper()
+        if not symbol:
+            return jsonify({'error': 'symbol required'}), 400
+        db.add_blue_chip(
+            symbol=symbol,
+            name=data.get('name', ''),
+            sector=data.get('sector', ''),
+            tier=int(data.get('tier', 2)),
+            max_loss_pct=float(data.get('max_loss_pct', -10)),
+            notes=data.get('notes', ''),
+            added_by='dashboard'
+        )
+        return jsonify({'ok': True, 'symbol': symbol})
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/v4/blue-chips/<symbol>', methods=['DELETE'])
+@require_auth
+def v4_blue_chips_delete(symbol):
+    """Remove a blue chip (soft delete)."""
+    try:
+        db = _get_v4_db()
+        db._exec("UPDATE blue_chips SET is_active = FALSE WHERE symbol = %s", (symbol.upper(),))
+        db.invalidate_cache(f"blue_{symbol.upper()}")
+        db.invalidate_cache("blue_chips_set")
+        return jsonify({'ok': True, 'removed': symbol.upper()})
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
 if __name__ == '__main__':
     print("Beast V4 Dashboard API starting on port 8080...")
     app.run(host='0.0.0.0', port=8080, debug=False)
