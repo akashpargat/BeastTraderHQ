@@ -1761,6 +1761,69 @@ def v4_blue_chips_delete(symbol):
         return jsonify({'error': str(e)})
 
 
+# ══════════════════════════════════════════════
+#  BACKTESTING ENDPOINTS
+# ══════════════════════════════════════════════
+
+@app.route('/api/v4/backtest/replay')
+@require_auth
+def v4_backtest_replay():
+    """Replay past decisions with current or modified settings."""
+    try:
+        from backtester import BacktestEngine
+        db = _get_v4_db()
+        bt = BacktestEngine(db)
+        days = int(request.args.get('days', 7))
+        result = bt.replay_decisions(days)
+        return jsonify({
+            'trades': result.total_trades, 'wins': result.wins, 'losses': result.losses,
+            'win_rate': round(result.win_rate, 1), 'total_pnl': round(result.total_pnl, 2),
+            'avg_pnl': round(result.avg_pnl, 2), 'profit_factor': round(result.profit_factor, 2),
+            'best_trade': round(result.best_trade, 2), 'worst_trade': round(result.worst_trade, 2),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+@app.route('/api/v4/backtest/what-if')
+@require_auth
+def v4_backtest_what_if():
+    """Compare: current settings vs what-if scenarios."""
+    try:
+        from backtester import BacktestEngine
+        db = _get_v4_db()
+        bt = BacktestEngine(db)
+        return jsonify(bt.replay_what_if())
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+@app.route('/api/v4/backtest/historical')
+@require_auth
+def v4_backtest_historical():
+    """Run strategy backtest on historical data."""
+    try:
+        from backtester import BacktestEngine
+        bt = BacktestEngine()
+        symbol = request.args.get('symbol', 'GOOGL').upper()
+        days = int(request.args.get('days', 90))
+        strategy = request.args.get('strategy', 'all')
+        if strategy == 'all':
+            return jsonify(bt.run_all_strategies(symbol, days))
+        else:
+            r = bt.historical_backtest(symbol, days, strategy)
+            return jsonify({
+                'symbol': symbol, 'strategy': strategy, 'period': f'{days}d',
+                'trades': r.total_trades, 'wins': r.wins, 'win_rate': round(r.win_rate, 1),
+                'total_pnl': round(r.total_pnl, 2), 'avg_pnl': round(r.avg_pnl, 2),
+                'profit_factor': round(r.profit_factor, 2),
+                'max_drawdown': round(r.max_drawdown, 2),
+                'best_trade': round(r.best_trade, 2), 'worst_trade': round(r.worst_trade, 2),
+                'trades_detail': [{'sym': t.symbol, 'pnl': t.pnl, 'pnl_pct': round(t.pnl_pct, 2),
+                                   'reason': t.reason, 'date': t.timestamp} for t in r.trades[:50]],
+            })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
 if __name__ == '__main__':
     print("Beast V4 Dashboard API starting on port 8080...")
     app.run(host='0.0.0.0', port=8080, debug=False)

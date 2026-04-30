@@ -15,6 +15,7 @@ const navLinks = [
   { href: '/stops', label: '🛡️ Stops' },
   { href: '/sectors', label: '🗺️ Sectors' },
   { href: '/analytics', label: '📈 Analytics' },
+  { href: '/backtest', label: '🔬 Backtest' },
   { href: '/activity', label: '⚡ Activity' },
   { href: '/scans', label: '🔍 Scans' },
   { href: '/news', label: '📰 News' },
