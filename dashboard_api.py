@@ -47,15 +47,39 @@ def _create_token(username: str) -> str:
 
 
 def _verify_token(token: str) -> bool:
-    if not token:
+    """Verify token by checking signature — works even after API restart."""
+    if not token or token == 'null' or token == 'undefined' or len(token) < 10:
         return False
+    # Check in-memory cache first
     session = _active_tokens.get(token)
-    if not session:
+    if session:
+        if int(_time.time()) > session['expires']:
+            _active_tokens.pop(token, None)
+            return False
+        return True
+    # Verify signature (works after restart — no memory needed)
+    try:
+        import base64
+        decoded = base64.b64decode(token).decode()
+        parts = decoded.rsplit(':', 1)
+        if len(parts) != 2:
+            return False
+        payload, signature = parts
+        expected_sig = hmac.new(JWT_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected_sig):
+            return False
+        # Check expiry from payload
+        payload_parts = payload.split(':')
+        if len(payload_parts) >= 2:
+            expiry = int(payload_parts[1])
+            if int(_time.time()) > expiry:
+                return False
+        # Valid — re-cache it
+        username = payload_parts[0] if payload_parts else 'unknown'
+        _active_tokens[token] = {'username': username, 'expires': expiry}
+        return True
+    except Exception:
         return False
-    if int(_time.time()) > session['expires']:
-        _active_tokens.pop(token, None)
-        return False
-    return True
 
 
 def _check_rate_limit(ip: str) -> bool:
@@ -82,6 +106,11 @@ def _record_failure(ip: str):
 def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
+        # Check API key first (bot/system calls)
+        api_key = request.headers.get('X-API-Key', '')
+        if api_key == os.getenv('AI_API_KEY', 'beast-v3-sk-7f3a9e2b4d1c8f5e6a0b3d9c'):
+            return f(*args, **kwargs)
+        # Check Bearer token (dashboard login)
         auth_header = request.headers.get('Authorization', '')
         token = ''
         if auth_header.startswith('Bearer '):
@@ -90,13 +119,17 @@ def require_auth(f):
             token = request.cookies.get('beast_token', '')
         if not token:
             token = request.args.get('token', '')
-        if not _verify_token(token):
-            return jsonify({'error': 'Unauthorized', 'login_required': True}), 401
-        return f(*args, **kwargs)
+        if token and _verify_token(token):
+            return f(*args, **kwargs)
+        # No valid auth — return 401
+        return jsonify({'error': 'Unauthorized', 'login_required': True}), 401
     return decorated
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": "*"}},
+     supports_credentials=True,
+     allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+     methods=["GET", "POST", "OPTIONS"])
 
 
 @app.route('/api/login', methods=['POST'])
