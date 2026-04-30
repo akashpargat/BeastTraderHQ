@@ -1466,112 +1466,334 @@ _cached_vix = 18.0  # Default neutral VIX
 
 
 def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=0, source="bot", **kwargs):
-    """SMART BUY: Trends → TV confirm → Self-learn → VIX size → Execute.
-    Every decision (buy/skip/block) is logged to trade_decisions for audit + learning."""
+    """SMART BUY PIPELINE — 7 gates, every buy must pass ALL.
+    
+    Gate 1: AI Trends (Claude daily avoid/buy recommendations)
+    Gate 2: Sell Cooldown (5 min after selling same stock)
+    Gate 3: Anti-Buyback (won't rebuy higher than we sold)
+    Gate 4: TV Confirmation (HARD LAW — needs 2+ bullish indicators)
+    Gate 5: Self-Learning (historical win rate for this stock)
+    Gate 6: VIX Sizing (fear-based position adjustment)
+    Gate 7: Execute (place the order via gateway)
+    
+    HEAVY LOGGING: Every gate logs PASS/FAIL with full context.
+    Format designed for human debugging — paste logs to diagnose any trade.
+    
+    All data stored to trade_decisions + trade_log for learning feedback loop.
+    
+    kwargs: confidence, sentiment_data, ai_verdict_data, vix, regime,
+            spy_change, heat_pct, position_count
+    """
     pg = _get_pg()
-    decision_ctx = {'reason': reason, 'day_change_pct': day_change_pct, 'sentiment': sentiment_score}
+    
+    # ── Capture all context upfront ──
+    _sent_data = kwargs.get('sentiment_data') or {'total': sentiment_score}
+    _ai_data = kwargs.get('ai_verdict_data')
+    _confidence = kwargs.get('confidence', 0)
+    original_qty = qty
+    decision_ctx = {'reason': reason, 'day_change_pct': day_change_pct,
+                    'sentiment': sentiment_score, 'source': source,
+                    'original_qty': qty, 'vix': _cached_vix}
+    steps = []  # Pipeline audit trail
+    
+    # ── Header ──
+    log.info(f"")
+    log.info(f"  {'='*50}")
+    log.info(f"  SMART_BUY PIPELINE: {symbol}")
+    log.info(f"  {'-'*50}")
+    log.info(f"    Input: {qty}x @${price:.2f} | source={source}")
+    log.info(f"    Reason: {reason[:80]}")
+    log.info(f"    Context: dayChg={day_change_pct:+.1f}% sent={sentiment_score:+d} "
+             f"vix={_cached_vix:.1f} aiConf={_confidence}%")
+    if _ai_data:
+        log.info(f"    AI verdict: {_ai_data.get('action','?')} ({_ai_data.get('confidence',0)}%) "
+                 f"— {str(_ai_data.get('reasoning',''))[:60]}")
+    log.info(f"  {'-'*50}")
 
-    # CHECK AI TRENDS FIRST: does Claude recommend avoiding this stock?
+    # ══════════════════════════════════════════════
+    # GATE 1: AI TREND CHECK
+    # Checks: Claude daily avoid list, earnings patterns, Claude buy recs
+    # ══════════════════════════════════════════════
     if pg:
         try:
             trends = pg.get_trends(symbol=symbol)
+            log.info(f"    [G1 TRENDS] Found {len(trends)} stored trends for {symbol}")
             for t in trends:
                 ttype = t.get('trend_type', '')
+                conf = t.get('confidence', 0)
+                insight = str(t.get('insight', ''))[:60]
+                log.info(f"      > {ttype} (conf:{conf}): {insight}")
+                
+                # BLOCK: Claude said avoid this stock
                 if ttype == 'claude_daily_avoid':
-                    log.info(f"  🧠 TREND BLOCK: {symbol} — Claude daily avoid: {t.get('insight','')[:60]}")
-                    _pg_log("TREND_BLOCKED", symbol=symbol, reason=f"Claude avoid: {t.get('insight','')[:80]}", source=source)
-                    if pg: pg.log_decision(symbol, 'BLOCK', 0, block_reason=f"Claude avoid: {t.get('insight','')[:80]}",
-                                           trend_data={'trends': [dict(t)]}, strategy=source, price_at_decision=price)
+                    log.info(f"    [G1] BLOCKED: Claude daily avoid — {insight}")
+                    steps.append(f"G1:BLOCKED claude_avoid")
+                    _pg_log("TREND_BLOCKED", symbol=symbol,
+                            reason=f"Claude avoid: {insight}", source=source)
+                    pg.log_decision(symbol, 'BLOCK', 0,
+                        block_reason=f"Claude avoid: {insight}",
+                        trend_data={'trends': [dict(t)], 'pipeline': steps},
+                        sentiment_data=_sent_data, ai_verdict=_ai_data,
+                        strategy=source, price_at_decision=price)
+                    log.info(f"  {'='*50}\n")
                     return None
+                
+                # BLOCK: Stock dips after earnings and earnings is TODAY
                 if ttype == 'earnings_pattern' and 'DIPS_AFTER' in str(t.get('insight', '')):
                     sa = SentimentAnalyst()
                     earn = sa.get_earnings_info(symbol)
-                    if earn.get('days_until', 999) == 0:
-                        log.info(f"  🧠 TREND: {symbol} dips after earnings (today!) — waiting for lower entry")
-                        _pg_log("TREND_WAIT", symbol=symbol, reason="Earnings today + dips pattern — waiting", source=source)
-                        if pg: pg.log_decision(symbol, 'SKIP', 0, block_reason="Earnings dip pattern — waiting",
-                                               trend_data={'pattern': 'dips_after_earnings'}, strategy=source, price_at_decision=price)
+                    days = earn.get('days_until', 999)
+                    log.info(f"      Earnings in {days} days — dips_after pattern active")
+                    if days == 0:
+                        log.info(f"    [G1] BLOCKED: Earnings TODAY + dips_after pattern")
+                        steps.append("G1:BLOCKED earnings_today_dip")
+                        _pg_log("TREND_WAIT", symbol=symbol,
+                                reason="Earnings today + dips pattern", source=source)
+                        pg.log_decision(symbol, 'SKIP', 0,
+                            block_reason="Earnings TODAY + dips_after pattern",
+                            trend_data={'pattern': 'dips_after', 'days': days},
+                            sentiment_data=_sent_data, ai_verdict=_ai_data,
+                            strategy=source, price_at_decision=price)
+                        log.info(f"  {'='*50}\n")
                         return None
-                if ttype == 'claude_daily_buy' and t.get('confidence', 0) >= 70:
+                
+                # BOOST: Claude recommended buying this stock
+                if ttype == 'claude_daily_buy' and conf >= 70:
+                    old_qty = qty
                     qty = int(qty * 1.3)
-                    log.info(f"  🧠 TREND BOOST: {symbol} — Claude daily buy rec ({t.get('confidence')}%)")
+                    log.info(f"    [G1] BOOST: Claude buy rec (conf:{conf}%) — qty {old_qty}->{qty}")
+                    steps.append(f"G1:BOOST qty {old_qty}->{qty}")
                     decision_ctx['claude_boost'] = True
-        except:
-            pass
+            
+            log.info(f"    [G1] PASSED: No blocking trends")
+            steps.append("G1:PASS")
+        except Exception as e:
+            log.info(f"    [G1] ERROR reading trends: {e} — proceeding anyway")
+            steps.append(f"G1:ERROR {e}")
+    else:
+        log.info(f"    [G1] SKIPPED: No DB connection")
+        steps.append("G1:SKIP no_db")
 
-    # DB-backed cooldown check (survives restarts)
-    if pg and pg.check_sell_cooldown(symbol, int(pg.get_config('cooldown_after_sell_sec', 300))):
-        log.info(f"  ⏳ COOLDOWN: {symbol} — recently sold, waiting")
-        pg.log_decision(symbol, 'BLOCK', 0, block_reason="Sell cooldown active", strategy=source, price_at_decision=price)
+    # ══════════════════════════════════════════════
+    # GATE 2: SELL COOLDOWN
+    # Prevents emotional re-entries after selling same stock
+    # INTC lesson: sold $87, rebought $93 = -$165
+    # ══════════════════════════════════════════════
+    cooldown_sec = int(pg.get_config('cooldown_after_sell_sec', 300)) if pg else 300
+    if pg and pg.check_sell_cooldown(symbol, cooldown_sec):
+        mem = pg.get_price_memory(symbol)
+        sell_time = str(mem.get('last_sell_time', '?'))[:19]
+        sell_price = mem.get('last_sell_price', 0)
+        log.info(f"    [G2] BLOCKED: Sold {symbol} at {sell_time} @${sell_price:.2f} — "
+                 f"cooldown {cooldown_sec}s not elapsed")
+        steps.append(f"G2:BLOCKED cooldown sold@{sell_price:.2f}")
+        pg.log_decision(symbol, 'BLOCK', 0,
+            block_reason=f"Sell cooldown ({cooldown_sec}s) — sold @${sell_price:.2f}",
+            sentiment_data=_sent_data, ai_verdict=_ai_data,
+            signals={'pipeline': steps, 'cooldown_sec': cooldown_sec,
+                     'sell_time': sell_time, 'sell_price': sell_price},
+            strategy=source, price_at_decision=price)
+        log.info(f"  {'='*50}\n")
         return None
+    log.info(f"    [G2] PASSED: No sell cooldown (limit={cooldown_sec}s)")
+    steps.append("G2:PASS")
 
-    # DB-backed anti-buyback (survives restarts)
+    # ══════════════════════════════════════════════
+    # GATE 3: ANTI-BUYBACK
+    # Won't rebuy higher than we sold — prevents round-trip losses
+    # ══════════════════════════════════════════════
     if pg and pg.check_anti_buyback(symbol, price):
         mem = pg.get_price_memory(symbol)
-        log.info(f"  🚫 ANTI-BUYBACK: {symbol} — sold at ${mem.get('last_sell_price',0):.2f}, now ${price:.2f}")
-        pg.log_decision(symbol, 'BLOCK', 0, block_reason=f"Anti-buyback: sold at ${mem.get('last_sell_price',0):.2f}",
-                        strategy=source, price_at_decision=price)
+        sold_at = mem.get('last_sell_price', 0)
+        diff = price - sold_at
+        log.info(f"    [G3] BLOCKED: Anti-buyback — sold @${sold_at:.2f}, "
+                 f"now @${price:.2f} (+${diff:.2f} higher)")
+        steps.append(f"G3:BLOCKED sold@{sold_at:.2f} rebuy@{price:.2f}")
+        pg.log_decision(symbol, 'BLOCK', 0,
+            block_reason=f"Anti-buyback: sold @${sold_at:.2f}, now ${price:.2f}",
+            sentiment_data=_sent_data, ai_verdict=_ai_data,
+            signals={'pipeline': steps, 'sold_at': sold_at, 'rebuy_at': price},
+            strategy=source, price_at_decision=price)
+        log.info(f"  {'='*50}\n")
         return None
+    log.info(f"    [G3] PASSED: No anti-buyback issue")
+    steps.append("G3:PASS")
 
-    # HARD LAW: TV must confirm
+    # ══════════════════════════════════════════════
+    # GATE 4: TV CONFIRMATION (HARD LAW)
+    # The most important gate — no TV = no trade, period.
+    # Needs 2+ bullish signals from RSI, MACD, VWAP, EMA, confluence
+    # ══════════════════════════════════════════════
+    log.info(f"    [G4] Scanning TradingView for {symbol}...")
     confirmed, tv = _tv_confirm_buy(symbol)
+    if tv:
+        log.info(f"      RSI={tv.get('rsi',0):.0f} MACD={tv.get('macd_hist',0):.3f} "
+                 f"VWAP={'ABOVE' if tv.get('vwap_above') else 'BELOW'} "
+                 f"Conf={tv.get('confluence',0)}/10 "
+                 f"EMA9={tv.get('ema_9',0):.1f}/{tv.get('ema_21',0):.1f} "
+                 f"Vol={tv.get('volume_ratio',0):.1f}x BB={tv.get('bb_position','?')}")
+        log.info(f"      Bullish signals: {tv.get('_signals',0)} | Confirmed: {confirmed}")
+    else:
+        log.info(f"      NO TV DATA — Hard Law blocks this buy")
+    
     if not confirmed:
-        if pg: pg.log_decision(symbol, 'BLOCK', 0, tv_data=tv, block_reason="TV rejected",
-                               strategy=source, price_at_decision=price)
+        reason_str = f"TV rejected ({tv.get('_signals',0)} signals)" if tv else "No TV data"
+        log.info(f"    [G4] BLOCKED: {reason_str}")
+        steps.append(f"G4:BLOCKED {reason_str}")
+        if pg:
+            pg.log_decision(symbol, 'BLOCK', 0,
+                tv_data=tv, block_reason=reason_str,
+                sentiment_data=_sent_data, ai_verdict=_ai_data,
+                signals={'pipeline': steps},
+                strategy=source, price_at_decision=price)
+        log.info(f"  {'='*50}\n")
         return None
+    log.info(f"    [G4] PASSED: TV confirmed ({tv.get('_signals',0)} bullish signals)")
+    steps.append(f"G4:PASS signals={tv.get('_signals',0)}")
 
-    # Self-learning: check trade history
+    # ══════════════════════════════════════════════
+    # GATE 5: SELF-LEARNING
+    # Checks: how did we do LAST TIME we traded this stock?
+    # Adjusts qty: proven winners get MORE, losers get LESS
+    # ══════════════════════════════════════════════
     if pg:
         try:
             advice = pg.should_trade_stock(symbol)
-            if not advice.get('trade', True):
-                log.info(f"  🧠 Self-learn: SKIP {symbol} — {advice.get('reason', '')}")
-                _pg_log("SELF_LEARN_SKIP", symbol=symbol, reason=advice.get('reason', ''), source=source)
-                pg.log_decision(symbol, 'SKIP', 0, block_reason=f"Self-learn: {advice.get('reason','')}",
-                                strategy=source, price_at_decision=price)
+            trade_ok = advice.get('trade', True)
+            size = advice.get('size', 'normal')
+            learn_reason = advice.get('reason', 'no history')
+            log.info(f"    [G5] History: trade={trade_ok} size={size} — {learn_reason[:60]}")
+            
+            if not trade_ok:
+                log.info(f"    [G5] BLOCKED: Self-learn says SKIP — {learn_reason}")
+                steps.append(f"G5:BLOCKED {learn_reason[:30]}")
+                _pg_log("SELF_LEARN_SKIP", symbol=symbol,
+                        reason=learn_reason, source=source)
+                pg.log_decision(symbol, 'SKIP', 0,
+                    tv_data=tv, block_reason=f"Self-learn: {learn_reason}",
+                    sentiment_data=_sent_data, ai_verdict=_ai_data,
+                    signals={'pipeline': steps, 'advice': advice},
+                    strategy=source, price_at_decision=price)
+                log.info(f"  {'='*50}\n")
                 return None
-            if advice.get('size') == 'large':
+            if size == 'large':
+                old_qty = qty
                 qty = int(qty * 1.5)
-            elif advice.get('size') == 'small':
+                log.info(f"    [G5] BOOST: Proven winner — qty {old_qty}->{qty}")
+                steps.append(f"G5:BOOST {old_qty}->{qty}")
+            elif size == 'small':
+                old_qty = qty
                 qty = max(1, qty // 2)
-        except:
-            pass
+                log.info(f"    [G5] REDUCE: Poor history — qty {old_qty}->{qty}")
+                steps.append(f"G5:REDUCE {old_qty}->{qty}")
+            else:
+                log.info(f"    [G5] PASSED: Normal size")
+                steps.append("G5:PASS normal")
+        except Exception as e:
+            log.info(f"    [G5] ERROR: {e} — proceeding with normal size")
+            steps.append(f"G5:ERROR")
+    else:
+        steps.append("G5:SKIP no_db")
 
-    # Save TV reading to PostgreSQL
+    # ══════════════════════════════════════════════
+    # GATE 6: VIX SIZING
+    # VIX>30 = high fear, halve position. VIX<15 = greed, boost.
+    # ══════════════════════════════════════════════
+    old_qty = qty
+    if _cached_vix > 30:
+        qty = max(1, qty // 2)
+        log.info(f"    [G6] VIX={_cached_vix:.1f} HIGH FEAR — halved qty {old_qty}->{qty}")
+        steps.append(f"G6:HALVED vix={_cached_vix:.0f}")
+    elif _cached_vix > 25:
+        qty = max(1, int(qty * 0.7))
+        log.info(f"    [G6] VIX={_cached_vix:.1f} ELEVATED — reduced qty {old_qty}->{qty}")
+        steps.append(f"G6:REDUCED vix={_cached_vix:.0f}")
+    elif _cached_vix < 15:
+        qty = int(qty * 1.3)
+        log.info(f"    [G6] VIX={_cached_vix:.1f} LOW FEAR — boosted qty {old_qty}->{qty}")
+        steps.append(f"G6:BOOSTED vix={_cached_vix:.0f}")
+    else:
+        log.info(f"    [G6] VIX={_cached_vix:.1f} NORMAL — no adjustment")
+        steps.append(f"G6:PASS vix={_cached_vix:.0f}")
+
+    # ── Persist TV reading ──
     if pg and tv:
         try:
             pg.save_tv_reading(symbol, scan_type=source,
-                             rsi=tv.get('rsi'), macd_hist=tv.get('macd_hist'),
-                             vwap_above=tv.get('vwap_above'), confluence=tv.get('confluence'),
-                             ema_9=tv.get('ema_9'), ema_21=tv.get('ema_21'),
-                             volume_ratio=tv.get('volume_ratio'), price=price)
+                rsi=tv.get('rsi'), macd_hist=tv.get('macd_hist'),
+                vwap_above=tv.get('vwap_above'), confluence=tv.get('confluence'),
+                ema_9=tv.get('ema_9'), ema_21=tv.get('ema_21'),
+                volume_ratio=tv.get('volume_ratio'), price=price)
         except:
             pass
 
-    # EXECUTE THE BUY
+    # ══════════════════════════════════════════════
+    # GATE 7: EXECUTE — All gates passed!
+    # ══════════════════════════════════════════════
+    log.info(f"  {'-'*50}")
+    log.info(f"    ALL 6 GATES PASSED — EXECUTING BUY")
+    log.info(f"    Final order: {symbol} {qty}x @${price:.2f} (original: {original_qty}x)")
+    log.info(f"    Pipeline: {' > '.join(steps)}")
+    
     result = gateway.quick_buy(symbol, qty, price, reason=reason,
                             day_change_pct=day_change_pct,
                             sentiment_score=sentiment_score,
                             vix=_cached_vix, tv_confirmed=True)
 
-    # Log the decision outcome to DB
+    # ── Log outcome with FULL context ──
     if pg:
-        executed = result is not None and hasattr(result, 'state') and result.state.value != 'REJECTED'
-        exec_result = result.state.value if result and hasattr(result, 'state') else 'FAILED'
+        executed = (result is not None and hasattr(result, 'state')
+                    and result.state.value != 'REJECTED')
+        exec_result = (result.state.value
+                       if result and hasattr(result, 'state') else 'FAILED')
         order_id = result.id if result and hasattr(result, 'id') else None
-        pg.log_decision(symbol, 'BUY', confidence=kwargs.get('confidence', 0),
-                        tv_data=tv, signals=decision_ctx,
-                        executed=executed, execution_result=exec_result,
-                        order_id=str(order_id) if order_id else None,
-                        strategy=source, price_at_decision=price)
+        
+        log.info(f"    Result: {'EXECUTED' if executed else 'REJECTED'} — {exec_result}")
+        if order_id:
+            log.info(f"    Order ID: {order_id}")
+        steps.append(f"G7:{'OK' if executed else 'REJECTED'} {exec_result}")
+        
+        # Store decision with ALL context
+        pg.log_decision(symbol, 'BUY', confidence=_confidence,
+            tv_data=tv, sentiment_data=_sent_data, ai_verdict=_ai_data,
+            signals={'pipeline': steps, 'original_qty': original_qty,
+                     'final_qty': qty, 'vix': _cached_vix,
+                     'day_change_pct': day_change_pct},
+            executed=executed, execution_result=exec_result,
+            order_id=str(order_id) if order_id else None,
+            strategy=source, price_at_decision=price)
+        
         if executed:
+            # Record in price memory
             pg.record_buy(symbol, price)
-            pg.set_state('last_trade_time', time.strftime('%Y-%m-%dT%H:%M:%SZ'), 'runtime')
+            # Deep trade log with full AI reasoning
+            pg.log_trade_deep(symbol, 'buy', qty, price,
+                strategy=source, source=source, trigger=reason[:100],
+                tv_at_trade=tv, sentiment_at_trade=_sent_data,
+                ai_verdict_at_trade=_ai_data, confidence=_confidence,
+                ai_reasoning=f"Pipeline: {' > '.join(steps)}",
+                regime=kwargs.get('regime'), vix=_cached_vix,
+                spy_change=kwargs.get('spy_change', 0),
+                heat_pct=kwargs.get('heat_pct', 0),
+                position_count=kwargs.get('position_count', 0),
+                day_change_pct=day_change_pct,
+                order_result=exec_result,
+                order_id=str(order_id) if order_id else None)
+            # Update counters
+            pg.set_state('last_trade_time',
+                         time.strftime('%Y-%m-%dT%H:%M:%SZ'), 'runtime')
             trades_today = pg.get_state('trades_today', 0)
             pg.set_state('trades_today', trades_today + 1, 'daily')
-            pg.notify(f"BUY {symbol}", f"{qty} shares @ ${price:.2f} — {reason[:100]}",
-                      severity='success', symbol=symbol, category='trade')
+            # Dashboard notification with rich detail
+            pg.notify(f"BUY {symbol}",
+                f"{qty}x @${price:.2f} | {reason[:60]}\n"
+                f"TV: RSI={tv.get('rsi',0):.0f} MACD={tv.get('macd_hist',0):.2f} "
+                f"VWAP={'above' if tv.get('vwap_above') else 'below'}\n"
+                f"Sent: {sentiment_score:+d} | VIX: {_cached_vix:.1f}",
+                severity='success', symbol=symbol, category='trade',
+                data={'pipeline': steps, 'tv': tv, 'sentiment': _sent_data})
 
+    log.info(f"  {'='*50}\n")
     return result
 
 def _get_trade_db():
@@ -3301,18 +3523,23 @@ async def outcome_grader():
         if not pg:
             return
 
+        from datetime import datetime, timezone
+
         # Grade trade_decisions: check current price vs price_at_decision
+        # Use timezone-aware NOW() from DB side to avoid Python/DB timezone mismatch
         ungraded = pg._exec(
             """SELECT id, symbol, action, price_at_decision, created_at
                FROM trade_decisions
                WHERE was_correct IS NULL AND price_at_decision IS NOT NULL
-                 AND created_at < NOW() - interval '1 hour'
-                 AND created_at > NOW() - interval '24 hours'
-               LIMIT 30""",
+                 AND price_at_decision > 0
+                 AND created_at < NOW() - interval '30 minutes'
+                 AND created_at > NOW() - interval '48 hours'
+               LIMIT 50""",
             fetch=True
         ) or []
 
         if not ungraded:
+            log.info(f"  📝 Outcome grader: 0 ungraded decisions")
             return
 
         # Get current prices for all ungraded symbols
@@ -3325,7 +3552,8 @@ async def outcome_grader():
             snaps = dc.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbols[:20], feed='iex'))
             for sym, s in snaps.items():
                 current_prices[sym] = float(s.latest_trade.price)
-        except:
+        except Exception as e:
+            log.warning(f"  📝 Grader price fetch failed: {e}")
             return
 
         graded = 0
@@ -3334,35 +3562,51 @@ async def outcome_grader():
             if sym not in current_prices:
                 continue
             now_price = current_prices[sym]
-            then_price = d['price_at_decision']
-            if not then_price or then_price <= 0:
+            then_price = float(d['price_at_decision'])
+            if then_price <= 0:
                 continue
 
-            hours_ago = (datetime.now(timezone.utc) - d['created_at'].replace(tzinfo=timezone.utc)).total_seconds() / 3600
+            # Grade it: for BUY decisions, correct if price went up
+            # For BLOCK/SKIP, correct if price went down (we were right to avoid)
+            pct_move = (now_price - then_price) / then_price * 100
+            action = d['action']
 
-            # Determine the right column
-            if hours_ago >= 4:
-                pg.update_decision_outcome(d['id'], now_price, hours=4)
+            if action == 'BUY':
+                was_correct = now_price > then_price  # We bought, price went up = correct
+            elif action in ('BLOCK', 'SKIP'):
+                was_correct = now_price <= then_price  # We avoided, price went down = correct
             else:
-                pg.update_decision_outcome(d['id'], now_price, hours=1)
-            graded += 1
+                was_correct = None
 
+            if was_correct is not None:
+                pg._exec(
+                    """UPDATE trade_decisions SET was_correct = %s, price_after_1h = %s WHERE id = %s""",
+                    (was_correct, now_price, d['id'])
+                )
+                graded += 1
+
+        log.info(f"  📝 Outcome grader: graded {graded}/{len(ungraded)} decisions")
+
+        # Log accuracy stats
         if graded > 0:
-            log.info(f"  📝 Outcome grader: graded {graded} decisions")
-            # Log accuracy stats
             accuracy = pg.get_decision_accuracy(7)
             for action, stats in accuracy.items():
                 total = stats.get('total', 0)
                 correct = stats.get('correct', 0)
                 if total > 0:
                     log.info(f"     {action}: {correct}/{total} correct ({correct/total*100:.0f}%)")
+
+            # Notify dashboard
+            pg.notify("Outcome Grader", f"Graded {graded} decisions",
+                      severity='info', category='learning')
+
     except Exception as e:
-        log.debug(f"Outcome grader error: {e}")
+        log.warning(f"Outcome grader error: {e}")
 
 @outcome_grader.before_loop
 async def before_grader():
     await bot.wait_until_ready()
-    await asyncio.sleep(600)
+    await asyncio.sleep(120)  # 2 min warmup (was 10 min — too long)
 
 
 @tasks.loop(hours=24)
