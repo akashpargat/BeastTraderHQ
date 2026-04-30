@@ -68,8 +68,41 @@ def get_ai_stats() -> dict:
     """Get AI health stats (for dashboard/logging)."""
     return dict(_ai_stats)
 
+def _safe_parse_json(text: str) -> dict:
+    """Parse JSON from AI response. Handles truncated/malformed responses.
+    GPT-5.4 sometimes returns unterminated strings or trailing content."""
+    if not text:
+        return {}
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Try truncating at last complete object
+    for end_char in ['}', ']}', '"}}']:
+        idx = text.rfind(end_char)
+        if idx > 0:
+            try:
+                return json.loads(text[:idx + len(end_char)])
+            except:
+                pass
+    # Try fixing common issues: trailing comma, unclosed strings
+    cleaned = text.strip()
+    if cleaned.endswith(','):
+        cleaned = cleaned[:-1]
+    # Close any unclosed braces
+    opens = cleaned.count('{') - cleaned.count('}')
+    if opens > 0:
+        cleaned += '}' * opens
+    try:
+        return json.loads(cleaned)
+    except:
+        pass
+    log.warning(f"  [AI] JSON repair failed — response: {text[:200]}")
+    return {}
+
 # ── Shared state ──
-_last_deep_briefing = {}  # symbol -> last Claude analysis (for GPT-4o to reference)
+_last_deep_briefing = {}
 _last_deep_time = None
 
 
@@ -170,9 +203,12 @@ class AIBrain:
     # ══════════════════════════════════════════════════
 
     def analyze_stock(self, symbol: str, data: dict) -> dict:
-        """5-min scan: GPT-5.4 primary, deterministic fallback. Claude reserved for deep scans."""
+        """5-min scan: GPT-5.4 primary → Claude fallback → deterministic."""
         if self._gpt_available:
             return self._gpt4o_analyze(symbol, data)
+        elif self._claude_available:
+            log.info(f"  [AI] GPT offline — using Claude quick for {symbol}")
+            return self._claude_quick(symbol, data)
         return self._deterministic_fallback(symbol, data)
 
     def analyze_batch(self, stocks_data: dict) -> dict:
@@ -292,7 +328,12 @@ RULES:
             tokens_out = usage.completion_tokens if usage else 0
             log.info(f"  [AI GPT-5.4] BATCH complete — {elapsed_ms}ms | tokens: {tokens_in} in + {tokens_out} out = {tokens_in+tokens_out} total")
 
-            result = json.loads(response.choices[0].message.content)
+            raw_content = response.choices[0].message.content
+            log.info(f"  [AI GPT-5.4] Raw response length: {len(raw_content)} chars")
+            result = _safe_parse_json(raw_content)
+            if not result:
+                log.warning(f"  [AI GPT-5.4] BATCH JSON PARSE FAILED — raw response:\n{raw_content[:500]}")
+                return {sym: self._deterministic_fallback(sym, data) for sym, data in stocks_data.items()}
             verdicts = result.get('results', result)
 
             # Normalize + log each verdict
@@ -411,7 +452,11 @@ Respond with JSON. confidence MUST be 30-100, never 0."""
             tokens_in = usage.prompt_tokens if usage else 0
             tokens_out = usage.completion_tokens if usage else 0
 
-            result = json.loads(response.choices[0].message.content)
+            raw_content = response.choices[0].message.content
+            result = _safe_parse_json(raw_content)
+            if not result:
+                log.warning(f"  [AI GPT-5.4] {symbol} JSON PARSE FAILED — raw:\n{raw_content[:300]}")
+                return self._deterministic_fallback(symbol, data)
             result['ai_source'] = f'Azure {AZURE_DEPLOYMENT}'
             result['scan_type'] = '5min'
             result['response_ms'] = elapsed_ms
@@ -431,7 +476,20 @@ Respond with JSON. confidence MUST be 30-100, never 0."""
             else:
                 log.warning(f"  [AI GPT-5.4] FAILED on {symbol} [{elapsed_ms}ms] — {e}")
             if self._claude_available:
-                log.info(f"  [AI] Falling back to deterministic for {symbol} (saving Claude for deep scans)")
+                log.info(f"  [AI] GPT-5.4 failed → falling back to Claude quick for {symbol}")
+                _ai_stats['claude_calls'] += 1
+                try:
+                    t1 = _time.time()
+                    result = self._claude_quick(symbol, data)
+                    claude_ms = int((_time.time() - t1) * 1000)
+                    _ai_stats['claude_success'] += 1
+                    _ai_stats['claude_total_ms'] += claude_ms
+                    log.info(f"  [AI Claude] {symbol}: {result.get('action','?')} ({result.get('confidence',0)}%) [{claude_ms}ms]")
+                    return result
+                except Exception as ce:
+                    _ai_stats['claude_errors'] += 1
+                    _ai_stats['claude_last_error'] = f"{symbol}: {ce}"[:100]
+                    log.warning(f"  [AI Claude] ALSO FAILED on {symbol} — {ce}")
             return self._deterministic_fallback(symbol, data)
 
     # ══════════════════════════════════════════════════
