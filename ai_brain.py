@@ -31,10 +31,11 @@ from openai import AzureOpenAI
 
 log = logging.getLogger('Beast.HybridAI')
 
-# ── Azure GPT-4o (5-min quick scans) ──
+# ── Azure GPT-5.4 (primary) + GPT-4o (fallback) ──
 AZURE_ENDPOINT = os.getenv('AZURE_OPENAI_ENDPOINT', 'https://eastus.api.cognitive.microsoft.com/')
 AZURE_KEY = os.getenv('AZURE_OPENAI_KEY', '')
-AZURE_DEPLOYMENT = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt4o')
+AZURE_DEPLOYMENT = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt54')  # GPT-5.4 — upgraded from gpt4o
+AZURE_DEPLOYMENT_FALLBACK = 'gpt4o'  # Fallback if gpt54 fails
 AZURE_API_VERSION = '2024-10-21'
 
 # ── Claude Opus 4.7 via tunnel (30-min deep scans) ──
