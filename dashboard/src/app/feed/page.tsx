@@ -1,7 +1,6 @@
 'use client'
 import { useEffect, useState, useCallback } from 'react'
-
-const API = 'https://api.beast-trader.com'
+import { authFetch } from '../../lib/api'
 
 // Urgency color mapping
 const urgencyColors: Record<string, string> = {
@@ -34,7 +33,7 @@ export default function LiveFeed() {
 
   const fetchFeed = useCallback(async () => {
     try {
-      const res = await fetch(`${API}/api/live-feed`)
+      const res = await authFetch('/api/live-feed')
       const data = await res.json()
       setFeed(data.feed || [])
     } catch (e) { console.error('Feed fetch failed:', e) }

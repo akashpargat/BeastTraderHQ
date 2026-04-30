@@ -1,7 +1,6 @@
 'use client'
 import { useState, useRef } from 'react'
-
-const API = 'https://api.beast-trader.com'
+import { authFetch } from '../lib/api'
 const API_KEY = 'beast-v3-sk-7f3a9e2b4d1c8f5e6a0b3d9c'
 
 export default function CommandBar() {
@@ -21,12 +20,11 @@ export default function CommandBar() {
     // If we have a confirm token, this is step 2
     if (confirmToken) {
       try {
-        const res = await fetch(`${API}/api/order`, {
+        const res = await authFetch('/api/order', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
           body: JSON.stringify({ confirm_token: confirmToken })
         })
-        const data = await res.json()
         if (data.executed) {
           setOutput(`✅ ${data.message}`)
         } else {
@@ -44,7 +42,7 @@ export default function CommandBar() {
 
     // Step 1: Parse and preview
     try {
-      const res = await fetch(`${API}/api/order`, {
+      const res = await authFetch('/api/order', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
         body: JSON.stringify({ command: input })
@@ -96,7 +94,7 @@ export default function CommandBar() {
       {/* Kill switch button */}
       <button
         onClick={async () => {
-          const res = await fetch(`${API}/api/kill`, {
+          const res = await authFetch('/api/kill', {
             method: 'POST',
             headers: { 'X-API-Key': API_KEY }
           })

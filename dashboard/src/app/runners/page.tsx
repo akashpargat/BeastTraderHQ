@@ -1,7 +1,6 @@
 'use client'
 import { useEffect, useState, useCallback } from 'react'
-
-const API = 'https://api.beast-trader.com'
+import { authFetch } from '../../lib/api'
 
 function getSession(): { label: string; color: string } {
   const now = new Date()
@@ -19,7 +18,7 @@ export default function RunnersPage() {
   const [lastUpdate, setLastUpdate] = useState('')
 
   const fetchData = useCallback(() => {
-    fetch(`${API}/api/runners`)
+    authFetch('/api/runners')
       .then(r => r.json())
       .then(data => {
         setRunners(Array.isArray(data) ? data : data.runners || [])

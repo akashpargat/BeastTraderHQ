@@ -1,7 +1,6 @@
 'use client'
 import { useEffect, useState, useCallback } from 'react'
-
-const API = 'https://api.beast-trader.com'
+import { authFetch } from '../../lib/api'
 
 const STRATEGY_META: Record<string, { label: string; color: string; border: string; badge: string }> = {
   scalp:   { label: 'Auto-Scalp',  color: '#3b82f6', border: 'border-l-blue-500',   badge: 'bg-blue-500/15 text-blue-400 border border-blue-500/30' },
@@ -40,7 +39,7 @@ export default function DecisionsPage() {
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
 
   const fetchData = useCallback(() => {
-    fetch(`${API}/api/decision-log`)
+    authFetch('/api/decision-log')
       .then(r => r.json())
       .then(data => { setDecisions(data.decisions || data.log || []); setLoading(false) })
       .catch(() => setLoading(false))

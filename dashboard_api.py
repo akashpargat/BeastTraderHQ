@@ -17,9 +17,134 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import hashlib
+import hmac
+import secrets
+import time as _time
+from functools import wraps
+
+# ── Authentication ─────────────────────────────────────
+AUTH_USERNAME = os.getenv('DASHBOARD_USER', 'akash')
+AUTH_PASSWORD_HASH = os.getenv('DASHBOARD_PASSWORD_HASH', 
+    hashlib.sha256('B3astTerminal!'.encode()).hexdigest())
+JWT_SECRET = os.getenv('JWT_SECRET', secrets.token_hex(32))
+JWT_EXPIRY = 86400  # 24 hours
+
+_active_tokens = {}
+_failed_attempts = {}
+MAX_FAILED_ATTEMPTS = 5
+LOCKOUT_SECONDS = 300
+
+
+def _create_token(username: str) -> str:
+    payload = f"{username}:{int(_time.time()) + JWT_EXPIRY}:{secrets.token_hex(8)}"
+    signature = hmac.new(JWT_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    token = f"{payload}:{signature}"
+    import base64
+    encoded = base64.b64encode(token.encode()).decode()
+    _active_tokens[encoded] = {'username': username, 'expires': int(_time.time()) + JWT_EXPIRY}
+    return encoded
+
+
+def _verify_token(token: str) -> bool:
+    if not token:
+        return False
+    session = _active_tokens.get(token)
+    if not session:
+        return False
+    if int(_time.time()) > session['expires']:
+        _active_tokens.pop(token, None)
+        return False
+    return True
+
+
+def _check_rate_limit(ip: str) -> bool:
+    if ip not in _failed_attempts:
+        return True
+    count, last_time = _failed_attempts[ip]
+    if count >= MAX_FAILED_ATTEMPTS:
+        if int(_time.time()) - last_time < LOCKOUT_SECONDS:
+            return False
+        else:
+            _failed_attempts.pop(ip)
+            return True
+    return True
+
+
+def _record_failure(ip: str):
+    if ip in _failed_attempts:
+        count, _ = _failed_attempts[ip]
+        _failed_attempts[ip] = (count + 1, int(_time.time()))
+    else:
+        _failed_attempts[ip] = (1, int(_time.time()))
+
+
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get('Authorization', '')
+        token = ''
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:]
+        if not token:
+            token = request.cookies.get('beast_token', '')
+        if not token:
+            token = request.args.get('token', '')
+        if not _verify_token(token):
+            return jsonify({'error': 'Unauthorized', 'login_required': True}), 401
+        return f(*args, **kwargs)
+    return decorated
 
 app = Flask(__name__)
 CORS(app)
+
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    ip = request.remote_addr or 'unknown'
+    if not _check_rate_limit(ip):
+        remaining = LOCKOUT_SECONDS - (int(_time.time()) - _failed_attempts.get(ip, (0, 0))[1])
+        return jsonify({'error': f'Too many failed attempts. Locked for {remaining}s', 'locked': True}), 429
+    data = request.get_json() or {}
+    username = data.get('username', '')
+    password = data.get('password', '')
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    if username == AUTH_USERNAME and password_hash == AUTH_PASSWORD_HASH:
+        token = _create_token(username)
+        response = jsonify({'success': True, 'token': token, 'username': username, 'expires_in': JWT_EXPIRY})
+        response.set_cookie('beast_token', token, max_age=JWT_EXPIRY, httponly=True, samesite='Strict', secure=True)
+        try:
+            from db_postgres import BeastDB
+            BeastDB().log_activity('LOGIN', reason=f'Dashboard login from {ip}', source='dashboard')
+        except:
+            pass
+        return response
+    else:
+        _record_failure(ip)
+        attempts = _failed_attempts.get(ip, (0, 0))[0]
+        remaining = MAX_FAILED_ATTEMPTS - attempts
+        return jsonify({'error': 'Invalid credentials', 'attempts_remaining': remaining}), 401
+
+
+@app.route('/api/logout', methods=['POST'])
+def logout():
+    token = request.headers.get('Authorization', '').replace('Bearer ', '')
+    if not token:
+        token = request.cookies.get('beast_token', '')
+    _active_tokens.pop(token, None)
+    response = jsonify({'success': True, 'message': 'Logged out'})
+    response.delete_cookie('beast_token')
+    return response
+
+
+@app.route('/api/auth-status')
+def auth_status():
+    token = request.headers.get('Authorization', '').replace('Bearer ', '')
+    if not token:
+        token = request.cookies.get('beast_token', '')
+    valid = _verify_token(token)
+    return jsonify({'authenticated': valid})
+
 
 ET = ZoneInfo("America/New_York")
 
@@ -38,6 +163,7 @@ def _get_gateway():
 # ── PORTFOLIO ──────────────────────────────────────────
 
 @app.route('/api/portfolio')
+@require_auth
 def portfolio():
     """Live portfolio: positions, P&L, equity."""
     gw = _get_gateway()
@@ -104,6 +230,7 @@ def portfolio():
 # ── TRADES ─────────────────────────────────────────────
 
 @app.route('/api/trades')
+@require_auth
 def trades():
     """Trade history with reasoning. Falls back to Alpaca orders if DB is empty."""
     db = _get_db()
@@ -140,6 +267,7 @@ def trades():
     return jsonify({'trades': all_trades, 'count': len(all_trades)})
 
 @app.route('/api/trades/today')
+@require_auth
 def trades_today():
     db = _get_db()
     today_trades = []
@@ -178,6 +306,7 @@ def trades_today():
 # ── SCANS ──────────────────────────────────────────────
 
 @app.route('/api/scans')
+@require_auth
 def scans():
     """Scan history — every 5-min scan result."""
     db = _get_db()
@@ -190,6 +319,7 @@ def scans():
 # ── EQUITY CURVE ───────────────────────────────────────
 
 @app.route('/api/equity')
+@require_auth
 def equity():
     """Equity curve data for charting."""
     db = _get_db()
@@ -203,6 +333,7 @@ def equity():
 # ── ANALYTICS ──────────────────────────────────────────
 
 @app.route('/api/analytics')
+@require_auth
 def analytics():
     """Full analytics: tries DB first, falls back to Alpaca portfolio history."""
     db = _get_db()
@@ -282,6 +413,7 @@ def analytics():
 # ── SYSTEM STATUS ──────────────────────────────────────
 
 @app.route('/api/system')
+@require_auth
 def system_status():
     """System health: AI, TV, tunnel, uptime."""
     import requests as req
@@ -325,6 +457,7 @@ def system_status():
 # ── DEBUG LOG ──────────────────────────────────────────
 
 @app.route('/api/debug')
+@require_auth
 def debug_log():
     db = _get_db()
     component = request.args.get('component', None)
@@ -337,6 +470,7 @@ def debug_log():
 # ── ALERTS ─────────────────────────────────────────────
 
 @app.route('/api/alerts')
+@require_auth
 def alerts():
     db = _get_db()
     rows = db.conn.execute(
@@ -356,6 +490,7 @@ def health():
 # ── INTRADAY P&L (for live chart) ──────────────────────
 
 @app.route('/api/intraday')
+@require_auth
 def intraday_pnl():
     """Intraday equity snapshots for live P&L chart."""
     db = _get_db()
@@ -372,6 +507,7 @@ def intraday_pnl():
 # ── ACTION FEED (live timeline) ────────────────────────
 
 @app.route('/api/actions')
+@require_auth
 def action_feed():
     """Live feed of all bot actions: trades, alerts, scans + Alpaca fills."""
     limit = request.args.get('limit', 50, type=int)
@@ -445,6 +581,7 @@ def action_feed():
 # ── SENTIMENT MATRIX ───────────────────────────────────
 
 @app.route('/api/sentiment')
+@require_auth
 def sentiment_matrix():
     """Per-stock sentiment scores from all sources."""
     try:
@@ -492,6 +629,7 @@ def index():
 # ── RUNNERS (pre-market, market, post-market) ─────────
 
 @app.route('/api/runners')
+@require_auth
 def runners():
     """Top runners across all sessions. Uses 3-layer detection."""
     try:
@@ -568,6 +706,7 @@ def runners():
 # ── SECTOR HEATMAP ─────────────────────────────────────
 
 @app.route('/api/sectors')
+@require_auth
 def sector_heatmap():
     """Sector rotation heatmap — all 14 sectors with avg % change."""
     try:
@@ -619,6 +758,7 @@ def sector_heatmap():
 # ── TRAILING STOPS VISUALIZATION ───────────────────────
 
 @app.route('/api/trailing-stops')
+@require_auth
 def trailing_stops():
     """Show all trailing stops with entry, current, HWM, stop levels."""
     try:
@@ -657,6 +797,7 @@ def trailing_stops():
 # ── LIVE NEWS FEED ─────────────────────────────────────
 
 @app.route('/api/news')
+@require_auth
 def news_feed():
     """Live macro news with sector tagging."""
     try:
@@ -715,6 +856,7 @@ def news_feed():
 # ── SHARPE + DRAWDOWN ─────────────────────────────────
 
 @app.route('/api/sharpe')
+@require_auth
 def sharpe_ratio():
     """Sharpe ratio and max drawdown."""
     db = _get_db()
@@ -729,6 +871,7 @@ def sharpe_ratio():
 # ── CORRELATION CHECK ─────────────────────────────────
 
 @app.route('/api/correlation')
+@require_auth
 def correlation():
     """Portfolio correlation check."""
     from correlation_check import CorrelationChecker
@@ -741,6 +884,7 @@ def correlation():
 # ── DAILY P&L ─────────────────────────────────────────
 
 @app.route('/api/daily-pnl')
+@require_auth
 def daily_pnl_api():
     """Today's P&L."""
     db = _get_db()
@@ -754,6 +898,7 @@ def daily_pnl_api():
 # ── AI VERDICTS ───────────────────────────────────────
 
 @app.route('/api/ai-verdicts')
+@require_auth
 def ai_verdicts():
     """AI analysis verdicts for all positions."""
     try:
@@ -790,6 +935,7 @@ def ai_verdicts():
 # ── DECISION LOG ──────────────────────────────────────
 
 @app.route('/api/decision-log')
+@require_auth
 def decision_log():
     """Complete decision history — what the bot did and WHY."""
     try:
@@ -896,6 +1042,7 @@ def _parse_command(raw: str) -> dict:
 
 
 @app.route('/api/order', methods=['POST'])
+@require_auth
 def execute_order():
     """Execute a trading command. Two-step: parse → preview → confirm.
 
@@ -976,6 +1123,7 @@ def execute_order():
 
 
 @app.route('/api/kill', methods=['POST'])
+@require_auth
 def kill_switch():
     """Emergency: disable all new orders."""
     global _trading_enabled
@@ -991,6 +1139,7 @@ def kill_switch():
 
 
 @app.route('/api/resume', methods=['POST'])
+@require_auth
 def resume_trading():
     """Re-enable trading after kill switch."""
     global _trading_enabled
@@ -1006,12 +1155,14 @@ def resume_trading():
 
 
 @app.route('/api/trading-status')
+@require_auth
 def trading_status():
     """Check if trading is enabled."""
     return jsonify({'trading_enabled': _trading_enabled})
 
 
 @app.route('/api/activity-log')
+@require_auth
 def activity_log_pg():
     """Activity log from PostgreSQL (replaces SQLite actions)."""
     limit = request.args.get('limit', 50, type=int)
@@ -1027,6 +1178,7 @@ def activity_log_pg():
 
 
 @app.route('/api/strategy-stats')
+@require_auth
 def strategy_stats():
     """P&L breakdown by strategy."""
     try:
@@ -1039,6 +1191,7 @@ def strategy_stats():
 
 
 @app.route('/api/live-feed')
+@require_auth
 def live_feed():
     """24/7 live feed — breaking news, catalysts, trade alerts, profit celebrations.
     This NEVER sleeps. Even at 3 AM, Trump could tweet something market-moving."""

@@ -1,7 +1,6 @@
 'use client'
 import { useEffect, useState, useCallback } from 'react'
-
-const API = 'https://api.beast-trader.com'
+import { authFetch } from '../../lib/api'
 
 const STRATEGY_STYLES: Record<string, string> = {
   scalp: 'bg-blue-500/15 text-blue-400 border border-blue-500/30',
@@ -39,7 +38,7 @@ export default function TradesPage() {
   const [filter, setFilter] = useState<Filter>('ALL')
 
   const fetchData = useCallback(() => {
-    fetch(`${API}/api/trades?limit=100`)
+    authFetch('/api/trades?limit=100')
       .then(r => r.json())
       .then(d => { setTrades(d.trades || []); setLoading(false) })
       .catch(() => setLoading(false))

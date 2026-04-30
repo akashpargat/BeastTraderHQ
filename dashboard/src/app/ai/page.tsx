@@ -1,7 +1,6 @@
 'use client'
 import { useEffect, useState, useCallback } from 'react'
-
-const API = 'https://api.beast-trader.com'
+import { authFetch } from '../../lib/api'
 
 function actionMeta(action: string) {
   const a = (action || '').toUpperCase()
@@ -21,7 +20,7 @@ export default function AIPage() {
   const [loading, setLoading] = useState(true)
 
   const fetchData = useCallback(() => {
-    fetch(`${API}/api/ai-verdicts`)
+    authFetch('/api/ai-verdicts')
       .then(r => r.json())
       .then(data => { setVerdicts(data.verdicts || []); setLoading(false) })
       .catch(() => setLoading(false))

@@ -1393,27 +1393,32 @@ def _log_trade(action, symbol, qty, price, reason, scan_type="60s"):
     db = _get_trade_db()
     if db:
         try:
-            side = 'sell' if 'SELL' in action.upper() else 'buy'
-            if side == 'buy':
-                db.log_entry(symbol=symbol, qty=qty, price=price,
-                            strategy=scan_type, reason=f"{action}: {reason}")
-            else:
-                db.log_entry(symbol=symbol, qty=qty, price=price,
-                            strategy=scan_type, reason=f"{action}: {reason}")
+            db.log_entry(symbol=symbol, qty=qty, price=price,
+                        strategy=scan_type, reason=f"{action}: {reason}")
         except Exception as e:
             log.debug(f"Trade DB write failed: {e}")
     # Persist to PostgreSQL (V4)
+    side = 'sell' if 'SELL' in action.upper() else 'buy'
+    _pg_log(action.split('(')[0].strip(), symbol=symbol, side=side,
+            qty=qty, price=price, reason=reason, strategy=scan_type, source=scan_type)
+
+
+def _pg_log(action_type, symbol=None, side=None, qty=None, price=None,
+            reason=None, strategy=None, source=None, confidence=None,
+            ai_source=None, data=None):
+    """Universal PostgreSQL logger. Logs EVERY bot action with timestamp.
+    Call this for: scans, AI verdicts, trades, alerts, blocks, errors, everything."""
     pg = _get_pg()
     if pg:
         try:
-            side = 'sell' if 'SELL' in action.upper() else 'buy'
             pg.log_activity(
-                action_type=action.split('(')[0].strip().split(' ')[0],
-                symbol=symbol, side=side, qty=qty, price=price,
-                reason=reason, strategy=scan_type, source=scan_type,
+                action_type=action_type, symbol=symbol, side=side,
+                qty=qty, price=price, reason=reason, strategy=strategy,
+                source=source, confidence=confidence, ai_source=ai_source,
+                data=data
             )
         except Exception as e:
-            log.debug(f"PostgreSQL write failed: {e}")
+            log.debug(f"PG log failed: {e}")
 
 def _is_market_hours() -> bool:
     from datetime import datetime
@@ -1474,6 +1479,7 @@ async def position_monitor():
                                     f"🛡️ **[60s] AUTO-PROTECT: {p.symbol}** — 3% trailing stop on {trail_qty} shares\n"
                                     f"No existing trailing stop found. Protecting against downside.")
                             log.info(f"  🛡️ Auto-protect: {p.symbol} {trail_qty} shares with 3% trail")
+                            _pg_log("PROTECT", symbol=p.symbol, qty=trail_qty, reason="3% trailing stop placed", source="60s")
                         except Exception as e:
                             log.debug(f"Auto-protect {p.symbol}: {e}")
             except Exception as e:
@@ -1489,6 +1495,7 @@ async def position_monitor():
                 half = max(1, min(avail, p.qty // 2))
                 if avail < 1:
                     log.info(f"  {p.symbol} +{pct:.1f}% runner but 0 shares available (held by orders)")
+                    _pg_log("BLOCKED", symbol=p.symbol, reason=f"+{pct:.1f}% runner but 0 shares available", source="60s")
                 else:
                     try:
                         sell_price = round(p.current_price * 0.999, 2)
@@ -1510,6 +1517,7 @@ async def position_monitor():
                 half = max(1, min(avail, p.qty // 2))
                 if avail < 1:
                     log.info(f"  {p.symbol} +{pct:.1f}% scalp but 0 shares available (held by orders)")
+                    _pg_log("BLOCKED", symbol=p.symbol, reason=f"+{pct:.1f}% scalp but 0 shares available", source="60s")
                 else:
                     try:
                         sell_price = round(p.avg_entry * 1.025, 2)
@@ -1551,6 +1559,7 @@ async def position_monitor():
             # Law 9: Max 3 active scalps at a time
             if active_scalps >= MAX_ACTIVE_SCALPS:
                 log.info(f"  Law 9: {active_scalps} active scalps (max {MAX_ACTIVE_SCALPS}). Skipping new buys.")
+                _pg_log("BLOCKED", reason=f"Law 9: {active_scalps} scalps (max {MAX_ACTIVE_SCALPS})", source="60s")
             else:
                 try:
                     from alpaca.data.historical import StockHistoricalDataClient
@@ -1608,6 +1617,7 @@ async def position_monitor():
                                         f"${price:.2f} (prev ${prev_close:.2f}) — Past winner running!\n"
                                         f"Check catalyst before buying. Use `!scan {sym}` for deep analysis.")
                                 log.info(f"  🏆 Phase 0: past winner {sym} +{day_change:.1f}%")
+                                _pg_log("ALERT", symbol=sym, reason=f"Past winner running +{day_change:.1f}%", source="Phase0")
                         except:
                             pass
             except Exception as e:
@@ -1647,6 +1657,7 @@ async def position_monitor():
             await channel.send("\n".join(lines))
             _tg("\n".join(tg_lines))
         log.info(f"[Monitor #{_cycle_count}] {len(positions)} pos | P&L: ${total_pl:+.2f}")
+        _pg_log("MONITOR", reason=f"#{_cycle_count} {len(positions)} pos P&L=${total_pl:+.2f}", source="60s")
     except Exception as e:
         log.error(f"Position monitor error: {e}")
 
@@ -2007,6 +2018,7 @@ async def full_scan():
 
         _last_full_scan = time.time()
         log.info(f"Full scan sent at {now.strftime('%H:%M')} [TV:{len(tv_data)} AI:{len(ai_verdicts)}]")
+        _pg_log("SCAN", reason=f"5min scan TV:{len(tv_data)} Sent:{len(sentiments)} AI:{len(ai_verdicts)}", source="5min", data={"tv_count": len(tv_data), "sentiment_count": len(sentiments), "ai_count": len(ai_verdicts)})
 
         # ── LOG TO DATABASE (scan log + equity curve + position snapshots) ──
         db = _get_trade_db()
@@ -2200,6 +2212,7 @@ async def fast_runner_scan():
             return
 
         log.info(f"  🏃 Runner scan: {len(runners)} stocks running >3%")
+        _pg_log("RUNNER_SCAN", reason=f"{len(runners)} stocks running >3%", source="2min")
 
         acct = gateway.get_account()
         equity = float(acct.get('equity', 100000))
@@ -2593,6 +2606,7 @@ async def claude_deep_scan():
                                 log.info(f"  🧠 Claude auto-BUY: {sym} {qty}x @ ${buy_price} ({conf}%)")
                             else:
                                 log.info(f"  🧠 Claude BUY {sym} blocked: {result.error if result else 'no result'}")
+                                _pg_log("AI_BLOCKED", symbol=sym, reason=f"Claude BUY blocked: {result.error if result else 'no result'}", ai_source="Claude", source="30min")
 
                     elif action == 'SELL' and sym in held_syms:
                         # Auto-sell: sell available qty at market-ish price
@@ -2614,6 +2628,7 @@ async def claude_deep_scan():
                     log.warning(f"Claude auto-execute {sym}: {e}")
 
         log.info(f"Claude MEGA-SCAN complete: {len(deep_results)} analyzed, {len(all_intel)} intel packages")
+        _pg_log("MEGA_SCAN", reason=f"Claude mega: {len(deep_results)} analyzed, {len(all_intel)} intel", source="30min", data={"analyzed": len(deep_results), "intel": len(all_intel)})
 
     except Exception as e:
         log.error(f"Claude mega-scan error: {e}\n{traceback.format_exc()}")

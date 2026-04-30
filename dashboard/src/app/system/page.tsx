@@ -1,7 +1,6 @@
 'use client'
 import { useEffect, useState, useCallback } from 'react'
-
-const API = 'https://api.beast-trader.com'
+import { authFetch } from '../../lib/api'
 
 interface ServiceCard {
   icon: string
@@ -69,7 +68,7 @@ export default function SystemPage() {
   const [system, setSystem] = useState<any>(null)
 
   const fetchData = useCallback(() => {
-    fetch(`${API}/api/system`).then(r => r.json()).then(setSystem).catch(() => {})
+    authFetch('/api/system').then(r => r.json()).then(setSystem).catch(() => {})
   }, [])
 
   useEffect(() => {

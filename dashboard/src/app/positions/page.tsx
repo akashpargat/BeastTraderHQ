@@ -1,7 +1,6 @@
 'use client'
 import { useEffect, useState, useCallback } from 'react'
-
-const API = 'https://api.beast-trader.com'
+import { authFetch } from '../../lib/api'
 
 type SortKey = 'pnl' | 'pct' | 'value' | 'alpha'
 
@@ -22,7 +21,7 @@ export default function PositionsPage() {
   const [sort, setSort] = useState<SortKey>('pnl')
 
   const fetchData = useCallback(() => {
-    fetch(`${API}/api/portfolio`).then(r => r.json()).then(setPortfolio).catch(() => {})
+    authFetch('/api/portfolio').then(r => r.json()).then(setPortfolio).catch(() => {})
   }, [])
 
   useEffect(() => {

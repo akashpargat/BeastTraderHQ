@@ -1,7 +1,6 @@
 'use client'
 import { useEffect, useState, useCallback } from 'react'
-
-const API = 'https://api.beast-trader.com'
+import { authFetch } from '../../lib/api'
 
 function WinRateRing({ rate }: { rate: number }) {
   const pct = rate > 1 ? rate : rate * 100
@@ -30,7 +29,7 @@ export default function AnalyticsPage() {
   const [data, setData] = useState<any>(null)
 
   const fetchData = useCallback(() => {
-    fetch(`${API}/api/analytics`).then(r => r.json()).then(setData).catch(() => {})
+    authFetch('/api/analytics').then(r => r.json()).then(setData).catch(() => {})
   }, [])
 
   useEffect(() => {

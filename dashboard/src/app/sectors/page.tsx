@@ -1,7 +1,6 @@
 'use client'
 import { useEffect, useState, useCallback } from 'react'
-
-const API = 'https://api.beast-trader.com'
+import { authFetch } from '../../lib/api'
 
 function heatColor(pct: number): string {
   if (pct <= -3) return 'bg-red-900 border-red-700 text-red-300'
@@ -18,7 +17,7 @@ export default function SectorsPage() {
   const [error, setError] = useState('')
 
   const fetchData = useCallback(() => {
-    fetch(`${API}/api/sectors`)
+    authFetch('/api/sectors')
       .then(r => {
         if (!r.ok) throw new Error(`API returned ${r.status}`)
         return r.json()

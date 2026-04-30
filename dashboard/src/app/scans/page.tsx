@@ -1,13 +1,12 @@
 'use client'
 import { useEffect, useState } from 'react'
-
-const API = typeof window !== 'undefined' ? 'https://api.beast-trader.com' : 'http://localhost:8080'
+import { authFetch } from '../../lib/api'
 
 export default function ScansPage() {
   const [scans, setScans] = useState<any[]>([])
 
   useEffect(() => {
-    fetch(`${API}/api/scans?limit=50`).then(r => r.json()).then(d => setScans(d.scans || []))
+    authFetch('/api/scans?limit=50').then(r => r.json()).then(d => setScans(d.scans || []))
   }, [])
 
   return (

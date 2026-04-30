@@ -1,7 +1,6 @@
 'use client'
 import { useEffect, useState, useCallback } from 'react'
-
-const API = 'https://api.beast-trader.com'
+import { authFetch } from '../../lib/api'
 
 const ACTION_ICONS: Record<string, string> = {
   scalp: '🎯', runner: '🏃', 'dip-buy': '📉', 'dip_buy': '📉',
@@ -17,7 +16,7 @@ export default function ActivityPage() {
   const [filter, setFilter] = useState('all')
 
   const fetchData = useCallback(() => {
-    fetch(`${API}/api/actions?limit=50`)
+    authFetch('/api/actions?limit=50')
       .then(r => r.json())
       .then(data => {
         setActions(Array.isArray(data) ? data : data.actions || [])

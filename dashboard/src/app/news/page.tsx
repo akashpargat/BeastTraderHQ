@@ -1,7 +1,6 @@
 'use client'
 import { useEffect, useState, useCallback } from 'react'
-
-const API = 'https://api.beast-trader.com'
+import { authFetch } from '../../lib/api'
 
 function scoreBadge(score: number | null | undefined): { text: string; color: string } {
   if (score == null) return { text: '—', color: 'bg-slate-600 text-slate-300' }
@@ -25,7 +24,7 @@ export default function NewsPage() {
   const [loading, setLoading] = useState(true)
 
   const fetchData = useCallback(() => {
-    fetch(`${API}/api/news`)
+    authFetch('/api/news')
       .then(r => r.json())
       .then(data => {
         setNews(Array.isArray(data) ? data : data.headlines || data.news || [])

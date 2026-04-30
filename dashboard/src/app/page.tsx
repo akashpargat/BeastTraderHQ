@@ -1,7 +1,6 @@
 'use client'
 import { useEffect, useState, useCallback, useRef } from 'react'
-
-const API = 'https://api.beast-trader.com'
+import { authFetch } from '../lib/api'
 
 // ── Animated number counter hook ──
 function useCounter(target: number, duration = 1000) {
@@ -120,12 +119,12 @@ export default function Dashboard() {
   const fetchAll = useCallback(async () => {
     try {
       const [pRes, vRes, aRes, anRes, tRes, nRes] = await Promise.all([
-        fetch(`${API}/api/portfolio`).catch(() => null),
-        fetch(`${API}/api/ai-verdicts`).catch(() => null),
-        fetch(`${API}/api/actions?limit=10`).catch(() => null),
-        fetch(`${API}/api/analytics`).catch(() => null),
-        fetch(`${API}/api/trading-status`).catch(() => null),
-        fetch(`${API}/api/live-feed`).catch(() => null),
+        authFetch('/api/portfolio').catch(() => null),
+        authFetch('/api/ai-verdicts').catch(() => null),
+        authFetch('/api/actions?limit=10').catch(() => null),
+        authFetch('/api/analytics').catch(() => null),
+        authFetch('/api/trading-status').catch(() => null),
+        authFetch('/api/live-feed').catch(() => null),
       ])
       if (pRes?.ok) setPortfolio(await pRes.json())
       if (vRes?.ok) { const d = await vRes.json(); setVerdicts(d.verdicts || d || []) }

@@ -1,7 +1,6 @@
 'use client'
 import { useEffect, useState, useCallback } from 'react'
-
-const API = 'https://api.beast-trader.com'
+import { authFetch } from '../../lib/api'
 
 function gapColor(gap: number): string {
   if (gap >= 5) return 'text-green-400'
@@ -20,7 +19,7 @@ export default function StopsPage() {
   const [loading, setLoading] = useState(true)
 
   const fetchData = useCallback(() => {
-    fetch(`${API}/api/trailing-stops`)
+    authFetch('/api/trailing-stops')
       .then(r => r.json())
       .then(data => {
         setStops(Array.isArray(data) ? data : data.stops || [])
