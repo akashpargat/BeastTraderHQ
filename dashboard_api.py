@@ -268,8 +268,15 @@ def analytics():
             'streak': db_result.get('streak', {}) if db_result else {},
         })
     except Exception as e:
-        return jsonify({'error': str(e), 'total_trades': 0, 'win_rate': 0, 'total_pnl': 0,
-                        'overall': {}, 'by_strategy': {}, 'by_stock': {}, 'by_regime': {}, 'by_day': [], 'streak': {}})
+        return jsonify({
+            'total_trades': 0, 'win_rate': 0, 'total_pnl': 0,
+            'wins': 0, 'losses': 0, 'best_day': 0, 'worst_day': 0,
+            'equity_curve': [],
+            'overall': {}, 'by_strategy': {}, 'by_stock': {}, 'by_regime': {}, 'by_day': [], 'streak': {},
+            'error': str(e),
+            'market_closed': True,
+            'message': 'Market closed — analytics update at next open',
+        })
 
 
 # ── SYSTEM STATUS ──────────────────────────────────────
@@ -550,7 +557,12 @@ def runners():
             'timestamp': now.isoformat(),
         })
     except Exception as e:
-        return jsonify({'error': str(e)})
+        return jsonify({
+            'session': 'closed',
+            'runners': [],
+            'error': str(e),
+            'message': 'Market closed — no active runners',
+        })
 
 
 # ── SECTOR HEATMAP ─────────────────────────────────────
@@ -596,7 +608,12 @@ def sector_heatmap():
             'timestamp': datetime.now(ET).isoformat(),
         })
     except Exception as e:
-        return jsonify({'error': str(e)})
+        return jsonify({
+            'sectors': {},
+            'error': str(e),
+            'market_closed': True,
+            'message': 'Sector data unavailable after hours',
+        })
 
 
 # ── TRAILING STOPS VISUALIZATION ───────────────────────
@@ -646,6 +663,11 @@ def news_feed():
         from sentiment_analyst import SentimentAnalyst
         sa = SentimentAnalyst()
         
+        # Force fresh fetch by clearing stale cache entries
+        for key in list(sa._cache.keys()):
+            if key.startswith('gnews:'):
+                del sa._cache[key]
+        
         # Get Trump/tariff headlines
         t_score, t_headlines = sa.get_trump_sentiment()
         
@@ -682,7 +704,12 @@ def news_feed():
             'timestamp': datetime.now(ET).isoformat(),
         })
     except Exception as e:
-        return jsonify({'error': str(e)})
+        return jsonify({
+            'trump_score': 0,
+            'news': [],
+            'error': str(e),
+            'message': 'News feed temporarily unavailable',
+        })
 
 
 # ── SHARPE + DRAWDOWN ─────────────────────────────────
@@ -750,9 +777,14 @@ def ai_verdicts():
                 'ai_source': cached.get('ai_source', '') if cached else '',
                 'scan_type': cached.get('scan_type', '') if cached else '',
             })
+        # Enrich "NO DATA" verdicts with a helpful message
+        for v in verdicts:
+            if v['ai_action'] == 'NO DATA':
+                v['ai_reasoning'] = 'Waiting for next scan cycle (scans run 4AM-8PM ET)'
         return jsonify({'verdicts': verdicts, 'count': len(verdicts)})
     except Exception as e:
-        return jsonify({'error': str(e), 'verdicts': [], 'count': 0})
+        return jsonify({'error': str(e), 'verdicts': [], 'count': 0, 'market_closed': True,
+                        'message': 'AI verdicts unavailable — positions may be empty after hours'})
 
 
 # ── DECISION LOG ──────────────────────────────────────
@@ -1004,6 +1036,172 @@ def strategy_stats():
         return jsonify(stats)
     except Exception as e:
         return jsonify({'error': str(e)})
+
+
+@app.route('/api/live-feed')
+def live_feed():
+    """24/7 live feed — breaking news, catalysts, trade alerts, profit celebrations.
+    This NEVER sleeps. Even at 3 AM, Trump could tweet something market-moving."""
+    try:
+        from sentiment_analyst import SentimentAnalyst
+        sa = SentimentAnalyst()
+
+        feed_items = []
+
+        # 1. BREAKING NEWS (Google News RSS — works 24/7, no API key)
+        for query, category in [
+            ("stock market breaking news today", "BREAKING"),
+            ("Trump tariff trade war", "TRUMP"),
+            ("Federal Reserve interest rate", "FED"),
+            ("Iran oil Hormuz war", "GEOPOLITICAL"),
+            ("NVIDIA AMD Intel earnings", "EARNINGS"),
+            ("AI artificial intelligence stocks", "AI"),
+            ("bitcoin crypto", "CRYPTO"),
+        ]:
+            try:
+                score, headlines = sa._google_news_sentiment(query)
+                for h in headlines[:3]:
+                    urgency = 'normal'
+                    h_lower = h.lower()
+                    if any(w in h_lower for w in ['crash', 'plunge', 'war', 'nuclear', 'halt', 'circuit breaker']):
+                        urgency = 'critical'
+                    elif any(w in h_lower for w in ['surge', 'rally', 'breakout', 'record', 'deal', 'beat']):
+                        urgency = 'bullish'
+                    elif any(w in h_lower for w in ['tariff', 'sanctions', 'attack', 'missile', 'crash']):
+                        urgency = 'bearish'
+
+                    feed_items.append({
+                        'type': 'NEWS',
+                        'category': category,
+                        'headline': h,
+                        'score': score,
+                        'urgency': urgency,
+                        'time': datetime.now(ET).isoformat(),
+                    })
+            except:
+                pass
+
+        # 2. YAHOO FINANCE TOP STORIES (per held stock)
+        positions = []
+        try:
+            gw = _get_gateway()
+            positions = gw.get_positions()
+            import yfinance as yf
+            for p in positions[:5]:
+                try:
+                    stock = yf.Ticker(p.symbol)
+                    news = stock.news or []
+                    for article in news[:2]:
+                        title = ''
+                        if isinstance(article, dict):
+                            if 'content' in article:
+                                title = article['content'].get('title', '') if isinstance(article['content'], dict) else ''
+                            else:
+                                title = article.get('title', '')
+                        if title:
+                            feed_items.append({
+                                'type': 'YAHOO',
+                                'category': 'STOCK_NEWS',
+                                'symbol': p.symbol,
+                                'headline': title,
+                                'urgency': 'normal',
+                                'time': datetime.now(ET).isoformat(),
+                            })
+                except:
+                    pass
+        except:
+            pass
+
+        # 3. TRADE ALERTS (recent fills from Alpaca)
+        try:
+            gw = _get_gateway()
+            activities = gw.client.get_account_activities(activity_types=['FILL'])
+            for a in (activities or [])[:10]:
+                side_emoji = '🟢 BOUGHT' if a.side == 'buy' else '🔴 SOLD'
+
+                feed_items.append({
+                    'type': 'TRADE',
+                    'category': 'FILL',
+                    'symbol': a.symbol,
+                    'headline': f"{side_emoji} {a.qty} shares of {a.symbol} @ ${a.price}",
+                    'side': a.side,
+                    'qty': str(a.qty),
+                    'price': str(a.price),
+                    'urgency': 'trade',
+                    'time': a.transaction_time.isoformat() if a.transaction_time else datetime.now(ET).isoformat(),
+                })
+        except:
+            pass
+
+        # 4. PROFIT CELEBRATIONS (check for recent profitable sells)
+        try:
+            gw = _get_gateway()
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=20)
+            orders = gw.client.get_orders(req)
+            for o in orders:
+                if o.filled_at and o.side.value == 'sell' and o.filled_avg_price:
+                    cid = str(o.client_order_id or '')
+                    if 'scalp' in cid or 'runner' in cid:
+                        feed_items.append({
+                            'type': 'CELEBRATION',
+                            'category': 'PROFIT',
+                            'symbol': o.symbol,
+                            'headline': f"💰 PROFIT! Sold {o.filled_qty} {o.symbol} @ ${o.filled_avg_price}",
+                            'urgency': 'celebration',
+                            'time': o.filled_at.isoformat() if o.filled_at else '',
+                            'strategy': 'Scalp' if 'scalp' in cid else 'Runner' if 'runner' in cid else 'Trade',
+                        })
+        except:
+            pass
+
+        # 5. CATALYST DETECTION
+        catalysts = []
+        try:
+            for p in (positions or [])[:10]:
+                info = sa.get_earnings_info(p.symbol)
+                if info.get('days_until', 999) <= 3:
+                    catalysts.append({
+                        'type': 'CATALYST',
+                        'category': 'EARNINGS',
+                        'symbol': p.symbol,
+                        'headline': f"⚡ {p.symbol} earnings in {info['days_until']} day(s) — {info.get('date', '?')}",
+                        'urgency': 'warning',
+                        'time': datetime.now(ET).isoformat(),
+                    })
+                short = sa.get_short_info(p.symbol)
+                if short.get('squeeze_risk'):
+                    catalysts.append({
+                        'type': 'CATALYST',
+                        'category': 'SQUEEZE',
+                        'symbol': p.symbol,
+                        'headline': f"🔥 {p.symbol} SHORT SQUEEZE RISK — {short['short_pct']:.1f}% short, ratio {short['short_ratio']:.1f}",
+                        'urgency': 'critical',
+                        'time': datetime.now(ET).isoformat(),
+                    })
+        except:
+            pass
+        feed_items.extend(catalysts)
+
+        # Sort by time (newest first), dedupe headlines
+        seen = set()
+        unique = []
+        for item in feed_items:
+            key = item.get('headline', '')[:50]
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
+
+        unique.sort(key=lambda x: x.get('time', ''), reverse=True)
+
+        return jsonify({
+            'feed': unique[:30],
+            'count': len(unique),
+            'timestamp': datetime.now(ET).isoformat(),
+        })
+    except Exception as e:
+        return jsonify({'feed': [], 'count': 0, 'error': str(e)})
 
 
 if __name__ == '__main__':

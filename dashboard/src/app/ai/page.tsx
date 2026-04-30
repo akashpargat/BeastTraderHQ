@@ -35,6 +35,7 @@ export default function AIPage() {
 
   // Sort by confidence descending
   const sorted = [...verdicts].sort((a, b) => (b.ai_confidence ?? 0) - (a.ai_confidence ?? 0))
+  const allNoData = verdicts.length > 0 && verdicts.every((v: any) => (v.ai_action || '').toUpperCase() === 'NO DATA')
 
   if (loading) return (
     <div className="min-h-screen flex items-center justify-center">
@@ -57,6 +58,15 @@ export default function AIPage() {
           <span className="text-xs text-purple-400/70">AI ACTIVE</span>
         </div>
       </div>
+
+      {allNoData && (
+        <div className="glass-card p-8 text-center">
+          <div className="text-5xl mb-3">🧠</div>
+          <p className="text-slate-300 text-lg">AI Scanning Paused</p>
+          <p className="text-slate-500">Scans resume at 4:00 AM ET pre-market</p>
+          <p className="text-slate-600 text-sm mt-2">Last scan data will appear here when available</p>
+        </div>
+      )}
 
       {sorted.length > 0 ? (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 stagger-enter">

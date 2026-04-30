@@ -1661,9 +1661,7 @@ async def full_scan():
         from zoneinfo import ZoneInfo
         now = datetime.now(ZoneInfo("America/New_York"))
 
-        # ── Skip off-hours (midnight to 4 AM) ──
-        if now.hour < 4 or now.hour >= 20:
-            return
+        # ── 24/7 scanning — TV and sentiment cost nothing, always scan ──
 
         positions = gateway.get_positions()
         acct = gateway.get_account()
@@ -2038,8 +2036,7 @@ async def decision_report():
         from datetime import datetime
         from zoneinfo import ZoneInfo
         now = datetime.now(ZoneInfo("America/New_York"))
-        if now.hour < 4 or now.hour >= 20:
-            return
+        # 24/7 — decision report always runs (shows P&L + risk even off-hours)
 
         positions = gateway.get_positions()
         acct = gateway.get_account()
@@ -2265,8 +2262,7 @@ async def claude_deep_scan():
         from datetime import datetime
         from zoneinfo import ZoneInfo
         now = datetime.now(ZoneInfo("America/New_York"))
-        if now.hour < 4 or now.hour >= 20:
-            return
+        # 24/7 — Claude mega-scan always runs (news + sentiment work anytime)
 
         if not brain or not brain.is_available:
             return

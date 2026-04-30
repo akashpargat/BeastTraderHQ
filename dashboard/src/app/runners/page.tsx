@@ -26,7 +26,7 @@ export default function RunnersPage() {
         setLastUpdate(new Date().toLocaleTimeString())
         setLoading(false)
       })
-      .catch(() => setLoading(false))
+      .catch(() => { setRunners([]); setLoading(false) })
   }, [])
 
   useEffect(() => {
@@ -124,7 +124,11 @@ export default function RunnersPage() {
           </tbody>
         </table>
         {runners.length === 0 && (
-          <p className="text-center text-slate-500 py-8">No active runners</p>
+          <div className="p-8 text-center">
+            <div className="text-4xl mb-2">🏃</div>
+            <p className="text-slate-400">No active runners</p>
+            <p className="text-slate-500 text-sm">{session.label === 'CLOSED' ? 'Market closed — runners appear during trading hours' : 'Watching for movers...'}</p>
+          </div>
         )}
       </div>
       <p className="text-xs text-slate-600 text-center">Auto-refreshes every 30s</p>

@@ -15,6 +15,7 @@ const navLinks = [
   { href: '/ai', label: '🧠 AI' },
   { href: '/activity', label: '📋 Activity' },
   { href: '/decisions', label: '🎯 Decisions' },
+  { href: '/feed', label: '📡 Feed' },
 ]
 
 export default function NavBar() {

@@ -24,8 +24,22 @@ export default function SectorsPage() {
         return r.json()
       })
       .then(data => {
-        setSectors(Array.isArray(data) ? data : data.sectors || [])
-        setError('')
+        // sectors comes as an object {sectorName: {avg_change, ...}}
+        const raw = data.sectors || data
+        if (typeof raw === 'object' && !Array.isArray(raw)) {
+          const arr = Object.entries(raw).map(([name, info]: [string, any]) => ({
+            name,
+            ...info,
+          }))
+          setSectors(arr)
+        } else {
+          setSectors(Array.isArray(raw) ? raw : [])
+        }
+        if (data.market_closed) {
+          setError('market_closed')
+        } else {
+          setError('')
+        }
         setLoading(false)
       })
       .catch((e) => {
@@ -53,7 +67,15 @@ export default function SectorsPage() {
     <div className="space-y-6">
       <h1 className="text-2xl font-bold">🗺️ Sector Heatmap</h1>
 
-      {error && (
+      {error === 'market_closed' && (
+        <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-6 text-center">
+          <div className="text-4xl mb-2">🗺️</div>
+          <p className="text-slate-400 text-lg">Sectors Offline</p>
+          <p className="text-slate-500 text-sm">Live sector data available during market hours</p>
+        </div>
+      )}
+
+      {error && error !== 'market_closed' && (
         <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-6 text-center">
           <p className="text-yellow-400 text-lg mb-1">⚠️ Sector Data Unavailable</p>
           <p className="text-slate-400 text-sm">Market may be closed or data is loading. Will retry automatically.</p>

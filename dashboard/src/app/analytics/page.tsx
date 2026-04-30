@@ -55,6 +55,7 @@ export default function AnalyticsPage() {
   const totalPnl = stats.total_pnl ?? 0
   const isGreen = totalPnl >= 0
   const winRate = stats.win_rate ?? 0
+  const marketClosed = data.market_closed || false
 
   const maxStrategyPnl = Math.max(...byStrategy.map((s: any) => Math.abs(s.total_pnl || 0)), 1)
 
@@ -64,6 +65,14 @@ export default function AnalyticsPage() {
         <h1 className="text-3xl font-bold tracking-tight">📈 Analytics Dashboard</h1>
         <p className="text-slate-500 text-sm mt-1">Auto-refresh 10s</p>
       </div>
+
+      {marketClosed && (
+        <div className="glass-card p-6 text-center mb-6">
+          <div className="text-4xl mb-2">🌙</div>
+          <p className="text-slate-400">Market Closed</p>
+          <p className="text-slate-500 text-sm">Analytics will update when market opens at 9:30 AM ET</p>
+        </div>
+      )}
 
       {/* Hero: Total P&L */}
       <div className="glass-card p-8 text-center relative overflow-hidden">

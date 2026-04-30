@@ -95,7 +95,11 @@ export default function NewsPage() {
           </div>
         ))
       ) : (
-        <p className="text-center text-slate-500 py-8">No news available</p>
+        <div className="glass-card p-6 text-center">
+          <div className="text-4xl mb-2">📰</div>
+          <p className="text-slate-400">No recent headlines</p>
+          <p className="text-slate-500 text-sm">News feed refreshes every 2 minutes</p>
+        </div>
       )}
       <p className="text-xs text-slate-600 text-center">Auto-refreshes every 2 min</p>
     </div>

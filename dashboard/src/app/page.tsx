@@ -110,6 +110,7 @@ export default function Dashboard() {
   const [portfolio, setPortfolio] = useState<any>(null)
   const [verdicts, setVerdicts] = useState<any[]>([])
   const [actions, setActions] = useState<any[]>([])
+  const [breakingNews, setBreakingNews] = useState<any[]>([])
   const [analytics, setAnalytics] = useState<any>(null)
   const [tradingStatus, setTradingStatus] = useState<any>(null)
   const [loading, setLoading] = useState(true)
@@ -118,18 +119,20 @@ export default function Dashboard() {
 
   const fetchAll = useCallback(async () => {
     try {
-      const [pRes, vRes, aRes, anRes, tRes] = await Promise.all([
+      const [pRes, vRes, aRes, anRes, tRes, nRes] = await Promise.all([
         fetch(`${API}/api/portfolio`).catch(() => null),
         fetch(`${API}/api/ai-verdicts`).catch(() => null),
         fetch(`${API}/api/actions?limit=10`).catch(() => null),
         fetch(`${API}/api/analytics`).catch(() => null),
         fetch(`${API}/api/trading-status`).catch(() => null),
+        fetch(`${API}/api/live-feed`).catch(() => null),
       ])
       if (pRes?.ok) setPortfolio(await pRes.json())
       if (vRes?.ok) { const d = await vRes.json(); setVerdicts(d.verdicts || d || []) }
       if (aRes?.ok) { const d = await aRes.json(); setActions(d.actions || d || []) }
       if (anRes?.ok) setAnalytics(await anRes.json())
       if (tRes?.ok) setTradingStatus(await tRes.json())
+      if (nRes?.ok) { const d = await nRes.json(); setBreakingNews(d.feed?.filter((f: any) => f.type === 'NEWS') || []) }
     } catch (_) {}
     setLoading(false)
   }, [])
@@ -161,6 +164,15 @@ export default function Dashboard() {
   const animCash = useCounter(cash, 800)
   const animHeat = useCounter(heat, 800)
   const animWinRate = useCounter(winRate, 1000)
+
+  // Market hours check (ET timezone)
+  const isMarketOpen = (() => {
+    const now = new Date()
+    const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }))
+    const h = et.getHours()
+    const d = et.getDay()
+    return d >= 1 && d <= 5 && h >= 9 && h < 16
+  })()
 
   if (loading) return <SkeletonDashboard />
 
@@ -206,6 +218,13 @@ export default function Dashboard() {
       </section>
 
       <div className="max-w-7xl mx-auto px-6 pb-12 space-y-6">
+
+        {/* Market closed banner */}
+        {!isMarketOpen && (
+          <div className="p-3 rounded-xl bg-yellow-900/20 border border-yellow-800/30 text-center -mt-2 mb-2">
+            <span className="text-yellow-400 text-sm">🌙 Market Closed — Next open: 9:30 AM ET</span>
+          </div>
+        )}
 
         {/* ═══ SECTION 2: QUICK STATS BAR ═══ */}
         <section className="grid grid-cols-2 lg:grid-cols-4 gap-4 -mt-6 relative z-10 stagger-enter">
@@ -420,6 +439,27 @@ export default function Dashboard() {
                   </div>
                 )
               })}
+            </div>
+          </section>
+
+          {/* Breaking News Ticker */}
+          <section className="glass p-0 overflow-hidden">
+            <div className="px-5 py-4 border-b border-white/5 flex items-center justify-between">
+              <h2 className="text-sm font-semibold uppercase tracking-wider text-gray-300">📡 Breaking News</h2>
+              <a href="/feed" className="text-xs text-green-400 hover:text-green-300">View all →</a>
+            </div>
+            <div className="p-4 space-y-2 overflow-y-auto" style={{ maxHeight: 340 }}>
+              {breakingNews.length === 0 && <p className="text-gray-500 text-sm text-center py-6">Loading news...</p>}
+              {breakingNews.slice(0, 5).map((item: any, i: number) => (
+                <div key={i} className={`flex items-center gap-2 text-xs p-2 rounded-lg ${
+                  item.urgency === 'critical' ? 'bg-red-950/40 text-red-300' :
+                  item.urgency === 'bullish' ? 'bg-green-950/30 text-green-300' :
+                  'bg-slate-800/50 text-slate-400'
+                }`}>
+                  <span>{({'BREAKING':'🚨','TRUMP':'🏛️','FED':'🏦','GEOPOLITICAL':'⚔️','EARNINGS':'📊','AI':'🤖','CRYPTO':'₿'} as Record<string,string>)[item.category] || '📌'}</span>
+                  <span className="flex-1 truncate">{item.headline}</span>
+                </div>
+              ))}
             </div>
           </section>
 
