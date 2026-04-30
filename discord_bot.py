@@ -1344,7 +1344,10 @@ def _get_tv_indicators(symbol: str) -> dict:
             return {}
 
         study_names = [s.get('name', '?') for s in studies]
-        log.info(f"  TV {symbol}: {len(studies)} studies loaded ({retries} retries)")
+        log.info(f"  📺 TV {symbol}: {len(studies)} studies loaded ({retries} retries) — {', '.join(study_names[:6])}")
+        _pg_log("TV_LOADED", symbol=symbol,
+                reason=f"{len(studies)} studies ({retries} retries): {', '.join(study_names[:6])}",
+                source="tv_read", data={'studies': study_names, 'retries': retries})
 
         # Parse via TV analyst
         from tv_analyst import TradingViewAnalyst
@@ -1415,11 +1418,38 @@ def _tv_confirm_buy(symbol: str) -> tuple[bool, dict]:
     tv['_signals'] = signals_bullish
     _tv_cache[symbol] = (time.time(), tv)
 
+    # Log EVERYTHING to PostgreSQL — confirmed or not
+    tv_details = {
+        'rsi': rsi, 'macd_hist': tv.get('macd_hist', 0),
+        'vwap_above': tv.get('vwap_above'), 'confluence': tv.get('confluence', 0),
+        'ema_9': tv.get('ema_9', 0), 'ema_21': tv.get('ema_21', 0),
+        'volume_ratio': tv.get('volume_ratio', 0),
+        'bb_position': tv.get('bb_position', '?'),
+        'signals_bullish': signals_bullish, 'confirmed': confirmed,
+    }
+
     if confirmed:
-        log.info(f"  📺 TV {symbol}: CONFIRMED ({signals_bullish} signals) RSI={rsi:.0f}")
+        log.info(f"  📺 TV {symbol}: CONFIRMED ({signals_bullish} signals) RSI={rsi:.0f} MACD={tv.get('macd_hist',0):.2f} VWAP={'↑' if tv.get('vwap_above') else '↓'} Conf={tv.get('confluence',0)}")
+        _pg_log("TV_CONFIRMED", symbol=symbol, 
+                reason=f"TV OK: {signals_bullish} signals RSI={rsi:.0f} MACD={tv.get('macd_hist',0):.2f} VWAP={'above' if tv.get('vwap_above') else 'below'} C={tv.get('confluence',0)}",
+                source="tv_confirm", data=tv_details)
     else:
-        log.info(f"  📺 TV {symbol}: REJECTED ({signals_bullish} signals) RSI={rsi:.0f}")
-        _pg_log("TV_BLOCKED", symbol=symbol, reason=f"TV rejected: {signals_bullish} signals, RSI={rsi:.0f}", source="tv_confirm")
+        log.info(f"  📺 TV {symbol}: REJECTED ({signals_bullish} signals) RSI={rsi:.0f} MACD={tv.get('macd_hist',0):.2f} VWAP={'↑' if tv.get('vwap_above') else '↓'}")
+        _pg_log("TV_BLOCKED", symbol=symbol,
+                reason=f"TV rejected: {signals_bullish} signals RSI={rsi:.0f} MACD={tv.get('macd_hist',0):.2f} VWAP={'above' if tv.get('vwap_above') else 'below'}",
+                source="tv_confirm", data=tv_details)
+
+    # Save TV reading to PostgreSQL tv_readings table
+    pg = _get_pg()
+    if pg:
+        try:
+            pg.save_tv_reading(symbol, scan_type='tv_confirm',
+                             rsi=rsi, macd_hist=tv.get('macd_hist'),
+                             vwap_above=tv.get('vwap_above'), confluence=tv.get('confluence'),
+                             ema_9=tv.get('ema_9'), ema_21=tv.get('ema_21'),
+                             volume_ratio=tv.get('volume_ratio'), price=tv.get('price', 0))
+        except:
+            pass
 
     return confirmed, tv
 
