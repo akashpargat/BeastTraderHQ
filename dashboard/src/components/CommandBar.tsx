@@ -25,6 +25,7 @@ export default function CommandBar() {
           headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
           body: JSON.stringify({ confirm_token: confirmToken })
         })
+        const data = await res.json()
         if (data.executed) {
           setOutput(`✅ ${data.message}`)
         } else {
