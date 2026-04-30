@@ -35,14 +35,16 @@ export default function SectorsPage() {
       ) : (
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
           {sectors.map(([name, val]: [string, any], i) => {
-            const change = typeof val === 'number' ? val : Number(val?.change ?? val?.change_pct ?? 0)
+            const change = typeof val === 'number' ? val : Number(val?.avg_change ?? val?.change ?? val?.change_pct ?? 0)
             const isGreen = change >= 0
+            const sampled = val?.stocks_sampled ?? 0
             return (
               <div key={i} className="glass p-4 text-center">
                 <div className="text-sm text-gray-300 mb-1">{name}</div>
                 <div className={`text-xl font-bold ${isGreen ? 'text-[#00ff88]' : 'text-[#ff4444]'}`}>
                   {isGreen ? '+' : ''}{change.toFixed(2)}%
                 </div>
+                {sampled > 0 && <div className="text-xs text-gray-500">{sampled} stocks</div>}
               </div>
             )
           })}

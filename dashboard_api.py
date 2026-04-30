@@ -228,25 +228,35 @@ def portfolio():
             pass
 
     pos_data = []
+    daily_pl = 0
     for p in positions:
         cost = p.avg_entry * p.qty
         pct = (p.unrealized_pl / cost * 100) if cost > 0 else 0
+        # Intraday P&L (today's change only)
+        intra_pl = float(p.unrealized_intraday_pl) if hasattr(p, 'unrealized_intraday_pl') and p.unrealized_intraday_pl else 0
+        intra_pct = float(p.unrealized_intraday_plpc) if hasattr(p, 'unrealized_intraday_plpc') and p.unrealized_intraday_plpc else 0
+        daily_pl += intra_pl
         entry = {
             'symbol': p.symbol,
             'qty': p.qty,
-            'avg_entry': p.avg_entry,
-            'current_price': p.current_price,
-            'market_value': p.market_value,
-            'unrealized_pl': p.unrealized_pl,
+            'avg_entry': float(p.avg_entry),
+            'current_price': float(p.current_price),
+            'market_value': float(p.market_value),
+            'unrealized_pl': float(p.unrealized_pl),
+            'pnl': float(p.unrealized_pl),
             'pct': round(pct, 2),
+            'pnl_pct': round(pct, 2),
+            'intraday_pl': intra_pl,
+            'intraday_pct': round(intra_pct * 100, 2) if abs(intra_pct) < 1 else round(intra_pct, 2),
             'is_green': p.unrealized_pl >= 0,
+            'change_today': round(float(p.change_today) * 100, 2) if hasattr(p, 'change_today') and p.change_today else 0,
             'last_tv_data': cached_tv.get(p.symbol),
             'last_sentiment': cached_sent.get(p.symbol),
             'last_ai_verdict': cached_ai.get(p.symbol),
         }
         pos_data.append(entry)
 
-    total_pl = sum(p.unrealized_pl for p in positions)
+    total_pl = sum(float(p.unrealized_pl) for p in positions)
 
     # Serialize orders to plain dicts (React can't render raw objects)
     orders_data = []
@@ -269,11 +279,15 @@ def portfolio():
         'equity': float(acct.get('equity', 0)),
         'buying_power': float(acct.get('buying_power', 0)),
         'cash': float(acct.get('cash', 0)),
-        'total_pl': total_pl,
+        'total_pl': round(total_pl, 2),
+        'pnl': round(total_pl, 2),
+        'daily_pl': round(daily_pl, 2),
         'positions': sorted(pos_data, key=lambda x: x['unrealized_pl'], reverse=True),
         'open_orders': orders_data,
         'positions_count': len(positions),
-        'orders_count': len(orders),
+        'orders_count': len(orders_data),
+        'green_count': sum(1 for p in pos_data if p['unrealized_pl'] >= 0),
+        'red_count': sum(1 for p in pos_data if p['unrealized_pl'] < 0),
         'timestamp': datetime.now(ET).isoformat(),
     })
 
