@@ -1824,6 +1824,88 @@ def v4_backtest_historical():
         return jsonify({'error': str(e)})
 
 
+@app.route('/api/v4/position-intel')
+@require_auth
+def v4_position_intel():
+    """Full intelligence for every position: fundamentals + AI + reasoning + plan.
+    This is the 'WHY do we hold this?' view."""
+    try:
+        from fundamentals import analyze_fundamentals, generate_position_reasoning
+        gw = _get_gateway()
+        db = _get_v4_db()
+        positions = gw.get_positions()
+        
+        results = []
+        for p in positions:
+            # Get fundamentals
+            fund = analyze_fundamentals(p.symbol)
+            
+            # Get latest AI verdict from DB
+            ai_v = {}
+            rows = db._exec(
+                "SELECT action, confidence, reasoning FROM ai_verdicts WHERE symbol = %s ORDER BY created_at DESC LIMIT 1",
+                (p.symbol,), fetch=True)
+            if rows:
+                ai_v = rows[0]
+            
+            # Get trends
+            trends = db.get_trends(symbol=p.symbol)
+            
+            # Build position dict
+            pos_data = {
+                'symbol': p.symbol, 'qty': p.qty,
+                'avg_entry': float(p.avg_entry),
+                'current_price': float(p.current_price),
+                'unrealized_pl': float(p.unrealized_pl),
+                'pct': round((p.unrealized_pl / (p.avg_entry * p.qty) * 100) if p.avg_entry * p.qty > 0 else 0, 2),
+                'intraday_pl': float(p.unrealized_intraday_pl),
+                'change_today': round(float(p.change_today) * 100, 2),
+            }
+            
+            # Generate reasoning
+            reasoning = generate_position_reasoning(p.symbol, pos_data, fund, ai_v, trends)
+            
+            results.append({
+                **pos_data,
+                'category': reasoning['category'],
+                'reasons': reasoning['reasons'],
+                'plan': reasoning['plan'],
+                'exit_strategy': reasoning['exit_strategy'],
+                'summary': reasoning['summary'],
+                'fundamentals': {
+                    'pe': fund.get('forward_pe', 0),
+                    'peg': fund.get('peg', 0),
+                    'rev_growth': fund.get('revenue_growth_pct', 0),
+                    'earn_growth': fund.get('earnings_growth_pct', 0),
+                    'analyst': fund.get('analyst_rating', '?'),
+                    'num_analysts': fund.get('num_analysts', 0),
+                    'target': fund.get('target_mean', 0),
+                    'upside': fund.get('upside_pct', 0),
+                    'score': fund.get('fundamental_score', 0),
+                    'verdict': fund.get('verdict', '?'),
+                    'lynch_type': fund.get('lynch_type', '?'),
+                },
+                'ai_verdict': ai_v,
+            })
+        
+        results.sort(key=lambda x: x['unrealized_pl'], reverse=True)
+        return jsonify({'positions': results, 'count': len(results)})
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()[:500]})
+
+
+@app.route('/api/v4/fundamentals/<symbol>')
+@require_auth
+def v4_fundamentals(symbol):
+    """Full fundamental analysis for a single stock."""
+    try:
+        from fundamentals import analyze_fundamentals
+        return jsonify(analyze_fundamentals(symbol.upper()))
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
 if __name__ == '__main__':
     print("Beast V4 Dashboard API starting on port 8080...")
     app.run(host='0.0.0.0', port=8080, debug=False)
