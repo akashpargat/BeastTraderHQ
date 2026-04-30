@@ -219,8 +219,9 @@ class BacktestEngine:
         for i in range(15, len(close)):
             avg_gain[i] = (avg_gain[i-1] * 13 + gains[i-1]) / 14
             avg_loss[i] = (avg_loss[i-1] * 13 + losses[i-1]) / 14
-        rs = np.where(avg_loss > 0, avg_gain / avg_loss, 100)
-        rsi = 100 - (100 / (1 + rs))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            rs = np.where(avg_loss > 0, avg_gain / avg_loss, 100)
+            rsi = 100 - (100 / (1 + rs))
 
         # SMAs
         sma20 = np.convolve(close, np.ones(20)/20, mode='same')

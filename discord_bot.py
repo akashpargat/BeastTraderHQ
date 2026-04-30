@@ -3107,6 +3107,38 @@ async def claude_deep_scan():
             except:
                 market_intel['fear_greed'] = {}
 
+            # 3.5 MARKET INTELLIGENCE (congressional, insider, sector, econ, squeeze)
+            try:
+                from market_intel import MarketIntelligence
+                mi = MarketIntelligence(db=_get_pg())
+                held_syms_list = [p.symbol for p in positions]
+                
+                # Market-wide intel
+                mkt_data = mi.full_market_intel(held_syms_list)
+                market_intel['congress'] = mkt_data.get('congress', [])
+                market_intel['economic_calendar'] = mkt_data.get('economic_calendar', [])
+                market_intel['sector_rotation'] = mkt_data.get('sector_rotation', {})
+                market_intel['correlation'] = mkt_data.get('correlation', {})
+                
+                # Per-stock intel (insider + options + squeeze)
+                for p in positions[:10]:
+                    try:
+                        stock_data = mi.full_intel(p.symbol)
+                        all_intel[p.symbol] = {**(all_intel.get(p.symbol) or {}), **stock_data}
+                    except:
+                        pass
+                
+                # Store everything to DB for learning
+                mi.store_intel_to_db()
+                for p in positions[:8]:
+                    mi.store_intel_to_db(p.symbol)
+                
+                log.info(f"  [INTEL] Market intelligence collected: congress={len(market_intel.get('congress',[]))} "
+                         f"econ={len(market_intel.get('economic_calendar',[]))} "
+                         f"rotation={list(market_intel.get('sector_rotation',{}).get('rotating_in',[])) }")
+            except Exception as e:
+                log.warning(f"  Market intel collection: {e}")
+
             # 4. TradingView indicators on ALL positions
             tv_intel = {}
             for p in positions:
