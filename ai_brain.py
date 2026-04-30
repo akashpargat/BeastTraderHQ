@@ -170,11 +170,9 @@ class AIBrain:
     # ══════════════════════════════════════════════════
 
     def analyze_stock(self, symbol: str, data: dict) -> dict:
-        """5-min scan: GPT-4o with ALL data + last Claude briefing."""
+        """5-min scan: GPT-5.4 primary, deterministic fallback. Claude reserved for deep scans."""
         if self._gpt_available:
             return self._gpt4o_analyze(symbol, data)
-        elif self._claude_available:
-            return self._claude_quick(symbol, data)
         return self._deterministic_fallback(symbol, data)
 
     def analyze_batch(self, stocks_data: dict) -> dict:
@@ -326,8 +324,10 @@ RULES:
                             f"total 429s: {_ai_stats['gpt_429s']}/{_ai_stats['gpt_calls']} calls")
             else:
                 log.warning(f"  [AI GPT-5.4] BATCH FAILED after {elapsed_ms}ms — {e}")
-            log.warning(f"  [AI GPT-5.4] Falling back to per-stock for top 5")
-            return {sym: self.analyze_stock(sym, data) for sym, data in list(stocks_data.items())[:5]}
+            # DON'T fall back to per-stock GPT (will just 429 again)
+            # Use deterministic fallback — fast, no API calls
+            log.warning(f"  [AI] Using deterministic fallback for all {len(stocks_data)} stocks")
+            return {sym: self._deterministic_fallback(sym, data) for sym, data in stocks_data.items()}
 
     def deep_analysis(self, symbol: str, data: dict) -> dict:
         """30-min ultra deep: Claude Opus preferred, GPT-4o fallback."""
@@ -431,8 +431,7 @@ Respond with JSON. confidence MUST be 30-100, never 0."""
             else:
                 log.warning(f"  [AI GPT-5.4] FAILED on {symbol} [{elapsed_ms}ms] — {e}")
             if self._claude_available:
-                log.info(f"  [AI] Falling back to Claude quick for {symbol}")
-                return self._claude_quick(symbol, data)
+                log.info(f"  [AI] Falling back to deterministic for {symbol} (saving Claude for deep scans)")
             return self._deterministic_fallback(symbol, data)
 
     # ══════════════════════════════════════════════════
