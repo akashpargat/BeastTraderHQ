@@ -1248,6 +1248,7 @@ import asyncio
 SCAN_CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', '1498363431013716079'))
 _prev_prices = {}
 _cycle_count = 0
+_cached_vix = 18.0  # Default neutral VIX
 _last_full_scan = 0
 _tv_client = None
 
@@ -1354,6 +1355,62 @@ def _get_tv_indicators(symbol: str) -> dict:
         _tv_client = None  # Reset connection on error
     return {}
 
+
+# Cache TV results so we don't re-scan same stock within 5 min
+_tv_cache = {}  # symbol → (timestamp, indicators)
+
+def _tv_confirm_buy(symbol: str) -> tuple[bool, dict]:
+    """HARD LAW: Check TradingView indicators before ANY buy.
+    Returns (confirmed: bool, indicators: dict).
+    
+    Confirms if:
+    - TV is connected and returns data
+    - RSI < 75 (not extremely overbought)
+    - At least 2 of: MACD positive, above VWAP, confluence >= 5
+    
+    Cached for 5 min to avoid re-scanning same stock."""
+    # Check cache first
+    cached = _tv_cache.get(symbol)
+    if cached and time.time() - cached[0] < 300:
+        return cached[1].get('_confirmed', False), cached[1]
+
+    # Get fresh TV data
+    tv = _get_tv_indicators(symbol)
+    if not tv or tv.get('rsi', 0) == 0:
+        log.info(f"  📺 TV {symbol}: NO DATA — buy BLOCKED (Hard Law)")
+        _pg_log("TV_BLOCKED", symbol=symbol, reason="No TV data — Hard Law", source="tv_confirm")
+        return False, {}
+
+    # Evaluate signals
+    signals_bullish = 0
+    rsi = tv.get('rsi', 50)
+    if rsi < 75:
+        signals_bullish += 1
+    if rsi < 30:
+        signals_bullish += 1  # Oversold bonus
+    if tv.get('macd_hist', 0) > 0:
+        signals_bullish += 1
+    if tv.get('vwap_above'):
+        signals_bullish += 1
+    if tv.get('confluence', 0) >= 5:
+        signals_bullish += 1
+    if tv.get('ema_9', 0) > tv.get('ema_21', 0) > 0:
+        signals_bullish += 1
+
+    # Need at least 2 bullish signals AND RSI not extreme
+    confirmed = signals_bullish >= 2 and rsi < 80
+    tv['_confirmed'] = confirmed
+    tv['_signals'] = signals_bullish
+    _tv_cache[symbol] = (time.time(), tv)
+
+    if confirmed:
+        log.info(f"  📺 TV {symbol}: CONFIRMED ({signals_bullish} signals) RSI={rsi:.0f}")
+    else:
+        log.info(f"  📺 TV {symbol}: REJECTED ({signals_bullish} signals) RSI={rsi:.0f}")
+        _pg_log("TV_BLOCKED", symbol=symbol, reason=f"TV rejected: {signals_bullish} signals, RSI={rsi:.0f}", source="tv_confirm")
+
+    return confirmed, tv
+
 def _pct(p) -> float:
     """Position P&L percentage."""
     cost = p.avg_entry * p.qty
@@ -1363,6 +1420,48 @@ def _pct(p) -> float:
 _trade_log = []
 _trade_db = None
 _pg_db = None
+_cached_vix = 18.0  # Default neutral VIX
+
+
+def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=0, source="bot"):
+    """SMART BUY: TV confirm → VIX size → quick_buy. All buys go through here."""
+    # HARD LAW: TV must confirm
+    confirmed, tv = _tv_confirm_buy(symbol)
+    if not confirmed:
+        return None
+
+    # Self-learning: check if we should trade this stock
+    pg = _get_pg()
+    if pg:
+        try:
+            advice = pg.should_trade_stock(symbol)
+            if not advice.get('trade', True):
+                log.info(f"  🧠 Self-learn: SKIP {symbol} — {advice.get('reason', '')}")
+                _pg_log("SELF_LEARN_SKIP", symbol=symbol, reason=advice.get('reason', ''), source=source)
+                return None
+            # Adjust size based on history
+            if advice.get('size') == 'large':
+                qty = int(qty * 1.5)
+            elif advice.get('size') == 'small':
+                qty = max(1, qty // 2)
+        except:
+            pass
+
+    # Save TV reading to PostgreSQL
+    if pg and tv:
+        try:
+            pg.save_tv_reading(symbol, scan_type=source,
+                             rsi=tv.get('rsi'), macd_hist=tv.get('macd_hist'),
+                             vwap_above=tv.get('vwap_above'), confluence=tv.get('confluence'),
+                             ema_9=tv.get('ema_9'), ema_21=tv.get('ema_21'),
+                             volume_ratio=tv.get('volume_ratio'), price=price)
+        except:
+            pass
+
+    return gateway.quick_buy(symbol, qty, price, reason=reason,
+                            day_change_pct=day_change_pct,
+                            sentiment_score=sentiment_score,
+                            vix=_cached_vix, tv_confirmed=True)
 
 def _get_trade_db():
     global _trade_db
@@ -1457,8 +1556,17 @@ def _is_trading_hours() -> bool:
 @tasks.loop(seconds=60)
 async def position_monitor():
     """Every 60s: check positions, alert drops, auto-scalp, auto-protect, auto-buy dips."""
-    global _prev_prices, _cycle_count
+    global _prev_prices, _cycle_count, _cached_vix
     _cycle_count += 1
+
+    # Refresh VIX every 10 cycles
+    if _cycle_count % 10 == 0:
+        try:
+            sa = SentimentAnalyst()
+            fg = sa.get_fear_greed()
+            _cached_vix = fg.get('vix', 18.0)
+        except:
+            pass
     try:
         positions = gateway.get_positions()
         if not positions:
@@ -1534,8 +1642,9 @@ async def position_monitor():
                             if cash > 3000:
                                 reload_qty = max(1, int(cash * 0.02 / p.current_price))
                                 buy_price = round(p.current_price * 1.001, 2)
-                                result = gateway.quick_buy(p.symbol, reload_qty, buy_price,
-                                    reason=f"Dip reload {dip_pct:.1f}% from ${intraday_high:.2f}")
+                                result = _smart_buy(p.symbol, reload_qty, buy_price,
+                                    reason=f"Dip reload {dip_pct:.1f}% from ${intraday_high:.2f}",
+                                    vix=_cached_vix)
                                 if result and result.state.value != 'REJECTED':
                                     _prev_prices[reload_key] = time.time()
                                     _log_trade("DIP RELOAD", p.symbol, reload_qty, buy_price,
@@ -1546,6 +1655,35 @@ async def position_monitor():
                                             f"Buy {reload_qty} @ ${buy_price} → scalp at +2%")
                         except:
                             pass
+
+            # ── PYRAMIDING: add to winning positions that keep running ──
+            if _is_trading_hours() and pct >= 3.0 and avail == 0:
+                # Stock is running +3%+ but we can't sell (all locked)
+                # Instead of watching, ADD MORE and scalp the new shares
+                pyramid_key = f"_pyramid_t_{p.symbol}"
+                last_pyramid = _prev_prices.get(pyramid_key, 0)
+                if time.time() - last_pyramid > 1800:  # 30min between pyramids
+                    try:
+                        acct_data = gateway.get_account()
+                        cash = float(acct_data.get('cash', 0))
+                        equity = float(acct_data.get('equity', 100000))
+                        if cash > 3000 and (cash / equity) > 0.30:  # Must have >30% cash
+                            add_qty = max(1, int(equity * 0.015 / p.current_price))  # 1.5% of portfolio
+                            buy_price = round(p.current_price * 1.001, 2)
+                            result = _smart_buy(
+                                p.symbol, add_qty, buy_price,
+                                reason=f"Pyramid: +{pct:.1f}% winner, adding {add_qty} shares",
+                                vix=_cached_vix)
+                            if result and result.state.value != 'REJECTED':
+                                _prev_prices[pyramid_key] = time.time()
+                                _log_trade("PYRAMID BUY", p.symbol, add_qty, buy_price,
+                                           f"Winner +{pct:.1f}% — adding more to ride", "60s Pyramid")
+                                if channel:
+                                    await channel.send(
+                                        f"📈🟢 **PYRAMID: {p.symbol}** +{pct:.1f}% winner\n"
+                                        f"Adding {add_qty} shares @ ${buy_price} — riding the momentum")
+                    except Exception as e:
+                        log.debug(f"Pyramid {p.symbol}: {e}")
 
             # ── DROP ALERT: >2% sudden drop ──
             if prev > 0:
@@ -1584,9 +1722,10 @@ async def position_monitor():
                                 equity = float(acct.get('equity', 100000))
                                 qty = max(1, int(equity * 0.03 / price))
                                 buy_price = round(price * 0.998, 2)
-                                gateway.quick_buy(sym, qty, buy_price,
+                                _smart_buy(sym, qty, buy_price,
                                                   reason=f"Akash Method: {day_change:+.1f}% dip",
-                                                  day_change_pct=day_change)
+                                                  day_change_pct=day_change,
+                                                  vix=_cached_vix)
                                 _prev_prices[f"_dipbuy_{sym}"] = True
                                 _log_trade("LIMIT BUY (Akash Method)", sym, qty, buy_price,
                                            f"{day_change:+.1f}% daily drop. Oversold dip buy.", "60s Monitor")
@@ -1877,10 +2016,11 @@ async def full_scan():
                         buy_price = round(price * 1.002, 2)
                         sent = sentiments.get(sym)
                         sent_score = sent.total_score if sent else 0
-                        result = gateway.quick_buy(
+                        result = _smart_buy(
                             sym, qty, buy_price,
                             reason=f"GPT-4o BUY {conf}%: {reason}",
-                            day_change_pct=0, sentiment_score=sent_score
+                            day_change_pct=0, sentiment_score=sent_score,
+                            vix=_cached_vix
                         )
                         if result and result.state.value != 'REJECTED':
                             _log_trade(f"AI BUY (GPT-4o {conf}%)", sym, qty, buy_price, reason, "5min GPT")
@@ -2275,10 +2415,11 @@ async def fast_runner_scan():
             qty = max(1, int(equity * 0.02 / r['price']))
             buy_price = round(r['price'] * 1.002, 2)
 
-            result = gateway.quick_buy(
+            result = _smart_buy(
                 sym, qty, buy_price,
                 reason=f"Fast runner +{r['pct']:.1f}% vol={r['volume']:,}",
-                day_change_pct=r['pct'], sentiment_score=sent_score
+                day_change_pct=r['pct'], sentiment_score=sent_score,
+                vix=_cached_vix
             )
 
             if result and result.state.value != 'REJECTED':
@@ -2627,11 +2768,12 @@ async def claude_deep_scan():
                             qty = max(1, int(equity * 0.03 / price))
                             buy_price = round(price * 1.002, 2)  # Slight premium to ensure fill
                             intel = all_intel.get(sym, {})
-                            result = gateway.quick_buy(
+                            result = _smart_buy(
                                 sym, qty, buy_price,
                                 reason=f"Claude AI BUY {conf}%: {reasoning}",
                                 day_change_pct=0,
-                                sentiment_score=intel.get('total_sentiment', 0)
+                                sentiment_score=intel.get('total_sentiment', 0),
+                                vix=_cached_vix
                             )
                             if result and result.state.value != 'REJECTED':
                                 _log_trade(f"AI BUY (Claude {conf}%)", sym, qty, buy_price, reasoning, "30min Claude")

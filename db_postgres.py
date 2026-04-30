@@ -589,6 +589,102 @@ class BeastDB:
             (pnl, symbol.upper())
         )
 
+    # ══════════════════════════════════════════════
+    #  SELF-LEARNING (learn from past trades)
+    # ══════════════════════════════════════════════
+
+    def get_stock_history(self, symbol: str) -> dict:
+        """What happened last time we traded this stock?
+        Returns win rate, avg P&L, best/worst trade, avg hold time."""
+        rows = self._exec(
+            """SELECT 
+                COUNT(*) as total_trades,
+                SUM(CASE WHEN realized_pl > 0 THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN realized_pl < 0 THEN 1 ELSE 0 END) as losses,
+                COALESCE(AVG(realized_pl), 0) as avg_pnl,
+                COALESCE(MAX(realized_pl), 0) as best_trade,
+                COALESCE(MIN(realized_pl), 0) as worst_trade,
+                COALESCE(SUM(realized_pl), 0) as total_pnl
+               FROM orders WHERE symbol = %s AND status = 'filled' AND side = 'sell'""",
+            (symbol,), fetch=True
+        )
+        if not rows or rows[0]['total_trades'] == 0:
+            return {'known': False, 'symbol': symbol}
+        r = rows[0]
+        total = r['total_trades']
+        wins = r['wins'] or 0
+        return {
+            'known': True,
+            'symbol': symbol,
+            'total_trades': total,
+            'win_rate': round(wins / total * 100, 1) if total > 0 else 0,
+            'avg_pnl': round(r['avg_pnl'], 2),
+            'best_trade': round(r['best_trade'], 2),
+            'worst_trade': round(r['worst_trade'], 2),
+            'total_pnl': round(r['total_pnl'], 2),
+            'recommendation': 'AGGRESSIVE' if wins / total > 0.6 else ('NORMAL' if wins / total > 0.4 else 'CAUTIOUS')
+        }
+
+    def get_best_performing_stocks(self, limit=10) -> list:
+        """Which stocks make us the most money? Used to prioritize scanning."""
+        return self._exec(
+            """SELECT symbol, 
+                COUNT(*) as trades,
+                SUM(CASE WHEN realized_pl > 0 THEN 1 ELSE 0 END) as wins,
+                COALESCE(SUM(realized_pl), 0) as total_pnl,
+                COALESCE(AVG(realized_pl), 0) as avg_pnl
+               FROM orders WHERE status = 'filled' AND side = 'sell' AND realized_pl IS NOT NULL
+               GROUP BY symbol
+               HAVING COUNT(*) >= 2
+               ORDER BY total_pnl DESC
+               LIMIT %s""",
+            (limit,), fetch=True
+        ) or []
+
+    def get_optimal_rsi_for_stock(self, symbol: str) -> dict:
+        """What RSI did we buy at when we won vs lost? Learn the optimal entry."""
+        # Get AI verdicts for this stock and cross-reference with order outcomes
+        rows = self._exec(
+            """SELECT 
+                v.confidence, v.action,
+                o.realized_pl, o.limit_price
+               FROM ai_verdicts v
+               LEFT JOIN orders o ON o.symbol = v.symbol 
+                 AND o.created_at BETWEEN v.created_at - interval '5 minutes' AND v.created_at + interval '30 minutes'
+               WHERE v.symbol = %s AND o.status = 'filled'
+               ORDER BY v.created_at DESC LIMIT 50""",
+            (symbol,), fetch=True
+        ) or []
+        
+        winning_confs = [r['confidence'] for r in rows if r.get('realized_pl') and r['realized_pl'] > 0]
+        losing_confs = [r['confidence'] for r in rows if r.get('realized_pl') and r['realized_pl'] < 0]
+        
+        return {
+            'symbol': symbol,
+            'avg_winning_confidence': round(sum(winning_confs) / len(winning_confs), 1) if winning_confs else 0,
+            'avg_losing_confidence': round(sum(losing_confs) / len(losing_confs), 1) if losing_confs else 0,
+            'min_safe_confidence': round(min(winning_confs), 1) if winning_confs else 50,
+            'sample_size': len(rows),
+        }
+
+    def should_trade_stock(self, symbol: str) -> dict:
+        """Self-learning decision: should we trade this stock based on history?"""
+        history = self.get_stock_history(symbol)
+        if not history.get('known'):
+            return {'trade': True, 'reason': 'No history — try it', 'size': 'normal'}
+        
+        win_rate = history.get('win_rate', 50)
+        avg_pnl = history.get('avg_pnl', 0)
+        
+        if win_rate >= 70 and avg_pnl > 0:
+            return {'trade': True, 'reason': f'{win_rate}% win rate, avg ${avg_pnl:.0f} — go BIGGER', 'size': 'large'}
+        elif win_rate >= 50:
+            return {'trade': True, 'reason': f'{win_rate}% win rate — normal size', 'size': 'normal'}
+        elif win_rate >= 30:
+            return {'trade': True, 'reason': f'{win_rate}% win rate — small size, be careful', 'size': 'small'}
+        else:
+            return {'trade': False, 'reason': f'{win_rate}% win rate, avg ${avg_pnl:.0f} — SKIP this stock', 'size': 'none'}
+
     def close(self):
         if self.conn:
             try:
