@@ -31,10 +31,25 @@ import asyncio
 import logging
 import traceback
 import time
+import subprocess
 import discord
 from discord.ext import commands, tasks
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+# ── VERSION TRACKING ──
+BOT_VERSION = "4.2.0"
+try:
+    _git_hash = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'],
+                                         stderr=subprocess.DEVNULL, cwd=os.path.dirname(os.path.abspath(__file__))
+                                         ).decode().strip()
+    _git_date = subprocess.check_output(['git', 'log', '-1', '--format=%ci', '--date=short'],
+                                         stderr=subprocess.DEVNULL, cwd=os.path.dirname(os.path.abspath(__file__))
+                                         ).decode().strip()[:16]
+except:
+    _git_hash = "unknown"
+    _git_date = "unknown"
+BOT_BUILD = f"v{BOT_VERSION} ({_git_hash} @ {_git_date})"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -2839,6 +2854,7 @@ async def before_claude():
 @bot.event
 async def on_ready():
     log.info(f"🦍 Beast Discord Bot online as {bot.user}")
+    log.info(f"   Build: {BOT_BUILD}")
     log.info(f"   AI Brain: {'✅ Opus 4.7' if brain and brain.is_available else '❌ offline'}")
     tv_ok = False
     try:
@@ -2847,6 +2863,9 @@ async def on_ready():
     except:
         pass
     log.info(f"   TradingView: {'✅' if tv_ok else '❌'}")
+    pg_ok = _get_pg() and _get_pg().conn
+    log.info(f"   PostgreSQL: {'✅' if pg_ok else '❌'}")
+    log.info(f"   Watchlist: {len(DIP_BUY_WATCHLIST)} stocks")
 
     if not position_monitor.is_running():
         position_monitor.start()
@@ -2867,18 +2886,18 @@ async def on_ready():
     channel = bot.get_channel(SCAN_CHANNEL_ID)
     if channel:
         await channel.send(
-            "🦍 **BEAST TERMINAL V4 ONLINE**\n"
-            f"• 60s: Position monitor (auto-scalp/runner/dip-buy/protect)\n"
-            f"• 2min: Fast runner scan (catch movers, auto-buy)\n"
+            f"🦍 **BEAST TERMINAL V4 ONLINE** `{BOT_BUILD}`\n"
+            f"• 60s: Position monitor (scalp/dip-reload/pyramid)\n"
+            f"• 2min: Market-wide runner scan (most_active API)\n"
             f"• 5min: Full scan (TV + sentiment + GPT-4o + auto-execute)\n"
-            f"• 10min: Decision report (risk + signals)\n"
+            f"• 10min: Decision report\n"
             f"• 30min: Claude MEGA-SCAN (ultra-deep + auto-execute)\n"
-            f"• AI: {'GPT-4o ✅' if brain and brain._gpt_available else '❌'} + {'Claude ✅' if brain and brain._claude_available else 'Claude ❌'}\n"
-            f"• TV: {'Connected ✅' if tv_ok else 'Offline ❌'}\n"
-            f"• Auto-execute: ≥75% confidence = BUY/SELL\n"
-            f"• Iron Laws: 23 HARDCODED ✅\n"
-            f"• PostgreSQL: {'Connected ✅' if _get_pg() and _get_pg().conn else 'Offline ❌'}\n"
-            f"• Pre/post market: ENABLED (4AM-8PM)"
+            f"• AI: {'GPT-4o ✅' if brain and brain._gpt_available else '❌'} + {'Claude ✅' if brain and brain._claude_available else '❌'}\n"
+            f"• TV: {'Connected ✅' if tv_ok else 'Offline ❌'} (HARD LAW: no TV = no buy)\n"
+            f"• Watchlist: {len(DIP_BUY_WATCHLIST)} stocks (from PostgreSQL)\n"
+            f"• Auto-execute: ≥75% confidence\n"
+            f"• Smart Buy: TV→SelfLearn→VIX→Execute\n"
+            f"• Trading: 4AM-8PM ET (pre+market+post)"
         )
 
 
