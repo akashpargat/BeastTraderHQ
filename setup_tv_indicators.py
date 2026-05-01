@@ -29,21 +29,74 @@ def evaluate(ws, js):
             return resp.get('result', {}).get('result', {}).get('value')
 
 def add_indicator(ws, name, wait=3):
-    """Add an indicator by name using TV's createStudy API."""
-    # Use the proven TradingViewApi path
-    js = f"""
-    (function() {{
-        try {{
-            var chart = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
-            var model = chart.model();
-            model.createStudy(model.mainSeries(), '{name}');
-            return true;
-        }} catch(e) {{ return 'error: ' + e.message; }}
-    }})()
-    """
-    result = evaluate(ws, js)
+    """Add an indicator by name — tries multiple API paths for compatibility."""
+    # Method 1: createStudy on paneViews (newer TV versions)
+    methods = [
+        f"""
+        (function() {{
+            try {{
+                var chart = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
+                chart.model().createStudy(chart.model().mainSeries(), '{name}');
+                return 'method1_ok';
+            }} catch(e) {{ return 'method1_fail: ' + e.message; }}
+        }})()
+        """,
+        f"""
+        (function() {{
+            try {{
+                var api = window.TradingViewApi;
+                var chart = api._activeChartWidgetWV.value();
+                chart.createStudy('{name}', false, false);
+                return 'method2_ok';
+            }} catch(e) {{ return 'method2_fail: ' + e.message; }}
+        }})()
+        """,
+        f"""
+        (function() {{
+            try {{
+                var chart = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
+                var pane = chart.paneViews()[0];
+                pane.model().createStudy(pane.model().mainSeries(), '{name}');
+                return 'method3_ok';
+            }} catch(e) {{ return 'method3_fail: ' + e.message; }}
+        }})()
+        """,
+        f"""
+        (function() {{
+            try {{
+                var w = document.querySelector('[class*="chart-widget"]');
+                var api = Object.keys(w).filter(k => k.startsWith('__reactFiber'))[0];
+                var fiber = w[api];
+                while (fiber && !fiber.memoizedProps?.chartWidgetCollection) fiber = fiber.return;
+                var coll = fiber.memoizedProps.chartWidgetCollection;
+                var chart = coll.activeChartWidget.value();
+                chart.createStudy('{name}', false, false);
+                return 'method4_ok';
+            }} catch(e) {{ return 'method4_fail: ' + e.message; }}
+        }})()
+        """,
+        # Method 5: Use the search/add UI via keyboard simulation
+        f"""
+        (function() {{
+            try {{
+                // Open indicators dialog
+                document.querySelector('[data-name="insert-indicator"]')?.click() ||
+                document.querySelector('[aria-label="Indicators, Metrics & Strategies"]')?.click();
+                return 'method5_clicked_indicator_btn';
+            }} catch(e) {{ return 'method5_fail: ' + e.message; }}
+        }})()
+        """,
+    ]
+    
+    for js in methods:
+        result = evaluate(ws, js)
+        if result and '_ok' in str(result):
+            time.sleep(wait)
+            return result
+        print(f"    {result}")
+    
     time.sleep(wait)
-    return result
+    return 'all_methods_failed'
 
 def get_current_studies(ws):
     """List currently loaded studies."""

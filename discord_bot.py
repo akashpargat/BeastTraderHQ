@@ -56,18 +56,61 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
 load_dotenv('.env')
 
+# ══════════════════════════════════════════════════════════
+# EXTREME STARTUP LOGGING — every import, every init, every failure
+# Logs to console + beast.log + PostgreSQL activity_log
+# ══════════════════════════════════════════════════════════
+_startup_log = []
+def _slog(msg, level='INFO'):
+    """Startup log — prints, appends to list, and will flush to DB after init."""
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    line = f'{ts} [STARTUP] {msg}'
+    print(line)
+    _startup_log.append((level, msg))
+
+_slog(f'Beast Bot starting — Python {sys.version}')
+_slog(f'Working dir: {os.getcwd()}')
+_slog(f'Python exe: {sys.executable}')
+
+# ── Import core modules with logging ──
+_slog('Importing order_gateway...')
 from order_gateway import OrderGateway
+_slog('  order_gateway OK')
+
+_slog('Importing sentiment_analyst...')
 from sentiment_analyst import SentimentAnalyst
+_slog('  sentiment_analyst OK')
+
+_slog('Importing ai_brain...')
 from ai_brain import AIBrain
+_slog('  ai_brain OK')
+
+_slog('Importing regime_detector...')
 from regime_detector import RegimeDetector
+_slog('  regime_detector OK')
+
+_slog('Importing sector_scanner...')
 from sector_scanner import SectorScanner
+_slog('  sector_scanner OK')
+
+_slog('Importing master_intelligence...')
 from engine.master_intelligence import (
     MasterConfidenceEngine, PAST_WINNERS, get_all_scan_symbols,
     get_stock_profile, FULL_SECTOR_SCAN
 )
+_slog('  master_intelligence OK')
+
+_slog('Importing tv_cdp_client...')
 from tv_cdp_client import TVClient
+_slog('  tv_cdp_client OK')
+
+_slog('Importing data_collector...')
 from data_collector import DataCollector
+_slog('  data_collector OK')
+
+_slog('Importing report_formatter...')
 from report_formatter import format_beast_report
+_slog('  report_formatter OK')
 
 ET = ZoneInfo("America/New_York")
 log = logging.getLogger('Beast.Discord')
@@ -81,38 +124,78 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
-# Components
-api_key = os.getenv('ALPACA_API_KEY', '')
-secret = os.getenv('ALPACA_SECRET_KEY', '')
+# Components — every init logged
+_slog('Initializing OrderGateway...')
 gateway = OrderGateway(api_key, secret, paper=True)
-sentiment = SentimentAnalyst()
-confidence = MasterConfidenceEngine()
-regime_det = RegimeDetector()
-sectors_scanner = SectorScanner()
-brain = AIBrain()
-tv = TVClient()
-dc = DataCollector(api_key, secret)
+_slog(f'  OrderGateway OK — anti-buyback timeout={gateway.ANTI_BUYBACK_TIMEOUT_MIN}min')
 
-# ── V5 PRO MODULES ──
+_slog('Initializing SentimentAnalyst...')
+sentiment = SentimentAnalyst()
+_slog('  SentimentAnalyst OK')
+
+confidence = MasterConfidenceEngine()
+_slog('  MasterConfidenceEngine OK')
+
+regime_det = RegimeDetector()
+_slog('  RegimeDetector OK')
+
+sectors_scanner = SectorScanner()
+_slog('  SectorScanner OK')
+
+_slog('Initializing AIBrain...')
+brain = AIBrain()
+_slog(f'  AIBrain OK — available={brain.is_available if hasattr(brain, "is_available") else "?"}')
+
+_slog('Initializing TVClient...')
+tv = TVClient()
+_slog('  TVClient OK')
+
+_slog('Initializing DataCollector...')
+dc = DataCollector(api_key, secret)
+_slog('  DataCollector OK')
+
+# ── V5 PRO MODULES (graceful — bot works without them) ──
+_slog('Loading V5 modules...')
+
 risk_mgr = None
 try:
     from risk_manager import RiskManager
     risk_mgr = RiskManager()
-    log.info("✅ [V5] RiskManager loaded — Kelly sizing, loss limits, correlation, sector caps")
+    _slog('  ✅ RiskManager loaded — Kelly sizing, loss limits, correlation, sector caps')
 except Exception as e:
-    log.warning(f"⚠️ [V5] RiskManager not available: {e}")
+    _slog(f'  ⚠️ RiskManager FAILED: {e}', 'WARNING')
+    _slog(f'     Traceback: {traceback.format_exc()[:200]}', 'WARNING')
 
 pro_data = None
 try:
     from pro_data_sources import ProDataSources
     pro_data = ProDataSources()
-    log.info("✅ [V5] ProDataSources loaded — congress, insider, PCR, VIX, dark pool, Fear&Greed")
+    _slog('  ✅ ProDataSources loaded — congress, insider, PCR, VIX, dark pool, Fear&Greed')
 except Exception as e:
-    log.warning(f"⚠️ [V5] ProDataSources not available: {e}")
+    _slog(f'  ⚠️ ProDataSources FAILED: {e}', 'WARNING')
+    _slog(f'     Traceback: {traceback.format_exc()[:200]}', 'WARNING')
 
+_slog('Initializing Alpaca data client...')
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockSnapshotRequest
 data_client = StockHistoricalDataClient(api_key, secret)
+_slog('  Alpaca data client OK')
+
+# ── Flush startup log to PostgreSQL ──
+def _flush_startup_log():
+    try:
+        pg = _get_pg()
+        if pg:
+            for level, msg in _startup_log:
+                pg._exec(
+                    "INSERT INTO activity_log (action_type, category, reason, source) VALUES (%s, %s, %s, %s)",
+                    ('STARTUP', 'system', msg[:500], 'boot')
+                )
+            _slog(f'Startup log flushed to PostgreSQL ({len(_startup_log)} entries)')
+    except Exception as e:
+        print(f'[STARTUP] Failed to flush to DB: {e}')
+
+_slog(f'=== STARTUP COMPLETE: V5 Risk={risk_mgr is not None} ProData={pro_data is not None} ===')
 
 
 @bot.event
@@ -1385,6 +1468,24 @@ def _get_tv_indicators(symbol: str) -> dict:
     except Exception as e:
         log.warning(f"  TV indicators {symbol}: {e}")
         _tv_client = None  # Reset connection on error
+
+    # ── V5 FALLBACK: Headless technicals when TV CDP unavailable ──
+    try:
+        from headless_technicals import HeadlessTechnicals
+        _ht = HeadlessTechnicals(api_key, secret)
+        result = _ht.analyze(symbol)
+        if result and result.get('price', 0) > 0:
+            log.info(f"  📊 HEADLESS {symbol}: RSI={result['rsi']:.0f} MACD={result['macd_hist']:.3f} "
+                     f"VWAP={'↑' if result['vwap_above'] else '↓'} Conf={result['confluence']}/10 "
+                     f"[fallback — TV CDP unavailable]")
+            _pg_log("HEADLESS_TA", symbol=symbol,
+                    reason=f"Headless fallback: RSI={result['rsi']:.0f} MACD={result['macd_hist']:.3f} "
+                           f"VWAP={'above' if result['vwap_above'] else 'below'} Conf={result['confluence']}",
+                    source="headless_ta")
+            return result
+    except Exception as he:
+        log.debug(f"  Headless TA also failed for {symbol}: {he}")
+
     return {}
 
 

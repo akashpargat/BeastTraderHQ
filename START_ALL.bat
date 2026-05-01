@@ -1,8 +1,9 @@
 @echo off
 echo ============================================
-echo   BEAST TERMINAL V4 - Full Setup + Start
+echo   BEAST TERMINAL V5 - Full Setup + Start
 echo ============================================
 set PYTHONIOENCODING=utf-8
+set PY=C:\Users\beastadmin\AppData\Local\Programs\Python\Python312\python.exe
 cd /d C:\beast-test2
 
 echo.
@@ -13,7 +14,8 @@ timeout /t 5 /nobreak >nul
 
 echo.
 echo [2/7] Installing Python dependencies...
-C:\Python312\python.exe -m pip install psycopg2-binary --quiet 2>nul
+%PY% -m pip install -r requirements.txt --quiet 2>nul
+%PY% -m pip install discord.py openai websocket-client aiohttp flask flask-cors beautifulsoup4 pandas --quiet 2>nul
 echo Done.
 
 echo.
@@ -27,13 +29,25 @@ echo Dashboard built.
 
 echo.
 echo [4/7] Starting TradingView Desktop with CDP...
-start "" "C:\Program Files\WindowsApps\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj\TradingView.exe" --remote-debugging-port=9222
+REM Try multiple possible TV paths
+if exist "C:\Program Files\WindowsApps\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj\TradingView.exe" (
+    start "" "C:\Program Files\WindowsApps\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj\TradingView.exe" --remote-debugging-port=9222
+) else (
+    echo Searching for TradingView...
+    for /f "delims=" %%i in ('dir /s /b "C:\Program Files\WindowsApps\TradingView*.exe" 2^>nul') do (
+        echo Found: %%i
+        start "" "%%i" --remote-debugging-port=9222
+        goto :tv_started
+    )
+    echo WARNING: TradingView Desktop not found - TV analysis will be unavailable
+)
+:tv_started
 echo Waiting 20s for TV to load chart...
 timeout /t 20 /nobreak >nul
 
 echo.
 echo [5/7] Starting Dashboard API (port 8080)...
-start "BeastAPI" cmd /c "cd /d C:\beast-test2 && set PYTHONIOENCODING=utf-8 && C:\Python312\python.exe dashboard_api.py"
+start "BeastAPI" cmd /c "cd /d C:\beast-test2 && set PYTHONIOENCODING=utf-8 && %PY% dashboard_api.py"
 echo Waiting 5s...
 timeout /t 5 /nobreak >nul
 
@@ -46,12 +60,13 @@ timeout /t 10 /nobreak >nul
 echo.
 echo [7/7] Starting Discord Bot (autonomous trading)...
 echo ============================================
-echo   ALL SYSTEMS GO - Beast Terminal V4
+echo   ALL SYSTEMS GO - Beast Terminal V5
 echo   TV: CDP port 9222
 echo   API: port 8080
 echo   Dashboard: port 3000
 echo   Bot: autonomous loops starting...
 echo   PostgreSQL: Azure beast-trading-db
+echo   V5: Risk Manager + Pro Data Sources
 echo ============================================
 echo.
-C:\Python312\python.exe discord_bot.py
+%PY% discord_bot.py

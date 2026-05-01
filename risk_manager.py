@@ -13,7 +13,19 @@ from typing import Optional
 
 import numpy as np
 import yfinance as yf
-from scipy.stats import pearsonr
+
+# Use numpy for correlation instead of scipy (scipy hard to install on some VMs)
+def _pearsonr(x, y):
+    """Numpy-only Pearson correlation. Returns (r, p_value_placeholder)."""
+    try:
+        if len(x) < 3 or len(y) < 3:
+            return 0.0, 1.0
+        x = np.array(x, dtype=float)
+        y = np.array(y, dtype=float)
+        r = np.corrcoef(x, y)[0, 1]
+        return float(r) if not np.isnan(r) else 0.0, 0.0
+    except:
+        return 0.0, 1.0
 
 try:
     from db_postgres import BeastDB
@@ -445,7 +457,7 @@ class RiskManager:
                 min_len = min(len(target_returns), len(pos_arr))
                 if min_len < 10:
                     continue
-                corr, _ = pearsonr(target_returns[:min_len], pos_arr[:min_len])
+                corr, _ = _pearsonr(target_returns[:min_len], pos_arr[:min_len])
                 corr = abs(corr)
                 details.append({"symbol": pos, "correlation": round(corr, 4)})
                 if corr > max_corr:

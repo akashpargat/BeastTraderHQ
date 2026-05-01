@@ -29,7 +29,12 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+    logging.getLogger("beast").warning("[PRO_DATA] beautifulsoup4 not installed — congress scraper disabled. Run: pip install beautifulsoup4")
 
 # ---------------------------------------------------------------------------
 # Logging setup
