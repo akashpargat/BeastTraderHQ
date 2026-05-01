@@ -159,4 +159,4 @@ echo ============================================
 echo.
 echo [%time%] ALL SYSTEMS GO >> %LOG%
 echo [%time%] Starting discord_bot.py >> %LOG%
-%PY% discord_bot.py 2>&1 | tee -a %LOG%
+%PY% discord_bot.py
