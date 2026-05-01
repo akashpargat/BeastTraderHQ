@@ -132,13 +132,20 @@ class RiskManager:
         self.portfolio_value = portfolio_value
         if self.db:
             self._ensure_tables()
-        log.info("[RISK] RiskManager initialised — portfolio $%.2f, db=%s", portfolio_value, 'connected' if db else 'none')
+        log.info("[RISK] RiskManager initialised — portfolio $%.2f, db=%s", portfolio_value, 'connected' if db else 'none (will connect lazily)')
+
+    def set_db(self, db):
+        """Connect to PostgreSQL after startup. Called from on_ready()."""
+        self.db = db
+        if self.db:
+            self._ensure_tables()
+            log.info("[RISK] PostgreSQL connected — risk_checks + daily_risk_state tables ready")
 
     # ── Schema bootstrap ─────────────────────────────────────────────
     def _ensure_tables(self):
         """Create risk-tracking tables if they don't exist."""
         try:
-            self.db.execute("""
+            self.db._exec("""
                 CREATE TABLE IF NOT EXISTS risk_checks (
                     id SERIAL PRIMARY KEY,
                     created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -151,7 +158,7 @@ class RiskManager:
                     details JSONB
                 );
             """)
-            self.db.execute("""
+            self.db._exec("""
                 CREATE TABLE IF NOT EXISTS daily_risk_state (
                     id SERIAL PRIMARY KEY,
                     date DATE NOT NULL UNIQUE,
@@ -179,7 +186,7 @@ class RiskManager:
         """Persist every risk decision to PostgreSQL."""
         import json
         try:
-            self.db.execute(
+            self.db._exec(
                 """INSERT INTO risk_checks
                    (symbol, check_type, approved, original_qty, adjusted_qty, reason, details)
                    VALUES (%s, %s, %s, %s, %s, %s, %s)""",
@@ -192,11 +199,11 @@ class RiskManager:
     def _get_trade_stats(self, symbol: str) -> dict:
         """Pull win_rate, avg_win, avg_loss from trade history."""
         try:
-            rows = self.db.fetch(
+            rows = self.db._exec(
                 """SELECT pnl FROM trades
                    WHERE symbol = %s AND pnl IS NOT NULL
                    ORDER BY closed_at DESC LIMIT 100""",
-                (symbol,),
+                (symbol,), fetch=True
             )
             if not rows or len(rows) < 5:
                 return {
@@ -261,6 +268,10 @@ class RiskManager:
         adjustments: list[str] = []
         try:
             conviction = max(0.0, min(1.0, conviction))
+            if conviction <= 0.0:
+                log.warning("[RISK] conviction=0 received — caller should pass confidence. Using 0.55 baseline")
+                conviction = 0.55
+                adjustments.append("missing-conviction-baseline=0.55")
 
             # --- trade stats ---
             stats = self._get_trade_stats(symbol)
@@ -810,3 +821,4 @@ class RiskManager:
                         f"{status}: {rejections or 'clean'}", result)
 
         return result
+

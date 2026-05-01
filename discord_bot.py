@@ -164,8 +164,11 @@ _slog('Loading V5 modules...')
 risk_mgr = None
 try:
     from risk_manager import RiskManager
+    # Pass DB connection lazily — _get_pg() isn't defined yet at startup
+    # RiskManager will get DB on first use via the set_db() call in on_ready
     risk_mgr = RiskManager()
     _slog('  ✅ RiskManager loaded — Kelly sizing, loss limits, correlation, sector caps')
+    _slog('     NOTE: DB will be connected after bot starts (lazy init)')
 except Exception as e:
     _slog(f'  ⚠️ RiskManager FAILED: {e}', 'WARNING')
     _slog(f'     Traceback: {traceback.format_exc()[:200]}', 'WARNING')
@@ -207,6 +210,23 @@ async def on_ready():
     log.info(f'🦍 Beast Discord Bot online as {bot.user}')
     log.info(f'   AI Brain: {"✅ Opus 4.7" if brain.is_available else "❌ offline"}')
     log.info(f'   TradingView: {"✅" if tv.health_check() else "❌"}')
+
+    # ── V5: Connect RiskManager + ProData to PostgreSQL ──
+    try:
+        pg = _get_pg()
+        if pg:
+            if risk_mgr:
+                risk_mgr.set_db(pg)
+                log.info('   ✅ [V5] RiskManager connected to PostgreSQL')
+            if pro_data:
+                pro_data.db = pg
+                log.info('   ✅ [V5] ProDataSources connected to PostgreSQL')
+            _flush_startup_log()
+            log.info('   ✅ Startup log flushed to PostgreSQL')
+        else:
+            log.warning('   ⚠️ PostgreSQL not available — V5 modules running without DB')
+    except Exception as e:
+        log.warning(f'   ⚠️ V5 DB connection failed: {e}')
 
 
 # ── !help ──────────────────────────────────────────────
@@ -2507,7 +2527,8 @@ async def position_monitor():
                                 buy_price = round(p.current_price * 1.001, 2)
                                 result = _smart_buy(p.symbol, reload_qty, buy_price,
                                     reason=f"Dip reload {dip_pct:.1f}% from ${intraday_high:.2f}",
-                                    source="60s_reload", vix=_cached_vix)
+                                    source="60s_reload", vix=_cached_vix,
+                                    confidence=65)  # Dip on existing position = moderate confidence
                                 if result and result.state.value != 'REJECTED':
                                     _prev_prices[reload_key] = time.time()
                                     if pg: pg.record_reload(p.symbol)
@@ -2536,7 +2557,8 @@ async def position_monitor():
                             result = _smart_buy(
                                 p.symbol, add_qty, buy_price,
                                 reason=f"Pyramid: +{pct:.1f}% winner, adding {add_qty} shares",
-                                source="60s_pyramid", vix=_cached_vix)
+                                source="60s_pyramid", vix=_cached_vix,
+                                confidence=75)  # Pyramids are high conviction — stock already proving itself
                             if result and result.state.value != 'REJECTED':
                                 _prev_prices[pyramid_key] = time.time()
                                 if pg: pg.record_pyramid(p.symbol)
@@ -2590,7 +2612,8 @@ async def position_monitor():
                                 _smart_buy(sym, qty, buy_price,
                                                   reason=f"Akash Method: {day_change:+.1f}% dip",
                                                   day_change_pct=day_change,
-                                                  source="60s_dipbuy", vix=_cached_vix)
+                                                  source="60s_dipbuy", vix=_cached_vix,
+                                                  confidence=70)  # Akash Method dip buys are proven
                                 _prev_prices[f"_dipbuy_{sym}"] = True
                                 _log_trade("LIMIT BUY (Akash Method)", sym, qty, buy_price,
                                            f"{day_change:+.1f}% daily drop. Oversold dip buy.", "60s Monitor")
@@ -3453,6 +3476,7 @@ async def fast_runner_scan():
                 reason=f"Fast runner +{r['pct']:.1f}% vol={r['volume']:,}",
                 day_change_pct=r['pct'], sentiment_score=sent_score,
                 source="2min_runner", vix=_cached_vix,
+                confidence=60 + min(sent_score * 3, 15),  # 60-75% based on sentiment strength
                 sentiment_data={'total': sent_score,
                                 'yahoo': getattr(sent, 'yahoo_score', 0) if sent else 0,
                                 'reddit': getattr(sent, 'reddit_score', 0) if sent else 0,
