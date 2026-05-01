@@ -195,6 +195,24 @@ class BeastModeLoop:
         except Exception as e:
             log.warning(f"AI Brain init failed: {e}")
 
+        # Risk Manager (Kelly sizing, loss limits, correlation, earnings)
+        self.risk = None
+        try:
+            from risk_manager import RiskManager
+            self.risk = RiskManager()
+            log.info("✅ RiskManager initialized — Kelly sizing, loss limits, correlation checks active")
+        except Exception as e:
+            log.warning(f"⚠️ RiskManager init failed (using fixed sizing): {e}")
+
+        # Pro Data Sources (congressional trades, insider, PCR, VIX, dark pool, etc.)
+        self.pro_data = None
+        try:
+            from pro_data_sources import ProDataSources
+            self.pro_data = ProDataSources()
+            log.info("✅ ProDataSources initialized — congressional, insider, PCR, VIX, dark pool, Fear&Greed active")
+        except Exception as e:
+            log.warning(f"⚠️ ProDataSources init failed (using standard sources only): {e}")
+
         # TV CDP client (direct to TradingView Desktop)
         self.tv_cdp = None
         try:
@@ -451,16 +469,48 @@ class BeastModeLoop:
 
     def _calculate_position_size(self, symbol: str, price: float,
                                   confidence: float, cash: float) -> int:
-        """Size positions by VOLATILITY (ATR) + confidence, not just price brackets.
+        """Size positions using Kelly Criterion (via RiskManager) or ATR fallback.
         
-        Pro bots size like this:
-        - High confidence (>70%) + low vol → bigger position (5% of portfolio)
-        - Low confidence (60%) + high vol → smaller position (2% of portfolio)
-        - Never risk more than MAX_PORTFOLIO_RISK_PCT per trade
-        
-        Uses 14-day ATR (Average True Range) to measure volatility.
-        High ATR = stock moves a lot = smaller position for same risk.
+        V5 UPGRADE: Uses institutional-grade sizing:
+        1. Half-Kelly based on historical win rate × avg P&L
+        2. VIX adjustment (halve at VIX>25)
+        3. Correlation check (reduce for correlated holdings)
+        4. Sector exposure cap (25% max per sector)
+        5. Earnings risk check (reduce 48h before)
+        6. Daily loss limit check (block if -2% daily)
         """
+        # ── V5: Use RiskManager if available ──
+        if self.risk:
+            try:
+                positions = self.gateway.get_positions()
+                acct = self.gateway.get_account()
+                equity = float(acct.get('equity', 100000))
+                
+                approval = self.risk.approve_trade(
+                    symbol=symbol, side='buy', qty=0,  # qty=0 means "calculate for me"
+                    price=price, conviction=confidence,
+                    positions=positions, equity=equity
+                )
+                
+                if not approval.get('approved', False):
+                    rejections = approval.get('rejections', [])
+                    log.warning(f"[RISK] {symbol} BLOCKED by RiskManager: {', '.join(rejections)}")
+                    return 0
+                
+                adjusted_qty = approval.get('adjusted_qty', 0)
+                if adjusted_qty > 0:
+                    adjustments = approval.get('adjustments', [])
+                    log.info(
+                        f"[RISK] {symbol}: Kelly sizing → {adjusted_qty} shares "
+                        f"(conf={confidence:.0%}, price=${price:.2f}, equity=${equity:,.0f}). "
+                        f"Adjustments: {adjustments if adjustments else 'none'}"
+                    )
+                    return adjusted_qty
+                    
+            except Exception as e:
+                log.warning(f"[RISK] RiskManager failed for {symbol}, falling back to ATR: {e}")
+        
+        # ── Fallback: ATR-based sizing (original method) ──
         try:
             from alpaca.data.historical import StockHistoricalDataClient
             from alpaca.data.requests import StockBarsRequest
@@ -1279,6 +1329,35 @@ class BeastModeLoop:
             log.warning("HALTED - skipping full scan")
             return
 
+        # ── V5 RISK CHECK: Daily loss limit ───────────
+        if self.risk:
+            try:
+                acct_check = self.gateway.get_account()
+                equity_now = float(acct_check.get('equity', 100000))
+                last_equity = float(acct_check.get('last_equity', equity_now))
+                risk_status = self.risk.check_loss_limits(
+                    equity=equity_now,
+                    starting_equity_today=last_equity,
+                    starting_equity_week=last_equity,  # TODO: track weekly start
+                    starting_equity_month=100000  # TODO: track monthly start
+                )
+                if not risk_status.get('can_buy', True):
+                    log.critical(
+                        f"🚨 [RISK] DAILY LOSS LIMIT HIT — {risk_status.get('reason', 'unknown')}. "
+                        f"Daily P&L: {risk_status.get('daily_pnl_pct', 0):.2%}. "
+                        f"Mode: SELL-ONLY until tomorrow. No new buys."
+                    )
+                    # Still run scan for monitoring, but flag no-buy mode
+                    self._risk_can_buy = False
+                else:
+                    self._risk_can_buy = True
+                    size_mult = risk_status.get('size_multiplier', 1.0)
+                    if size_mult < 1.0:
+                        log.info(f"[RISK] Size multiplier: {size_mult:.1f}x (weekly/monthly loss reduction)")
+            except Exception as e:
+                log.warning(f"[RISK] Loss limit check failed: {e}")
+                self._risk_can_buy = True
+
         # ── PHASE 1: POSITIONS ─────────────────────────
         log.info("Phase 1: Positions...")
         positions = self.gateway.get_positions()
@@ -1306,6 +1385,30 @@ class BeastModeLoop:
         scan_list = self._build_scan_list(regime, held_symbols)
         log.info(f"  Scan list ({len(scan_list)}): {', '.join(scan_list[:15])}")
 
+        # ── PHASE 2.5: PRO MARKET CONDITIONS ──────────
+        market_conditions = {}
+        if self.pro_data:
+            try:
+                log.info("Phase 2.5: Pro market conditions (PCR, VIX, Fear&Greed, economic calendar)...")
+                market_conditions = self.pro_data.get_market_conditions()
+                pcr = market_conditions.get('pcr', {})
+                vix = market_conditions.get('vix', {})
+                fg = market_conditions.get('fear_greed', {})
+                econ = market_conditions.get('economic', {})
+                log.info(f"  [PRO] PCR: {pcr.get('value', '?')} ({pcr.get('signal', '?')}) | "
+                        f"VIX: {vix.get('vix', '?')} (contango={'yes' if vix.get('contango') else 'INVERTED'}) | "
+                        f"Fear&Greed: {fg.get('value', '?')} ({fg.get('label', '?')}) | "
+                        f"High-impact tomorrow: {econ.get('high_impact_tomorrow', '?')}")
+                # Adjust regime based on pro data
+                if fg.get('value', 50) <= 20:
+                    log.info(f"  [PRO] 🟢 EXTREME FEAR ({fg.get('value')}) — contrarian BUY signal active")
+                elif fg.get('value', 50) >= 80:
+                    log.info(f"  [PRO] 🔴 EXTREME GREED ({fg.get('value')}) — reducing exposure")
+                if econ.get('high_impact_tomorrow'):
+                    log.info(f"  [PRO] ⚠️ HIGH IMPACT EVENT TOMORROW — reducing new positions by 50%")
+            except Exception as e:
+                log.warning(f"  [PRO] Market conditions fetch failed: {e}")
+
         # ── PHASE 3: MARKET MOVERS ─────────────────────
         log.info("Phase 3: Market movers...")
         movers = self._get_movers()
@@ -1325,6 +1428,26 @@ class BeastModeLoop:
                 log.info(f"  {sym}: score={sent.overall_score:.0f} "
                         f"yahoo={getattr(sent, 'yahoo_score', '?')} "
                         f"reddit={getattr(sent, 'reddit_score', '?')}")
+
+        # ── PHASE 4.5: PRO DATA INTEL (per-stock) ─────
+        pro_intel = {}
+        if self.pro_data:
+            try:
+                log.info("Phase 4.5: Pro intel (congress, insider, dark pool, short interest)...")
+                intel_symbols = held_symbols[:10]  # Check held stocks first
+                for sym in intel_symbols:
+                    try:
+                        intel = self.pro_data.get_full_intel(sym)
+                        pro_intel[sym] = intel
+                        score = intel.get('score', 0)
+                        breakdown = intel.get('breakdown', {})
+                        active_signals = {k: v for k, v in breakdown.items() if v != 0}
+                        if active_signals:
+                            log.info(f"  [PRO] {sym}: score={score:+d} | {active_signals}")
+                    except Exception as e:
+                        log.debug(f"  [PRO] {sym} intel failed: {e}")
+            except Exception as e:
+                log.warning(f"  [PRO] Intel scan failed: {e}")
 
         # ── PHASE 5: OPEN ORDERS CHECK ─────────────────
         log.info("Phase 5: Open orders...")

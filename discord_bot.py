@@ -93,6 +93,23 @@ brain = AIBrain()
 tv = TVClient()
 dc = DataCollector(api_key, secret)
 
+# ── V5 PRO MODULES ──
+risk_mgr = None
+try:
+    from risk_manager import RiskManager
+    risk_mgr = RiskManager()
+    log.info("✅ [V5] RiskManager loaded — Kelly sizing, loss limits, correlation, sector caps")
+except Exception as e:
+    log.warning(f"⚠️ [V5] RiskManager not available: {e}")
+
+pro_data = None
+try:
+    from pro_data_sources import ProDataSources
+    pro_data = ProDataSources()
+    log.info("✅ [V5] ProDataSources loaded — congress, insider, PCR, VIX, dark pool, Fear&Greed")
+except Exception as e:
+    log.warning(f"⚠️ [V5] ProDataSources not available: {e}")
+
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockSnapshotRequest
 data_client = StockHistoricalDataClient(api_key, secret)
@@ -1607,38 +1624,72 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
     steps.append(f"G2:PASS cooldown={cooldown_sec}s")
 
     # ══════════════════════════════════════════════
-    # GATE 3: ANTI-BUYBACK
+    # GATE 3: ANTI-BUYBACK (V5: with timeout + price reset)
     # Won't rebuy higher than we sold — prevents round-trip losses
-    # EXCEPTION: Blue chips (from DB) with strong sentiment or breakout bypass
-    # GOOGL lesson: sold at $374.86, kept running to $386+
+    # V5 RESETS:
+    #   - 30 min timeout: anti-buyback expires after 30 min
+    #   - Price threshold: if price > sold+3%, it's a new trend
+    #   - AI override: AI confidence >= 80% with fresh verdict
+    #   - Blue chip: sentiment >= +3 OR breakout > +5%
     # ══════════════════════════════════════════════
+    ANTI_BUYBACK_TIMEOUT_MIN = 30
+    ANTI_BUYBACK_PRICE_RESET_PCT = 3.0  # +3% above sold = new trend
+    ANTI_BUYBACK_AI_OVERRIDE = 80       # AI conf >= 80% can override
+    
     if pg and pg.check_anti_buyback(symbol, price):
         mem = pg.get_price_memory(symbol)
         sold_at = mem.get('last_sell_price', 0)
+        sold_time_str = mem.get('last_sell_time', '')
         diff = price - sold_at
         pct_above = (diff / sold_at * 100) if sold_at > 0 else 0
         
-        # Blue chip check from DB (not hardcoded)
-        has_strong_sent = sentiment_score >= 3
+        # Calculate elapsed time since sell
+        elapsed_min = 999
+        try:
+            from datetime import datetime as dt2
+            if sold_time_str:
+                sold_dt = dt2.fromisoformat(str(sold_time_str).replace('Z', '+00:00').split('+')[0])
+                elapsed_min = (dt2.utcnow() - sold_dt).total_seconds() / 60
+        except:
+            elapsed_min = 999
         
-        if is_blue_chip and has_strong_sent:
-            log.info(f"    [G3] BYPASSED: {symbol} is BLUE CHIP (DB) "
-                     f"with sentiment {sentiment_score:+d} (sold @${sold_at:.2f}, rebuy @${price:.2f} +{pct_above:.1f}%)")
-            steps.append(f"G3:BYPASS blue_chip sent={sentiment_score}")
+        # V5 Smart reset conditions
+        reset_reason = None
+        if elapsed_min >= ANTI_BUYBACK_TIMEOUT_MIN:
+            reset_reason = f"timeout ({elapsed_min:.0f}min >= {ANTI_BUYBACK_TIMEOUT_MIN}min)"
+        elif pct_above >= ANTI_BUYBACK_PRICE_RESET_PCT:
+            reset_reason = f"new trend (+{pct_above:.1f}% >= +{ANTI_BUYBACK_PRICE_RESET_PCT}%)"
+        elif _confidence >= ANTI_BUYBACK_AI_OVERRIDE:
+            reset_reason = f"AI override (conf={_confidence}% >= {ANTI_BUYBACK_AI_OVERRIDE}%)"
+        elif is_blue_chip and has_strong_sent:
+            reset_reason = f"blue chip + sentiment {sentiment_score:+d}"
         elif is_blue_chip and pct_above > 5:
-            log.info(f"    [G3] BYPASSED: {symbol} BLUE CHIP (DB) "
-                     f"breakout +{pct_above:.1f}% above sell price")
-            steps.append(f"G3:BYPASS blue_chip_breakout +{pct_above:.1f}%")
+            reset_reason = f"blue chip breakout +{pct_above:.1f}%"
+        
+        if reset_reason:
+            log.info(f"    [G3] RESET: Anti-buyback overridden for {symbol} — {reset_reason}. "
+                     f"Sold @${sold_at:.2f} ({elapsed_min:.0f}min ago), rebuy @${price:.2f} (+{pct_above:.1f}%)")
+            steps.append(f"G3:RESET {reset_reason}")
+            # Clear the anti-buyback in DB so we don't re-block
+            try:
+                pg._exec("UPDATE price_memory SET last_sell_price = NULL WHERE symbol = %s", (symbol,))
+            except:
+                pass
         else:
-            log.info(f"    [G3] BLOCKED: Anti-buyback — sold @${sold_at:.2f}, "
-                     f"now @${price:.2f} (+{pct_above:.1f}%) "
-                     f"blue_chip={is_blue_chip} sent={sentiment_score}")
+            log.info(f"    [G3] BLOCKED: Anti-buyback — sold @${sold_at:.2f} ({elapsed_min:.0f}min ago), "
+                     f"now @${price:.2f} (+{pct_above:.1f}%). "
+                     f"Resets: timeout={max(0, ANTI_BUYBACK_TIMEOUT_MIN - elapsed_min):.0f}min, "
+                     f"price=need +{ANTI_BUYBACK_PRICE_RESET_PCT}%, ai_conf={_confidence}% (need {ANTI_BUYBACK_AI_OVERRIDE}%)")
             steps.append(f"G3:BLOCKED sold@{sold_at:.2f} rebuy@{price:.2f}")
             pg.log_decision(symbol, 'BLOCK', 0,
                 block_reason=f"Anti-buyback: sold @${sold_at:.2f}, now ${price:.2f} (+{pct_above:.1f}%)",
                 sentiment_data=_sent_data, ai_verdict=_ai_data,
                 signals={'pipeline': steps, 'sold_at': sold_at, 'rebuy_at': price,
-                         'pct_above': pct_above, 'is_blue_chip': is_blue_chip},
+                         'pct_above': pct_above, 'is_blue_chip': is_blue_chip,
+                         'elapsed_min': elapsed_min, 'reset_conditions': {
+                             'timeout_left': max(0, ANTI_BUYBACK_TIMEOUT_MIN - elapsed_min),
+                             'price_needed': ANTI_BUYBACK_PRICE_RESET_PCT,
+                             'ai_conf_needed': ANTI_BUYBACK_AI_OVERRIDE}},
                 strategy=source, price_at_decision=price)
             log.info(f"  {'='*50}\n")
             return None
@@ -1773,6 +1824,93 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
         log.info(f"    [G6] VIX={_cached_vix:.1f} NORMAL — no adjustment")
         steps.append(f"G6:PASS vix={_cached_vix:.0f}")
 
+    # ══════════════════════════════════════════════
+    # GATE 6.5: RISK MANAGER (V5)
+    # Kelly sizing, daily loss limits, correlation, sector caps, earnings
+    # ══════════════════════════════════════════════
+    if risk_mgr:
+        try:
+            positions = gateway.get_positions()
+            acct = gateway.get_account()
+            equity = float(acct.get('equity', 100000))
+            
+            risk_result = risk_mgr.approve_trade(
+                symbol=symbol, side='buy', qty=qty,
+                price=price, conviction=_confidence / 100.0,
+                positions=positions, equity=equity
+            )
+            
+            if not risk_result.get('approved', True):
+                rejections = risk_result.get('rejections', [])
+                log.info(f"    [G6.5] BLOCKED by RiskManager: {', '.join(rejections)}")
+                steps.append(f"G6.5:BLOCKED {rejections[0] if rejections else 'unknown'}")
+                if pg:
+                    pg.log_decision(symbol, 'BLOCK', 0,
+                        block_reason=f"RiskManager: {', '.join(rejections)}",
+                        sentiment_data=_sent_data, ai_verdict=_ai_data,
+                        signals={'pipeline': steps, 'risk_checks': risk_result.get('checks', {})},
+                        strategy=source, price_at_decision=price)
+                log.info(f"  {'='*50}\n")
+                return None
+            
+            adjusted = risk_result.get('adjusted_qty', qty)
+            if adjusted != qty:
+                old_qty = qty
+                qty = adjusted
+                adj_reasons = risk_result.get('adjustments', [])
+                log.info(f"    [G6.5] ADJUSTED: qty {old_qty}->{qty} | {adj_reasons}")
+                steps.append(f"G6.5:ADJUSTED {old_qty}->{qty}")
+            else:
+                log.info(f"    [G6.5] PASSED: RiskManager approved {qty}x")
+                steps.append("G6.5:PASS")
+        except Exception as e:
+            log.info(f"    [G6.5] ERROR: {e} — proceeding without risk check")
+            steps.append(f"G6.5:ERROR")
+
+    # ══════════════════════════════════════════════
+    # GATE 6.7: PRO DATA INTEL (V5)
+    # Congressional trades, insider buys, dark pool, short interest
+    # ══════════════════════════════════════════════
+    if pro_data:
+        try:
+            intel = pro_data.get_full_intel(symbol)
+            pro_score = intel.get('score', 0)
+            breakdown = intel.get('breakdown', {})
+            active = {k: v for k, v in breakdown.items() if v != 0}
+            
+            if active:
+                log.info(f"    [G6.7] Pro intel: score={pro_score:+d} | {active}")
+            
+            # Strong negative pro signal = reduce
+            if pro_score <= -15:
+                old_qty = qty
+                qty = max(1, qty // 2)
+                log.info(f"    [G6.7] REDUCE: Strong negative pro signal ({pro_score}) — qty {old_qty}->{qty}")
+                steps.append(f"G6.7:REDUCE pro_score={pro_score}")
+            # Strong positive = boost
+            elif pro_score >= 15:
+                old_qty = qty
+                qty = int(qty * 1.3)
+                log.info(f"    [G6.7] BOOST: Strong positive pro signal ({pro_score}) — qty {old_qty}->{qty}")
+                steps.append(f"G6.7:BOOST pro_score={pro_score}")
+            else:
+                steps.append(f"G6.7:PASS pro_score={pro_score}")
+            
+            # High-impact event tomorrow = halve
+            try:
+                conditions = pro_data.get_market_conditions()
+                if conditions.get('economic', {}).get('high_impact_tomorrow'):
+                    old_qty = qty
+                    qty = max(1, qty // 2)
+                    log.info(f"    [G6.7] REDUCE: High-impact economic event tomorrow — qty {old_qty}->{qty}")
+                    steps.append("G6.7:ECON_EVENT_REDUCE")
+            except:
+                pass
+                
+        except Exception as e:
+            log.info(f"    [G6.7] ERROR: {e} — proceeding without pro data")
+            steps.append("G6.7:ERROR")
+
     # ── Persist TV reading ──
     if pg and tv:
         try:
@@ -1795,7 +1933,8 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
     result = gateway.quick_buy(symbol, qty, price, reason=reason,
                             day_change_pct=day_change_pct,
                             sentiment_score=sentiment_score,
-                            vix=_cached_vix, tv_confirmed=True)
+                            vix=_cached_vix, tv_confirmed=True,
+                            ai_confidence=_confidence)
 
     # ── Log outcome with FULL context ──
     if pg:
