@@ -50,14 +50,15 @@ export default function RiskPage() {
   if (loading) return <div className="flex items-center justify-center min-h-[50vh]"><div className="text-4xl animate-bounce">🛡️</div></div>
   if (error && !risk) return <div className="bg-gray-800 rounded-lg p-6 text-center text-red-400">{error}</div>
 
-  const dailyPl = risk?.daily_pl_pct ?? 0
-  const weeklyPl = risk?.weekly_pl_pct ?? 0
-  const monthlyPl = risk?.monthly_pl_pct ?? 0
-  const invested = risk?.invested_pct ?? risk?.heat ?? 0
+  const ll = risk?.loss_limits || {}
+  const dailyPl = Number(ll.daily_pnl_pct ?? risk?.daily_pnl_pct ?? risk?.daily_pl_pct ?? 0) * 100
+  const weeklyPl = Number(ll.weekly_pnl_pct ?? risk?.weekly_pl_pct ?? 0) * 100
+  const monthlyPl = Number(ll.monthly_pnl_pct ?? risk?.monthly_pl_pct ?? 0) * 100
+  const invested = Number(risk?.portfolio_heat ?? risk?.invested_pct ?? risk?.heat ?? 0) * 100
   const cashPct = 100 - invested
   const sectors = risk?.sector_exposure || {}
-  const blocked = antiBuyback?.blocked || antiBuyback?.stocks || []
-  const killSwitch = risk?.kill_switch_active ?? false
+  const blocked = antiBuyback?.blocks || antiBuyback?.blocked || antiBuyback?.stocks || []
+  const killSwitch = risk?.kill_switch_active ?? !(ll.can_buy ?? true)
 
   return (
     <div className="space-y-6 fade-in">

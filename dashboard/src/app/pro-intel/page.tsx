@@ -78,11 +78,14 @@ export default function ProIntelPage() {
   if (error && !market) return <div className="bg-gray-800 rounded-lg p-6 text-center text-red-400">{error}</div>
 
   const positions = portfolio?.positions || []
-  const fg = market?.fear_greed ?? market?.fear_and_greed ?? 50
-  const vix = market?.vix ?? 0
-  const pcr = market?.put_call_ratio ?? market?.pcr ?? 0
+  const fgData = market?.fear_greed || {}
+  const fg = typeof fgData === 'object' ? (fgData.value ?? 50) : (fgData ?? 50)
+  const vixData = market?.vix_structure || market?.vix || {}
+  const vix = typeof vixData === 'object' ? (vixData.vix ?? 0) : (vixData ?? 0)
+  const pcrData = market?.pcr || market?.put_call_ratio || {}
+  const pcr = typeof pcrData === 'object' ? (pcrData.value ?? 0) : (pcrData ?? 0)
   const highImpact = market?.high_impact_tomorrow ?? false
-  const vs = vixStatus(vix)
+  const vs = vixStatus(Number(vix) || 0)
 
   return (
     <div className="space-y-6 fade-in">
@@ -104,7 +107,7 @@ export default function ProIntelPage() {
         </div>
         <div className="bg-gray-800 rounded-lg p-4 shadow-lg text-center">
           <div className="text-xs text-gray-400 mb-1">VIX</div>
-          <div className="text-4xl font-bold text-white">{vix.toFixed(1)}</div>
+          <div className="text-4xl font-bold text-white">{Number(vix).toFixed(1)}</div>
           <span className={`text-sm px-2 py-0.5 rounded-full ${vs.color}`}>{vs.label}</span>
         </div>
         <div className="bg-gray-800 rounded-lg p-4 shadow-lg text-center">
@@ -135,29 +138,18 @@ export default function ProIntelPage() {
                 </div>
                 {intel ? (
                   <div className="space-y-2 text-sm">
-                    <div className="flex justify-between">
-                      <span className="text-gray-400">🏛️ Congress</span>
-                      <span className={scoreColor(intel.congress_score ?? 0)}>{intel.congress_score ?? 0}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-gray-400">👤 Insider</span>
-                      <span className={scoreColor(intel.insider_score ?? 0)}>{intel.insider_score ?? 0}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-gray-400">📉 Short Interest</span>
-                      <span className={scoreColor(intel.short_interest_score ?? 0)}>{intel.short_interest_score ?? 0}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-gray-400">🕳️ Dark Pool</span>
-                      <span className={scoreColor(intel.dark_pool_score ?? 0)}>{intel.dark_pool_score ?? 0}</span>
-                    </div>
-                    {intel.signals && intel.signals.length > 0 && (
-                      <div className="mt-2 pt-2 border-t border-gray-700">
-                        {intel.signals.slice(0, 2).map((s: string, i: number) => (
-                          <div key={i} className="text-xs text-gray-500">• {s}</div>
-                        ))}
-                      </div>
-                    )}
+                    {Object.entries(intel.breakdown || intel).filter(([k]) => 
+                      !['score','signals','pro_score','source','reasoning','symbol'].includes(k)
+                    ).map(([k, v]: [string, any]) => {
+                      const s = typeof v === 'object' ? (v?.score ?? 0) : (v ?? 0)
+                      const label = k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+                      return (
+                        <div key={k} className="flex justify-between">
+                          <span className="text-gray-400">{label}</span>
+                          <span className={scoreColor(s)}>{s > 0 ? '+' : ''}{s}</span>
+                        </div>
+                      )
+                    })}
                   </div>
                 ) : (
                   <div className="text-sm text-gray-500">Loading intel...</div>

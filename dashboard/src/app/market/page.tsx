@@ -51,16 +51,22 @@ export default function MarketPage() {
   if (loading) return <div className="flex items-center justify-center min-h-[50vh]"><div className="text-4xl animate-bounce">🌍</div></div>
   if (error && !market) return <div className="bg-gray-800 rounded-lg p-6 text-center text-red-400">{error}</div>
 
-  const vix = market?.vix ?? 0
-  const vix3m = market?.vix3m ?? market?.vix_3m ?? 0
-  const contango = vix3m > 0 ? vix3m > vix : false
-  const fg = market?.fear_greed ?? market?.fear_and_greed ?? 50
-  const fgHistory = market?.fear_greed_history ?? []
-  const pcr = market?.put_call_ratio ?? market?.pcr ?? 0
+  const vixData = market?.vix_structure || market?.vix || {}
+  const vix = Number(typeof vixData === 'object' ? (vixData.vix ?? 0) : (vixData ?? 0)) || 0
+  const vix3m = Number(typeof vixData === 'object' ? (vixData.vix3m ?? 0) : (market?.vix3m ?? 0)) || 0
+  const contango = vix3m > 0 ? vix3m > vix : (typeof vixData === 'object' ? !vixData.is_inverted : false)
+  const fgData = market?.fear_greed || {}
+  const fg = Number(typeof fgData === 'object' ? (fgData.value ?? 50) : (fgData ?? 50)) || 50
+  const fgHistory = (typeof fgData === 'object' ? fgData.history : market?.fear_greed_history) ?? []
+  const pcrData = market?.pcr || market?.put_call_ratio || {}
+  const pcr = Number(typeof pcrData === 'object' ? (pcrData.value ?? 0) : (pcrData ?? 0)) || 0
   const events = calendar?.events ?? calendar?.upcoming ?? []
-  const squeezeList = (squeeze?.stocks ?? squeeze?.candidates ?? [])
-    .filter((s: any) => (s.short_ratio ?? s.short_pct ?? 0) >= 30)
-    .sort((a: any, b: any) => (b.short_ratio ?? b.short_pct ?? 0) - (a.short_ratio ?? a.short_pct ?? 0))
+  const squeezeList = (squeeze?.squeeze_candidates ?? squeeze?.stocks ?? squeeze?.candidates ?? [])
+    .filter((s: any) => {
+      const ratio = Number(s.short_ratio ?? s.short_pct ?? 0)
+      return ratio >= 0.30 || ratio >= 30  // Handle both 0.44 and 44% formats
+    })
+    .sort((a: any, b: any) => Number(b.short_ratio ?? b.short_pct ?? 0) - Number(a.short_ratio ?? a.short_pct ?? 0))
 
   return (
     <div className="space-y-6 fade-in">
@@ -73,7 +79,7 @@ export default function MarketPage() {
           <h3 className="text-sm text-gray-400 mb-3">VIX Term Structure</h3>
           <div className="flex items-end gap-6 justify-center">
             <div className="text-center">
-              <div className="text-3xl font-bold text-white">{vix.toFixed(1)}</div>
+              <div className="text-3xl font-bold text-white">{Number(vix).toFixed(1)}</div>
               <div className="text-xs text-gray-400 mt-1">VIX (spot)</div>
             </div>
             <div className="text-center">
@@ -195,7 +201,7 @@ export default function MarketPage() {
                       <td className="py-2 px-3 font-mono font-semibold text-white">{s.symbol ?? '—'}</td>
                       <td className="py-2 px-3 text-right">
                         <span className={`font-semibold ${ratio >= 50 ? 'text-red-400' : ratio >= 40 ? 'text-orange-400' : 'text-yellow-400'}`}>
-                          {ratio.toFixed(1)}%
+                          {Number(ratio).toFixed(1)}%
                         </span>
                       </td>
                       <td className="py-2 px-3 text-right text-gray-300">{s.days_to_cover?.toFixed(1) ?? '—'}</td>
@@ -215,3 +221,4 @@ export default function MarketPage() {
     </div>
   )
 }
+
