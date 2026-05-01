@@ -38,15 +38,23 @@ echo [%time%] STEP 2: Git pull >> %LOG%
 echo   Done.
 
 REM ── STEP 3: Install deps ──
-echo [3/6] Installing dependencies...
+echo [3/7] Installing dependencies...
 echo [%time%] STEP 3: Installing deps >> %LOG%
 %PY% -m pip install -r requirements.txt --quiet >> %LOG% 2>&1
 %PY% -m pip install discord.py openai websocket-client aiohttp flask flask-cors beautifulsoup4 pandas --quiet >> %LOG% 2>&1
 echo   Done.
 
+REM ── STEP 4: Rebuild Dashboard ──
+echo [4/7] Rebuilding Dashboard (Next.js)...
+echo [%time%] STEP 4: Dashboard build >> %LOG%
+cd /d C:\beast-test2\dashboard
+call npx next build >> %LOG% 2>&1
+cd /d C:\beast-test2
+echo   Dashboard built.
+
 REM ── STEP 4: Verify TV CDP is running ──
-echo [4/6] Checking TradingView CDP...
-echo [%time%] STEP 4: TV CDP check >> %LOG%
+echo [5/7] Checking TradingView CDP...
+echo [%time%] STEP 5: TV CDP check >> %LOG%
 powershell -Command "try { $r = Invoke-WebRequest http://localhost:9222/json/version -UseBasicParsing -TimeoutSec 5; Write-Output ('CDP OK: ' + $r.Content.Substring(0, [Math]::Min(80, $r.Content.Length))); exit 0 } catch { Write-Output 'CDP NOT RESPONDING'; exit 1 }" >> %LOG% 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo   WARNING: TV CDP not responding on port 9222!
@@ -59,8 +67,8 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 REM ── STEP 5: Start Dashboard API + UI ──
-echo [5/6] Starting Dashboard...
-echo [%time%] STEP 5: Dashboard >> %LOG%
+echo [6/7] Starting Dashboard...
+echo [%time%] STEP 6: Dashboard >> %LOG%
 
 REM Kill old API/Dashboard if running
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr "8080" ^| findstr "LISTENING"') do (
@@ -89,8 +97,8 @@ echo   Dashboard UI starting on port 3000...
 timeout /t 5 /nobreak >nul
 
 REM ── STEP 6: Start Bot ──
-echo [6/6] Starting Beast Bot...
-echo [%time%] STEP 6: Starting bot >> %LOG%
+echo [7/7] Starting Beast Bot...
+echo [%time%] STEP 7: Starting bot >> %LOG%
 echo ============================================
 echo   BEAST TERMINAL V5 - ALL SYSTEMS GO
 echo   TV: CDP port 9222 (must be running already)
@@ -102,3 +110,4 @@ echo ============================================
 echo.
 echo [%time%] Starting discord_bot.py >> %LOG%
 %PY% discord_bot.py
+
