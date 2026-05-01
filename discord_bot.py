@@ -224,7 +224,7 @@ def _flush_startup_log():
     except Exception as e:
         print(f'[STARTUP] Failed to flush to DB: {e}')
 
-_slog(f'=== STARTUP COMPLETE: V5 Risk={risk_mgr is not None} ProData={pro_data is not None} ===')
+_slog(f'=== STARTUP COMPLETE: V6 Risk={risk_mgr is not None} ProData={pro_data is not None} SmartExits={smart_exits is not None} Intel={intel_engine is not None} ===')
 
 # NOTE: on_ready is defined ONCE at bottom of file (line ~4810) where it merges
 # V5 init (risk_mgr.set_db, pro_data.db, _flush_startup_log) with existing
@@ -2467,7 +2467,7 @@ async def position_monitor():
                     # V6: Smart trailing stops — don't trail at -0.0%, use ATR-based width
                     if pct < 0 and p.symbol not in protected and avail > 0:
                         tv_now = _tv_cache.get(p.symbol, (0, {}))[1] if _tv_cache.get(p.symbol) else {}
-                        is_blue = p.symbol in BLUE_CHIPS if 'BLUE_CHIPS' in dir() else False
+                        is_blue = p.symbol in ('AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'CRM', 'NOW', 'AVGO', 'LMT', 'ORCL', 'JPM', 'GS', 'JNJ', 'UNH', 'V', 'MA')
                         
                         if smart_exits:
                             trail_decision = smart_exits.get_trail_params(
@@ -4212,7 +4212,7 @@ async def ai_background_learning():
                                 'symbol': sym, 'sector': sector,
                                 'market_cap_b': round(market_cap / 1e9, 1),
                                 'pe_ratio': round(pe, 1) if pe else '?',
-                                'avg_daily_range_pct': round(avg_range_pct, 1) if 'avg_range_pct' in dir() else '?',
+                                'avg_daily_range_pct': round(avg_range_pct, 1) if isinstance(avg_range_pct, (int, float)) else '?',
                             }
                             result = brain.analyze_stock(sym, data)
                             if result and result.get('reasoning'):
@@ -4337,13 +4337,16 @@ async def outcome_grader():
                     symbol_or_symbols=sym, feed='iex'))
                 if snap and sym in snap:
                     return float(snap[sym].latest_trade.price)
-            except Exception:                    pass
+            except Exception:
+                pass
             return 0
         tl_graded = grade_trade_log(pg, _get_price)
         if tl_graded:
             log.info(f"  📝 V6 trade_log grader: {tl_graded} trades scored with pnl_1h/4h/lesson")
+            _pg_log("V6_GRADED", reason=f"trade_log: {tl_graded} trades graded with pnl_1h/4h/lesson", source="outcome_grader")
     except Exception as e:
-        log.debug(f"  V6 trade_log grader: {e}")
+        log.warning(f"  V6 trade_log grader error: {e}")
+        _pg_log("V6_GRADE_ERROR", reason=f"trade_log grader: {str(e)[:200]}", source="outcome_grader")
 
     # V6: Grade post-sell outcomes (was_premature detection)
     try:
@@ -4354,19 +4357,25 @@ async def outcome_grader():
                         symbol_or_symbols=sym, feed='iex'))
                     if snap and sym in snap:
                         return float(snap[sym].latest_trade.price)
-                except Exception:                        pass
+                except Exception:
+                    pass
                 return 0
             findings = sell_tracker.grade_pending(_get_price2)
             if findings:
                 log.info(f"  📝 V6 post-sell: {len(findings)} 'sold too early' events detected")
                 for f in findings[:3]:
                     log.info(f"     🔴 {f['symbol']}: sold @${f['sell_price']:.2f} → ran to ${f['max_after']:.2f} (+{f['pct_missed']:.1f}%)")
+                _pg_log("V6_PREMATURE_SELL", reason=f"{len(findings)} premature sells detected",
+                        source="outcome_grader", data={'findings': findings[:5]})
                 if pg:
                     pg.notify("Sold Too Early", 
                               f"{len(findings)} premature sells detected",
                               severity='warning', category='learning')
+            else:
+                log.info("  📝 V6 post-sell: no premature sells to grade")
     except Exception as e:
-        log.debug(f"  V6 post-sell grader: {e}")
+        log.warning(f"  V6 post-sell grader error: {e}")
+        _pg_log("V6_POSTSELL_ERROR", reason=f"post-sell grader: {str(e)[:200]}", source="outcome_grader")
 
 @outcome_grader.before_loop
 async def before_grader():
@@ -4978,15 +4987,20 @@ async def intelligence_scan():
     """Hourly: Deep analysis on batch of stocks. Builds the eagle eye."""
     try:
         if not intel_engine:
+            log.warning("[V6] intelligence_scan: intel_engine is None — skipping")
             return
         pg = _get_pg()
         if not pg:
+            log.warning("[V6] intelligence_scan: no PostgreSQL — skipping")
             return
 
         intel_engine.set_db(pg)
-        symbols = list(DIP_BUY_WATCHLIST) if 'DIP_BUY_WATCHLIST' in dir() else []
+        symbols = list(DIP_BUY_WATCHLIST) if DIP_BUY_WATCHLIST else []
         if not symbols:
+            log.warning("[V6] intelligence_scan: DIP_BUY_WATCHLIST empty — skipping")
             return
+
+        log.info(f"  🧠 [V6] Intelligence scan starting: {len(symbols)} stocks, batch=20...")
 
         def _run_intel():
             return intel_engine.run_batch(symbols, batch_size=20)
@@ -5007,6 +5021,7 @@ async def intelligence_scan():
 
     except Exception as e:
         log.warning(f"Intelligence scan error: {e}")
+        _pg_log("INTELLIGENCE_ERROR", reason=f"Intelligence scan failed: {str(e)[:200]}", source="intel_engine")
 
 @intelligence_scan.before_loop
 async def before_intel():
@@ -5174,34 +5189,39 @@ async def on_ready():
     log.info(f"   PostgreSQL: {'✅' if pg_ok else '❌'}")
     log.info(f"   Watchlist: {len(DIP_BUY_WATCHLIST)} stocks")
 
-    # ── V5: Connect RiskManager + ProData to PostgreSQL ──
+    # ── V5/V6: Connect all modules to PostgreSQL ──
     if pg:
         try:
+            v6_status = []
             if risk_mgr:
                 risk_mgr.set_db(pg)
-                log.info('   ✅ [V5] RiskManager connected to PostgreSQL')
+                v6_status.append('RiskMgr=✅')
             if pro_data:
                 pro_data.db = pg
-                log.info('   ✅ [V5] ProDataSources connected to PostgreSQL')
+                v6_status.append('ProData=✅')
             # V6: Connect SmartExits modules
             if sell_tracker:
                 sell_tracker.set_db(pg)
-                log.info('   ✅ [V6] PostSellTracker connected to PostgreSQL')
+                v6_status.append('SellTracker=✅')
             if smart_exits:
                 smart_exits.set_db(pg)
-                log.info('   ✅ [V6] SmartExitEngine connected')
+                v6_status.append('SmartExits=✅')
             if catalyst_tracker:
                 catalyst_tracker.set_db(pg)
-                log.info('   ✅ [V6] CatalystTracker connected to PostgreSQL')
+                v6_status.append('Catalysts=✅')
             if intel_engine:
                 intel_engine.set_db(pg)
-                log.info('   ✅ [V6] IntelligenceEngine connected to PostgreSQL')
+                v6_status.append('IntelEngine=✅')
             _flush_startup_log()
-            log.info('   ✅ [V5] Startup log flushed to PostgreSQL')
+            # Log V6 wiring to PostgreSQL (not just console!)
+            wiring_msg = f"V6 DB wired: {' | '.join(v6_status)}"
+            log.info(f'   ✅ {wiring_msg}')
+            _pg_log("V6_READY", reason=wiring_msg, source="on_ready")
         except Exception as e:
-            log.warning(f'   ⚠️ [V5] DB wiring failed: {e}')
+            log.warning(f'   ⚠️ DB wiring failed: {e}')
+            _pg_log("V6_ERROR", reason=f"DB wiring failed: {str(e)[:200]}", source="on_ready")
     else:
-        log.warning('   ⚠️ [V5] No PostgreSQL — V5 modules running without DB')
+        log.warning('   ⚠️ No PostgreSQL — modules running without DB')
 
     log.info(f"   V5: Risk={'✅' if risk_mgr else '❌'} ProData={'✅' if pro_data else '❌'}")
     log.info(f"   V6: SellTracker={'✅' if sell_tracker else '❌'} SmartExits={'✅' if smart_exits else '❌'} Catalysts={'✅' if catalyst_tracker else '❌'}")
@@ -5255,6 +5275,13 @@ async def on_ready():
     if not intelligence_scan.is_running():
         intelligence_scan.start()
         log.info("   ✅ V6 Intelligence scan: every 1 hour (stock DNA, earnings, strategies)")
+
+    # Log all task starts to PostgreSQL
+    tasks_started = ['position_monitor(60s)', 'full_scan(5min)', 'decision_report(10min)',
+                     'runner_scan(2min)', 'claude_deep(30min)', 'learning(1hr)',
+                     'outcome_grader(30min)', 'ah_pm(15min)', 'fill_tracker(5min)',
+                     'claude_3am(daily)', 'intelligence(1hr)']
+    _pg_log("TASKS_STARTED", reason=f"11 tasks: {', '.join(tasks_started)}", source="on_ready")
 
     channel = bot.get_channel(SCAN_CHANNEL_ID)
     if channel:
