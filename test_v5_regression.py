@@ -387,10 +387,19 @@ for line_no, has_conf, preview in smart_buy_calls:
     if not has_conf:
         log.error(f'    MISSING confidence at line {line_no}: {preview}')
 
-# RiskManager DB wiring
-test('on_ready wires risk_mgr.set_db', lambda: 'risk_mgr.set_db' in bot_code)
-test('on_ready wires _flush_startup_log', lambda: '_flush_startup_log' in bot_code)
-test('on_ready wires pro_data.db', lambda: 'pro_data.db' in bot_code)
+# RiskManager DB wiring — must be in the LAST on_ready (not an overwritten one)
+on_ready_count = bot_code.count('async def on_ready()')
+test(f'Only ONE on_ready handler (found {on_ready_count})', lambda: on_ready_count == 1)
+
+# Find the on_ready block and verify it has V5 wiring
+on_ready_start = bot_code.rfind('async def on_ready()')  # Last one wins
+on_ready_block = bot_code[on_ready_start:on_ready_start+2000]
+test('on_ready has risk_mgr.set_db', lambda: 'risk_mgr.set_db' in on_ready_block)
+test('on_ready has pro_data.db', lambda: 'pro_data.db' in on_ready_block)
+test('on_ready has _flush_startup_log', lambda: '_flush_startup_log' in on_ready_block)
+
+# Check for undefined variables
+test('No undefined has_strong_sent', lambda: 'has_strong_sent' not in bot_code)
 
 # DB method names in risk_manager
 with open('risk_manager.py', 'r', encoding='utf-8') as f:

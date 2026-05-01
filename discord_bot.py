@@ -204,29 +204,9 @@ def _flush_startup_log():
 
 _slog(f'=== STARTUP COMPLETE: V5 Risk={risk_mgr is not None} ProData={pro_data is not None} ===')
 
-
-@bot.event
-async def on_ready():
-    log.info(f'🦍 Beast Discord Bot online as {bot.user}')
-    log.info(f'   AI Brain: {"✅ Opus 4.7" if brain.is_available else "❌ offline"}')
-    log.info(f'   TradingView: {"✅" if tv.health_check() else "❌"}')
-
-    # ── V5: Connect RiskManager + ProData to PostgreSQL ──
-    try:
-        pg = _get_pg()
-        if pg:
-            if risk_mgr:
-                risk_mgr.set_db(pg)
-                log.info('   ✅ [V5] RiskManager connected to PostgreSQL')
-            if pro_data:
-                pro_data.db = pg
-                log.info('   ✅ [V5] ProDataSources connected to PostgreSQL')
-            _flush_startup_log()
-            log.info('   ✅ Startup log flushed to PostgreSQL')
-        else:
-            log.warning('   ⚠️ PostgreSQL not available — V5 modules running without DB')
-    except Exception as e:
-        log.warning(f'   ⚠️ V5 DB connection failed: {e}')
+# NOTE: on_ready is defined ONCE at bottom of file (line ~4810) where it merges
+# V5 init (risk_mgr.set_db, pro_data.db, _flush_startup_log) with existing
+# session tracking. Do NOT add a second on_ready here — it gets overwritten.
 
 
 # ── !help ──────────────────────────────────────────────
@@ -1857,7 +1837,7 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
             reset_reason = f"new trend (+{pct_above:.1f}% >= +{ANTI_BUYBACK_PRICE_RESET_PCT}%)"
         elif _confidence >= ANTI_BUYBACK_AI_OVERRIDE:
             reset_reason = f"AI override (conf={_confidence}% >= {ANTI_BUYBACK_AI_OVERRIDE}%)"
-        elif is_blue_chip and has_strong_sent:
+        elif is_blue_chip and sentiment_score >= 3:
             reset_reason = f"blue chip + sentiment {sentiment_score:+d}"
         elif is_blue_chip and pct_above > 5:
             reset_reason = f"blue chip breakout +{pct_above:.1f}%"
@@ -2095,7 +2075,7 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
             # High-impact event tomorrow = halve
             try:
                 conditions = pro_data.get_market_conditions()
-                if conditions.get('economic', {}).get('high_impact_tomorrow'):
+                if conditions.get('high_impact_tomorrow'):
                     old_qty = qty
                     qty = max(1, qty // 2)
                     log.info(f"    [G6.7] REDUCE: High-impact economic event tomorrow — qty {old_qty}->{qty}")
@@ -4821,6 +4801,24 @@ async def on_ready():
     pg_ok = pg and pg.conn
     log.info(f"   PostgreSQL: {'✅' if pg_ok else '❌'}")
     log.info(f"   Watchlist: {len(DIP_BUY_WATCHLIST)} stocks")
+
+    # ── V5: Connect RiskManager + ProData to PostgreSQL ──
+    if pg:
+        try:
+            if risk_mgr:
+                risk_mgr.set_db(pg)
+                log.info('   ✅ [V5] RiskManager connected to PostgreSQL')
+            if pro_data:
+                pro_data.db = pg
+                log.info('   ✅ [V5] ProDataSources connected to PostgreSQL')
+            _flush_startup_log()
+            log.info('   ✅ [V5] Startup log flushed to PostgreSQL')
+        except Exception as e:
+            log.warning(f'   ⚠️ [V5] DB wiring failed: {e}')
+    else:
+        log.warning('   ⚠️ [V5] No PostgreSQL — V5 modules running without DB')
+
+    log.info(f"   V5: Risk={'✅' if risk_mgr else '❌'} ProData={'✅' if pro_data else '❌'}")
 
     # Register this bot session in DB (tracks version, uptime, crashes)
     if pg:
