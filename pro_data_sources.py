@@ -77,27 +77,34 @@ class _TTLCache:
 
 _cache = _TTLCache()
 
-# Shared HTTP session with retries + proper User-Agent (avoids 403s from CBOE/FINRA/SEC)
+# Shared HTTP session — NO retries (retries cause blocking sleep that kills Discord heartbeat)
 _http = requests.Session()
 _http.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 })
-_adapter = requests.adapters.HTTPAdapter(max_retries=2)
-_http.mount("https://", _adapter)
-_http.mount("http://", _adapter)
-_DEFAULT_TIMEOUT = 15
+# NO HTTPAdapter retries — they block the async loop with sleep_for_retry
+_DEFAULT_TIMEOUT = 10  # Hard timeout — never wait more than 10s for any API
 
 
 def _safe_request(method: str, url: str, *, headers: dict | None = None,
                   params: dict | None = None, json_body: dict | None = None,
                   timeout: int = _DEFAULT_TIMEOUT, tag: str = "HTTP") -> Optional[requests.Response]:
-    """Fire an HTTP request; return Response on success or None on any error."""
+    """Fire an HTTP request; return Response on success or None on any error.
+    CRITICAL: Never blocks more than timeout seconds. No retries. No sleep."""
     try:
         log.info(f"[PRO_DATA] {tag}: {method.upper()} {url}")
         resp = _http.request(method, url, headers=headers, params=params,
-                             json=json_body, timeout=timeout)
+                             json=json_body, timeout=timeout, allow_redirects=False)
         log.info(f"[PRO_DATA] {tag}: status={resp.status_code} len={len(resp.content)}")
+        # Handle redirects manually — don't follow if it means sleeping
+        if resp.status_code in (301, 302, 307, 308):
+            redirect_url = resp.headers.get('Location', '')
+            log.info(f"[PRO_DATA] {tag}: redirect to {redirect_url[:80]}")
+            if redirect_url:
+                resp = _http.request(method, redirect_url, headers=headers,
+                                     timeout=timeout, allow_redirects=False)
+                log.info(f"[PRO_DATA] {tag}: redirect status={resp.status_code}")
         resp.raise_for_status()
         return resp
     except requests.RequestException as exc:

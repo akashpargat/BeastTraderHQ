@@ -206,6 +206,35 @@ if rm:
     log.info(f'    → approved={approval.get("approved")} qty={approval.get("adjusted_qty")} '
              f'rejections={approval.get("rejections")}')
 
+    # ── MOCK DB TEST: verify RiskManager works with BeastDB-compatible interface ──
+    log.info('\n  -- Mock DB compatibility test --')
+    class MockBeastDB:
+        """Mimics BeastDB._exec behavior: returns list of dicts for fetch=True."""
+        def _exec(self, sql, params=None, fetch=False):
+            if fetch and 'realized_pl' in sql:
+                return [{'pnl': 5.2}, {'pnl': -3.1}, {'pnl': 8.0}, {'pnl': -1.5}, {'pnl': 2.3},
+                        {'pnl': 6.1}, {'pnl': -2.0}, {'pnl': 4.5}, {'pnl': -0.8}, {'pnl': 3.2}]
+            if fetch:
+                return []
+            return None
+    
+    rm_with_db = RiskManager(db=MockBeastDB())
+    test('RiskManager with MockDB init', lambda: rm_with_db.db is not None)
+    
+    stats = rm_with_db._get_trade_stats('AAPL')
+    test('_get_trade_stats returns win_rate', lambda: 'win_rate' in stats)
+    test('_get_trade_stats win_rate > 0', lambda: stats['win_rate'] > 0)
+    test('_get_trade_stats sample_size = 10', lambda: stats.get('sample_size', 0) == 10)
+    log.info(f'    → trade stats: {stats}')
+    
+    rm_with_db._log_check('TEST', 'unit_test', True, 10, 10, 'mock test')
+    test('_log_check doesnt crash with mock', lambda: True)
+    
+    kelly_db = rm_with_db.kelly_position_size('AAPL', conviction=0.7, current_price=200.0, atr=5.0)
+    test('Kelly with DB → shares > 0', lambda: kelly_db['shares'] > 0)
+    test('Kelly with DB → no missing-conviction warning', lambda: 'missing-conviction' not in str(kelly_db['adjustments']))
+    log.info(f'    → Kelly with DB: {kelly_db["shares"]} shares, adj={kelly_db["adjustments"]}')
+
 
 # ══════════════════════════════════════════════════════════
 # SECTION 6: ORDER GATEWAY — ANTI-BUYBACK V2

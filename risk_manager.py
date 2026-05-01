@@ -197,12 +197,15 @@ class RiskManager:
             log.error("[RISK] Failed to log check: %s", e)
 
     def _get_trade_stats(self, symbol: str) -> dict:
-        """Pull win_rate, avg_win, avg_loss from trade history."""
+        """Pull win_rate, avg_win, avg_loss from trade history.
+        Uses BeastDB._exec(fetch=True) which returns list of DICTS, not tuples.
+        Table: orders (not trades). Column: realized_pl."""
         try:
             rows = self.db._exec(
-                """SELECT pnl FROM trades
-                   WHERE symbol = %s AND pnl IS NOT NULL
-                   ORDER BY closed_at DESC LIMIT 100""",
+                """SELECT realized_pl as pnl FROM orders
+                   WHERE symbol = %s AND status = 'filled' AND side = 'sell'
+                   AND realized_pl IS NOT NULL
+                   ORDER BY created_at DESC LIMIT 100""",
                 (symbol,), fetch=True
             )
             if not rows or len(rows) < 5:
@@ -212,7 +215,8 @@ class RiskManager:
                     "avg_loss": DEFAULT_AVG_LOSS,
                     "sample_size": len(rows) if rows else 0,
                 }
-            pnls = [float(r[0]) for r in rows]
+            # _exec returns list of dicts: [{'pnl': 5.2}, ...]
+            pnls = [float(r.get('pnl', 0) if isinstance(r, dict) else r[0]) for r in rows]
             wins = [p for p in pnls if p > 0]
             losses = [abs(p) for p in pnls if p <= 0]
             win_rate = len(wins) / len(pnls) if pnls else DEFAULT_WIN_RATE
