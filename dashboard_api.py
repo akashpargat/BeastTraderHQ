@@ -1906,6 +1906,160 @@ def v4_fundamentals(symbol):
         return jsonify({'error': str(e)})
 
 
+# ─── V5 ENDPOINTS ──────────────────────────────────────────────────────────
+
+@app.route('/api/v5/pro-intel/<symbol>')
+@require_auth
+def v5_pro_intel(symbol):
+    try:
+        from pro_data_sources import ProDataSources
+        pro = ProDataSources()
+        intel = pro.get_full_intel(symbol.upper())
+        return jsonify(intel)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v5/market-conditions')
+@require_auth
+def v5_market_conditions():
+    try:
+        from pro_data_sources import ProDataSources
+        pro = ProDataSources()
+        conditions = pro.get_market_conditions()
+        return jsonify(conditions)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v5/risk-status')
+@require_auth
+def v5_risk_status():
+    try:
+        from risk_manager import RiskManager
+        gw = _get_gateway()
+        acct = gw.client.get_account()
+        equity = float(acct.equity)
+        last_equity = float(acct.last_equity)
+        
+        rm = RiskManager()
+        limits = rm.check_loss_limits(equity, last_equity, last_equity, 100000)
+        
+        # Get positions for sector breakdown
+        positions = gw.get_positions()
+        sector_exposure = {}
+        for p in positions:
+            sector = rm._get_sector(p.symbol)
+            val = float(p.market_value) if hasattr(p, 'market_value') else 0
+            sector_exposure[sector] = sector_exposure.get(sector, 0) + val
+        
+        return jsonify({
+            'equity': equity,
+            'last_equity': last_equity,
+            'daily_pnl': equity - last_equity,
+            'daily_pnl_pct': (equity - last_equity) / last_equity if last_equity else 0,
+            'loss_limits': limits,
+            'sector_exposure': sector_exposure,
+            'portfolio_heat': sum(sector_exposure.values()) / equity if equity else 0,
+            'positions_count': len(positions),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v5/congress')
+@require_auth
+def v5_congress():
+    try:
+        from pro_data_sources import CongressTracker
+        ct = CongressTracker()
+        trades = ct.fetch()
+        return jsonify({'trades': trades, 'count': len(trades)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v5/insiders/<symbol>')
+@require_auth
+def v5_insiders(symbol):
+    try:
+        from pro_data_sources import InsiderTracker
+        it = InsiderTracker()
+        signal = it.get_insider_signal(symbol.upper())
+        return jsonify(signal)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v5/anti-buyback')
+@require_auth
+def v5_anti_buyback():
+    try:
+        gw = _get_gateway()
+        blocks = []
+        from datetime import datetime
+        for sym, sold_price in gw.last_sell_prices.items():
+            sold_time = gw.last_sell_times_precise.get(sym)
+            elapsed_min = (datetime.now() - sold_time).total_seconds() / 60 if sold_time else 999
+            resets_in = max(0, gw.ANTI_BUYBACK_TIMEOUT_MIN - elapsed_min)
+            blocks.append({
+                'symbol': sym,
+                'sold_price': sold_price,
+                'sold_time': str(sold_time)[:19] if sold_time else None,
+                'elapsed_min': round(elapsed_min, 1),
+                'resets_in_min': round(resets_in, 1),
+                'reset_price': round(sold_price * (1 + gw.ANTI_BUYBACK_PRICE_RESET_PCT), 2),
+                'active': resets_in > 0,
+            })
+        return jsonify({'blocks': blocks, 'count': len(blocks), 
+                       'timeout_min': gw.ANTI_BUYBACK_TIMEOUT_MIN,
+                       'price_reset_pct': gw.ANTI_BUYBACK_PRICE_RESET_PCT})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v5/economic-calendar')
+@require_auth
+def v5_economic_calendar():
+    try:
+        from pro_data_sources import EconomicCalendar
+        ec = EconomicCalendar()
+        events = ec.get_upcoming_events(14)
+        high_impact_tomorrow = ec.has_high_impact_tomorrow()
+        return jsonify({'events': events, 'high_impact_tomorrow': high_impact_tomorrow})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v5/short-squeeze')
+@require_auth
+def v5_short_squeeze():
+    try:
+        from pro_data_sources import ShortInterest
+        si = ShortInterest()
+        # Check all held positions + watchlist
+        gw = _get_gateway()
+        positions = gw.get_positions()
+        symbols = [p.symbol for p in positions]
+        # Add some popular squeeze candidates
+        symbols.extend(['GME', 'AMC', 'BBBY', 'BB', 'NOK', 'CLOV', 'WISH'])
+        symbols = list(set(symbols))
+        
+        results = []
+        for sym in symbols[:20]:  # Cap at 20 to avoid rate limits
+            try:
+                signal = si.get_short_signal(sym)
+                if signal.get('short_ratio', 0) and signal['short_ratio'] > 0.3:
+                    results.append(signal)
+            except:
+                pass
+        
+        results.sort(key=lambda x: x.get('short_ratio', 0), reverse=True)
+        return jsonify({'squeeze_candidates': results, 'count': len(results)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     print("Beast V4 Dashboard API starting on port 8080...")
     app.run(host='0.0.0.0', port=8080, debug=False)

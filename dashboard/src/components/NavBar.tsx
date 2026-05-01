@@ -22,6 +22,10 @@ const navLinks = [
   { href: '/system', label: '⚙️ System' },
   { href: '/notifications', label: '🔔 Alerts' },
   { href: '/feed', label: '📡 Feed' },
+  { href: '/pro-intel', label: '🧠 Pro Intel' },
+  { href: '/risk', label: '🛡️ Risk' },
+  { href: '/congress', label: '🏛️ Congress' },
+  { href: '/market', label: '🌍 Market' },
 ]
 
 export default function NavBar() {
