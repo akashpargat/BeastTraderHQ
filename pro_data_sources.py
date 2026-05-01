@@ -1049,10 +1049,8 @@ class ProDataSources:
     # ----- DB helpers -----
     def _init_db(self):
         try:
-            cur = self.db.cursor()
             for sql in self._INIT_SQL:
-                cur.execute(sql)
-            self.db.commit()
+                self.db._exec(sql)
             log.info("[PRO_DATA] ProDataSources: DB tables ensured")
         except Exception as exc:
             log.error(f"[PRO_DATA] ProDataSources: DB init error {exc}")
@@ -1062,11 +1060,10 @@ class ProDataSources:
         if not self.db:
             return
         try:
-            cur = self.db.cursor()
             for entry in intel.get("breakdown", {}).values():
                 if not isinstance(entry, dict):
                     continue
-                cur.execute(
+                self.db._exec(
                     """INSERT INTO pro_intel (symbol, source, signal_type, score,
                                              raw_data, reasoning)
                        VALUES (%s, %s, %s, %s, %s, %s)""",
@@ -1079,7 +1076,6 @@ class ProDataSources:
                         entry.get("reasoning", ""),
                     ),
                 )
-            self.db.commit()
             log.info(f"[PRO_DATA] ProDataSources: logged intel for {symbol} to DB")
         except Exception as exc:
             log.error(f"[PRO_DATA] ProDataSources: DB log error {exc}")
@@ -1088,11 +1084,10 @@ class ProDataSources:
         if not self.db:
             return
         try:
-            cur = self.db.cursor()
             pcr_data = mc.get("pcr", {})
             vix_data = mc.get("vix_structure", {})
             fg_data = mc.get("fear_greed", {})
-            cur.execute(
+            self.db._exec(
                 """INSERT INTO market_conditions
                    (pcr, pcr_signal, vix, vix3m, vix_contango,
                     fear_greed, fear_greed_label,
@@ -1110,7 +1105,6 @@ class ProDataSources:
                     json.dumps(mc.get("events", []), default=str),
                 ),
             )
-            self.db.commit()
             log.info("[PRO_DATA] ProDataSources: logged market conditions to DB")
         except Exception as exc:
             log.error(f"[PRO_DATA] ProDataSources: DB market cond error {exc}")
