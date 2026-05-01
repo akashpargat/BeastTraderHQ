@@ -182,6 +182,19 @@ except Exception as e:
     _slog(f'  ⚠️ ProDataSources FAILED: {e}', 'WARNING')
     _slog(f'     Traceback: {traceback.format_exc()[:200]}', 'WARNING')
 
+# V6: Smart Exit Engine + Post-Sell Tracker + Catalyst Tracker
+sell_tracker = None
+smart_exits = None
+catalyst_tracker = None
+try:
+    from smart_exits import PostSellTracker, SmartExitEngine, CatalystTracker
+    sell_tracker = PostSellTracker()
+    smart_exits = SmartExitEngine()
+    catalyst_tracker = CatalystTracker()
+    _slog('  ✅ V6 SmartExits loaded — PostSellTracker, SmartExitEngine, CatalystTracker')
+except Exception as e:
+    _slog(f'  ⚠️ V6 SmartExits FAILED: {e}', 'WARNING')
+
 _slog('Initializing Alpaca data client...')
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockSnapshotRequest
@@ -2455,18 +2468,45 @@ async def position_monitor():
                                 pass
                             continue
 
-                    # Only trail RED positions that aren't already protected
+                    # V6: Smart trailing stops — don't trail at -0.0%, use ATR-based width
                     if pct < 0 and p.symbol not in protected and avail > 0:
-                        try:
-                            trail_qty = max(1, avail // 2)
-                            gateway.place_trailing_stop(p.symbol, trail_qty, trail_percent=3.0,
-                                                        reason=f"Protect RED {pct:.1f}%",
-                                                        entry_price=p.avg_entry)
-                            _log_trade("TRAILING STOP", p.symbol, trail_qty, 0,
-                                       f"RED {pct:.1f}% — protecting {trail_qty} shares", "60s")
-                            _pg_log("PROTECT", symbol=p.symbol, qty=trail_qty, reason=f"RED {pct:.1f}%", source="60s")
-                        except:
-                            pass
+                        tv_now = _tv_cache.get(p.symbol, (0, {}))[1] if _tv_cache.get(p.symbol) else {}
+                        is_blue = p.symbol in BLUE_CHIPS if 'BLUE_CHIPS' in dir() else False
+                        
+                        if smart_exits:
+                            trail_decision = smart_exits.get_trail_params(
+                                p.symbol, pct, p.current_price,
+                                tv_signals=tv_now, is_blue_chip=is_blue,
+                                alpaca_data=data_client
+                            )
+                            if not trail_decision['should_trail']:
+                                log.info(f"    V6 NO TRAIL: {p.symbol} {pct:.1f}% — {trail_decision['reason']}")
+                            else:
+                                try:
+                                    trail_qty = max(1, avail // 2)
+                                    trail_pct = trail_decision['trail_pct']
+                                    gateway.place_trailing_stop(p.symbol, trail_qty, trail_percent=trail_pct,
+                                                                reason=f"V6 Protect RED {pct:.1f}% (ATR trail {trail_pct:.1f}%)",
+                                                                entry_price=p.avg_entry)
+                                    _log_trade("TRAILING STOP", p.symbol, trail_qty, 0,
+                                               f"RED {pct:.1f}% — V6 trail {trail_pct:.1f}% ({trail_decision['reason']})", "60s")
+                                    _pg_log("PROTECT", symbol=p.symbol, qty=trail_qty,
+                                            reason=f"V6: RED {pct:.1f}%, trail={trail_pct:.1f}%", source="60s")
+                                except:
+                                    pass
+                        else:
+                            # Fallback: old behavior but with -1% minimum
+                            if pct < -1.0:
+                                try:
+                                    trail_qty = max(1, avail // 2)
+                                    gateway.place_trailing_stop(p.symbol, trail_qty, trail_percent=3.0,
+                                                                reason=f"Protect RED {pct:.1f}%",
+                                                                entry_price=p.avg_entry)
+                                    _log_trade("TRAILING STOP", p.symbol, trail_qty, 0,
+                                               f"RED {pct:.1f}% — protecting {trail_qty} shares", "60s")
+                                    _pg_log("PROTECT", symbol=p.symbol, qty=trail_qty, reason=f"RED {pct:.1f}%", source="60s")
+                                except:
+                                    pass
             except:
                 pass
 
@@ -2487,9 +2527,9 @@ async def position_monitor():
                     pass
 
             if _is_trading_hours() and avail > 0:
-                # ── SMART SELL: Check trade_style from learning before scalping ──
+                # ── V6 SMART SELL: TV-aware + ATR-based dynamic targets ──
                 last_scalp = _prev_prices.get(f"_scalp_t_{p.symbol}", 0)
-                if pct >= 2.0 and time.time() - last_scalp > 900:
+                if pct >= 1.5 and time.time() - last_scalp > 900:
                     # What style is this stock? SCALP / SWING / CORE
                     trade_style = 'SCALP'  # default
                     fund_upside = 0
@@ -2503,8 +2543,37 @@ async def position_monitor():
                                 fund_upside = ft[0].get('data', {}).get('upside', 0)
                         except:
                             pass
+
+                    # V6: Get TV signals for this position to check if trend is still alive
+                    tv_now = _tv_cache.get(p.symbol, (0, {}))[1] if _tv_cache.get(p.symbol) else {}
                     
-                    if trade_style == 'CORE':
+                    # V6: SmartExitEngine decides scalp target dynamically
+                    scalp_decision = None
+                    if smart_exits:
+                        scalp_decision = smart_exits.get_scalp_target(
+                            p.symbol, trade_style=trade_style,
+                            ai_confidence=0, price=p.current_price,
+                            tv_signals=tv_now
+                        )
+                        target_pct = scalp_decision['scalp_pct']
+                        
+                        if scalp_decision['hold_signal'] and pct < target_pct:
+                            # TV says trend intact — don't scalp yet!
+                            log.info(f"    V6 HOLD: {p.symbol} +{pct:.1f}% — {scalp_decision['reason']}")
+                            _pg_log("V6_HOLD", symbol=p.symbol,
+                                    reason=f"SmartExit HOLD at +{pct:.1f}%: {scalp_decision['reason']}", source="60s")
+                            sell_qty = 0
+                            continue
+                        elif pct < target_pct:
+                            # Below dynamic target — hold
+                            sell_qty = 0
+                            continue
+                    else:
+                        target_pct = 2.0  # fallback to old behavior
+                    
+                    if pct < target_pct:
+                        sell_qty = 0
+                    elif trade_style == 'CORE':
                         # CORE = don't scalp at all, let it ride with trailing stop
                         log.info(f"    HOLD: {p.symbol} +{pct:.1f}% — CORE position (fund upside {fund_upside:+.0f}%), no scalp")
                         _pg_log("CORE_HOLD", symbol=p.symbol,
@@ -4295,6 +4364,48 @@ async def outcome_grader():
     except Exception as e:
         log.warning(f"Outcome grader error: {e}")
 
+    # V6: Also grade trade_log (pnl_1h, 4h, lesson_learned — was always zero)
+    try:
+        from smart_exits import grade_trade_log
+        def _get_price(sym):
+            try:
+                snap = data_client.get_stock_snapshot(StockSnapshotRequest(
+                    symbol_or_symbols=sym, feed='iex'))
+                if snap and sym in snap:
+                    return float(snap[sym].latest_trade.price)
+            except:
+                pass
+            return 0
+        tl_graded = grade_trade_log(pg, _get_price)
+        if tl_graded:
+            log.info(f"  📝 V6 trade_log grader: {tl_graded} trades scored with pnl_1h/4h/lesson")
+    except Exception as e:
+        log.debug(f"  V6 trade_log grader: {e}")
+
+    # V6: Grade post-sell outcomes (was_premature detection)
+    try:
+        if sell_tracker:
+            def _get_price2(sym):
+                try:
+                    snap = data_client.get_stock_snapshot(StockSnapshotRequest(
+                        symbol_or_symbols=sym, feed='iex'))
+                    if snap and sym in snap:
+                        return float(snap[sym].latest_trade.price)
+                except:
+                    pass
+                return 0
+            findings = sell_tracker.grade_pending(_get_price2)
+            if findings:
+                log.info(f"  📝 V6 post-sell: {len(findings)} 'sold too early' events detected")
+                for f in findings[:3]:
+                    log.info(f"     🔴 {f['symbol']}: sold @${f['sell_price']:.2f} → ran to ${f['max_after']:.2f} (+{f['pct_missed']:.1f}%)")
+                if pg:
+                    pg.notify("Sold Too Early", 
+                              f"{len(findings)} premature sells detected",
+                              severity='warning', category='learning')
+    except Exception as e:
+        log.debug(f"  V6 post-sell grader: {e}")
+
 @outcome_grader.before_loop
 async def before_grader():
     await bot.wait_until_ready()
@@ -4390,6 +4501,19 @@ async def claude_daily_deep_learn():
             except:
                 pass
 
+            log.info("  [DAILY LEARN] Step 3b: V6 learning data (post-sell, catalysts)...")
+
+            # ── STEP 3b: V6 LEARNING DATA ──
+            v6_data = {}
+            try:
+                from smart_exits import get_learning_data_for_claude
+                v6_data = get_learning_data_for_claude(pg)
+                log.info(f"  [DAILY LEARN] V6 data: {len(v6_data.get('premature_sells', []))} premature sells, "
+                         f"{len(v6_data.get('catalysts', []))} catalysts, "
+                         f"{len(v6_data.get('graded_trades', []))} graded trades")
+            except Exception as e:
+                log.warning(f"  V6 learning data: {e}")
+
             log.info("  [DAILY LEARN] Step 4: Sending to AI for analysis...")
 
             # ── STEP 4: AI ANALYSIS with institutional frameworks ──
@@ -4425,6 +4549,29 @@ Market: {_json.dumps(market, default=str)[:300]}
 VIX: {_json.dumps(fg, default=str)[:150]}
 Trends: {_json.dumps([{{'s': t.get('symbol'), 'i': t.get('insight','')[:50]}} for t in trends[:10]], default=str)[:600]}
 
+=== V6: SOLD TOO EARLY ANALYSIS (CRITICAL — this is our #1 problem) ===
+Premature sells (sold then stock kept running):
+{_json.dumps(v6_data.get('premature_sells', []), default=str)[:800]}
+
+Graded trades with 1h/4h outcomes:
+{_json.dumps(v6_data.get('graded_trades', [])[:10], default=str)[:800]}
+
+Runner catalysts (what made stocks move):
+{_json.dumps(v6_data.get('catalysts', [])[:10], default=str)[:600]}
+
+Sell→Rebuy events (bot sold then bought back higher):
+{_json.dumps(v6_data.get('rebuys', [])[:5], default=str)[:400]}
+
+Strategy performance by win rate:
+{_json.dumps(v6_data.get('strategy_performance', []), default=str)[:400]}
+
+=== SPECIFIC QUESTIONS YOU MUST ANSWER ===
+1. Are our scalp targets too tight? Should we hold longer? What target % per stock?
+2. Are our trailing stops too tight? What ATR multiple should we use?
+3. Which stocks should NEVER be scalped (should be SWING or CORE positions)?
+4. What catalysts predict sustained runs vs dead-cat bounces?
+5. Based on premature sells data: which specific stocks and strategies need wider targets?
+
 === USE THESE FRAMEWORKS ===
 1. BUFFETT: Moat, quality, hold winners. Which stocks have durable advantages?
 2. LYNCH: P/E growth, categorize each stock (stalwart/fast grower/turnaround)
@@ -4448,7 +4595,10 @@ Trends: {_json.dumps([{{'s': t.get('symbol'), 'i': t.get('insight','')[:50]}} fo
   "tv_learnings": "what TV patterns predict moves",
   "missed_opportunities": "what settings to change (from what-if analysis)",
   "strategy_adjustments": "which strategies to use more/less based on win rates",
-  "position_sizing": "which stocks deserve bigger positions based on backtest win rates"}}"""
+  "position_sizing": "which stocks deserve bigger positions based on backtest win rates",
+  "scalp_adjustments": [{{"symbol": "X", "current_target_pct": 2.0, "recommended_pct": 4.0, "reason": "runs +5% avg"}}],
+  "trail_adjustments": [{{"symbol": "X", "current_trail_pct": 3.0, "recommended_pct": 4.5, "reason": "ATR based"}}],
+  "sold_too_early_fixes": "specific recommendations to stop premature sells"}}"""
 
             try:
                 if brain._claude_available:
@@ -4838,6 +4988,13 @@ async def fill_tracker():
                         f"Sold {f['qty']}x @${f['filled_price']:.2f} "
                         f"— P&L: **${f['realized_pnl']:+.2f}**")
 
+                # V6: Record sell for post-sell tracking
+                if f['side'] == 'sell' and sell_tracker:
+                    sell_tracker.record_sell(
+                        f['symbol'], f['filled_price'], f['qty'],
+                        reason=f.get('reason', ''), strategy=f.get('order_type', '')
+                    )
+
     except Exception as e:
         log.warning(f"Fill tracker error: {e}")
 
@@ -4873,6 +5030,16 @@ async def on_ready():
             if pro_data:
                 pro_data.db = pg
                 log.info('   ✅ [V5] ProDataSources connected to PostgreSQL')
+            # V6: Connect SmartExits modules
+            if sell_tracker:
+                sell_tracker.set_db(pg)
+                log.info('   ✅ [V6] PostSellTracker connected to PostgreSQL')
+            if smart_exits:
+                smart_exits.set_db(pg)
+                log.info('   ✅ [V6] SmartExitEngine connected')
+            if catalyst_tracker:
+                catalyst_tracker.set_db(pg)
+                log.info('   ✅ [V6] CatalystTracker connected to PostgreSQL')
             _flush_startup_log()
             log.info('   ✅ [V5] Startup log flushed to PostgreSQL')
         except Exception as e:
@@ -4881,6 +5048,7 @@ async def on_ready():
         log.warning('   ⚠️ [V5] No PostgreSQL — V5 modules running without DB')
 
     log.info(f"   V5: Risk={'✅' if risk_mgr else '❌'} ProData={'✅' if pro_data else '❌'}")
+    log.info(f"   V6: SellTracker={'✅' if sell_tracker else '❌'} SmartExits={'✅' if smart_exits else '❌'} Catalysts={'✅' if catalyst_tracker else '❌'}")
 
     # Register this bot session in DB (tracks version, uptime, crashes)
     if pg:
