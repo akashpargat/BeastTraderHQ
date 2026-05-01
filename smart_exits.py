@@ -248,9 +248,65 @@ class SmartExitEngine:
         self.db = db
         self._atr_cache = {}  # symbol → (atr, timestamp)
         self._ATR_TTL = 300   # 5 min cache
+        self._claude_recs = {}  # symbol → {scalp_pct, trail_pct} from 3AM Claude
+        self._claude_recs_loaded = 0
 
     def set_db(self, db):
         self.db = db
+        self._load_claude_recommendations()
+
+    def _load_claude_recommendations(self):
+        """Load scalp/trail targets set by 3AM Claude deep learning."""
+        if not self.db or time.time() - self._claude_recs_loaded < 3600:
+            return  # reload max once per hour
+        try:
+            # Scalp targets from Claude
+            scalp_rows = self.db._exec(
+                """SELECT symbol, data FROM ai_trends
+                   WHERE trend_type = 'scalp_target' AND is_active = true
+                   AND updated_at > NOW() - interval '48 hours'""",
+                fetch=True
+            ) or []
+            for r in scalp_rows:
+                sym = r['symbol']
+                d = r['data'] if isinstance(r['data'], dict) else {}
+                if d.get('recommended_pct'):
+                    self._claude_recs.setdefault(sym, {})['scalp_pct'] = float(d['recommended_pct'])
+
+            # Trail targets from Claude
+            trail_rows = self.db._exec(
+                """SELECT symbol, data FROM ai_trends
+                   WHERE trend_type = 'trail_target' AND is_active = true
+                   AND updated_at > NOW() - interval '48 hours'""",
+                fetch=True
+            ) or []
+            for r in trail_rows:
+                sym = r['symbol']
+                d = r['data'] if isinstance(r['data'], dict) else {}
+                if d.get('recommended_pct'):
+                    self._claude_recs.setdefault(sym, {})['trail_pct'] = float(d['recommended_pct'])
+
+            # Stock DNA optimal targets
+            dna_rows = self.db._exec(
+                """SELECT symbol, data FROM ai_trends
+                   WHERE trend_type = 'stock_dna' AND is_active = true
+                   AND updated_at > NOW() - interval '7 days'""",
+                fetch=True
+            ) or []
+            for r in dna_rows:
+                sym = r['symbol']
+                d = r['data'] if isinstance(r['data'], dict) else {}
+                rec = self._claude_recs.setdefault(sym, {})
+                if 'scalp_pct' not in rec and d.get('best_scalp_pct'):
+                    rec['scalp_pct'] = float(d['best_scalp_pct'])
+                if 'trail_pct' not in rec and d.get('best_trail_pct'):
+                    rec['trail_pct'] = float(d['best_trail_pct'])
+
+            self._claude_recs_loaded = time.time()
+            if self._claude_recs:
+                log.info(f"[V6] Loaded Claude recommendations for {len(self._claude_recs)} stocks")
+        except Exception as e:
+            log.debug(f"[V6] Load Claude recs: {e}")
 
     def get_atr(self, symbol: str, alpaca_data=None) -> float:
         """Get 14-period ATR. Uses Alpaca bars or falls back to estimate."""
@@ -312,6 +368,12 @@ class SmartExitEngine:
             base_pct = 5.0
         else:
             base_pct = 2.5  # slightly wider than old 2.0
+
+        # Override with Claude 3AM recommendation if available
+        claude_rec = self._claude_recs.get(symbol, {})
+        if claude_rec.get('scalp_pct'):
+            base_pct = claude_rec['scalp_pct']
+            log.debug(f"[V6] {symbol} scalp target from Claude: {base_pct}%")
 
         # TV-aware: if signals are still bullish, RAISE the scalp target
         rsi = tv.get('rsi', 50)
@@ -390,6 +452,11 @@ class SmartExitEngine:
         atr = self.get_atr(symbol, alpaca_data)
         atr_pct = (atr / price * 100) if price > 0 else 2.0
         trail_pct = max(self.MIN_TRAIL_PCT, min(self.MAX_TRAIL_PCT, atr_pct * self.ATR_TRAIL_MULT))
+
+        # Override with Claude 3AM recommendation if available
+        claude_rec = self._claude_recs.get(symbol, {})
+        if claude_rec.get('trail_pct'):
+            trail_pct = max(trail_pct, claude_rec['trail_pct'])
 
         # Blue chips get wider stops (they recover)
         if is_blue_chip:

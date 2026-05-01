@@ -46,7 +46,7 @@ try:
     _git_date = subprocess.check_output(['git', 'log', '-1', '--format=%ci', '--date=short'],
                                          stderr=subprocess.DEVNULL, cwd=os.path.dirname(os.path.abspath(__file__))
                                          ).decode().strip()[:16]
-except:
+except Exception:
     _git_hash = "unknown"
     _git_date = "unknown"
 BOT_BUILD = f"v{BOT_VERSION} ({_git_hash} @ {_git_date})"
@@ -345,8 +345,7 @@ async def runners_cmd(ctx):
                     prev = float(snap.previous_daily_bar.close)
                     change = (price - prev) / prev
                     movers.append({'symbol': sym, 'change_pct': change, 'price': price})
-        except:
-            pass
+        except Exception:                pass
 
     runners = sorted([m for m in movers if m['change_pct'] > 0.01],
                      key=lambda x: x['change_pct'], reverse=True)
@@ -380,8 +379,7 @@ async def dumpers_cmd(ctx):
                     prev = float(snap.previous_daily_bar.close)
                     change = (price - prev) / prev
                     movers.append({'symbol': sym, 'change_pct': change, 'price': price})
-        except:
-            pass
+        except Exception:                pass
 
     dumpers = sorted([m for m in movers if m['change_pct'] < -0.02],
                      key=lambda x: x['change_pct'])
@@ -455,8 +453,7 @@ async def scan_cmd(ctx, symbol: str = None):
                 'prev_close': float(s.previous_daily_bar.close),
                 'change_pct': (float(s.daily_bar.close) - float(s.previous_daily_bar.close)) / float(s.previous_daily_bar.close)
             }
-    except:
-        pass
+    except Exception:            pass
 
     # Parse TV data
     rsi, macd, vwap = '?', '?', '?'
@@ -483,7 +480,7 @@ async def scan_cmd(ctx, symbol: str = None):
     if brain.is_available:
         try:
             rsi_f = float(str(rsi).replace('\u2212', '-')) if rsi != '?' else 50
-        except:
+        except Exception:
             rsi_f = 50
 
         ai = brain.analyze_stock(symbol, {
@@ -598,8 +595,7 @@ async def sectors_cmd(ctx):
                     prev = float(snap.previous_daily_bar.close)
                     change = (price - prev) / prev
                     movers.append({'symbol': sym, 'change_pct': change, 'price': price})
-        except:
-            pass
+        except Exception:                pass
 
     alerts = sectors_scanner.detect_sector_move(movers)
 
@@ -1136,7 +1132,7 @@ async def full_scan_cmd(ctx):
             spy_snap = data_client.get_stock_snapshot(req)
             spy_change = (float(spy_snap['SPY'].daily_bar.close) - float(spy_snap['SPY'].previous_daily_bar.close)) / float(spy_snap['SPY'].previous_daily_bar.close)
             current_regime = regime_det.detect(spy_change)
-        except:
+        except Exception:
             current_regime = regime_det.current_regime
 
         # PHASE 3: Full Sentiment
@@ -1159,8 +1155,7 @@ async def full_scan_cmd(ctx):
                         prev = float(snap.previous_daily_bar.close)
                         change = (price - prev) / prev
                         movers.append({'symbol': sym, 'change_pct': change, 'price': price})
-            except:
-                pass
+            except Exception:                    pass
 
         runners = sorted([m for m in movers if m['change_pct'] > 0.01], key=lambda x: x['change_pct'], reverse=True)
         dumpers = sorted([m for m in movers if m['change_pct'] < -0.02], key=lambda x: x['change_pct'])
@@ -1182,8 +1177,7 @@ async def full_scan_cmd(ctx):
                         if 'Relative Strength' in s.get('name', ''): rsi = s.get('values', {}).get('RSI', '?')
                         elif s.get('name') == 'MACD': macd = s.get('values', {}).get('Histogram', '?')
                     tv_results[sym] = {'rsi': rsi, 'macd': macd}
-                except:
-                    pass
+                except Exception:                        pass
 
         # PHASE 5: AI Brain on ALL stocks
         await ctx.send(f"🧠 Phase 5: Claude Opus 4.7 analyzing {len(scan_list)} stocks...")
@@ -1325,7 +1319,7 @@ async def full_scan_cmd(ctx):
         spy_prev = float(spy_snap['SPY'].previous_daily_bar.close)
         spy_change = (spy_price - spy_prev) / spy_prev
         current_regime = regime_det.detect(spy_change)
-    except:
+    except Exception:
         current_regime = regime_det.current_regime
 
     # Phase 2: Sentiment
@@ -1687,8 +1681,7 @@ def _tv_confirm_buy(symbol: str) -> tuple[bool, dict]:
                              vwap_above=tv.get('vwap_above'), confluence=tv.get('confluence'),
                              ema_9=tv.get('ema_9'), ema_21=tv.get('ema_21'),
                              volume_ratio=tv.get('volume_ratio'), price=tv.get('price', 0))
-        except:
-            pass
+        except Exception:                pass
 
     return confirmed, tv
 
@@ -1871,7 +1864,7 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
             if sold_time_str:
                 sold_dt = dt2.fromisoformat(str(sold_time_str).replace('Z', '+00:00').split('+')[0])
                 elapsed_min = (dt2.utcnow() - sold_dt).total_seconds() / 60
-        except:
+        except Exception:
             elapsed_min = 999
         
         # V5 Smart reset conditions
@@ -1894,8 +1887,7 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
             # Clear the anti-buyback in DB so we don't re-block
             try:
                 pg._exec("UPDATE price_memory SET last_sell_price = NULL WHERE symbol = %s", (symbol,))
-            except:
-                pass
+            except Exception:                    pass
         else:
             log.info(f"    [G3] BLOCKED: Anti-buyback — sold @${sold_at:.2f} ({elapsed_min:.0f}min ago), "
                      f"now @${price:.2f} (+{pct_above:.1f}%). "
@@ -2021,7 +2013,7 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
                     steps.append(f"G5.5:PASS fund={fund_score}")
             else:
                 steps.append("G5.5:SKIP no_fund_data")
-        except:
+        except Exception:
             steps.append("G5.5:ERROR")
 
     # ══════════════════════════════════════════════
@@ -2152,8 +2144,7 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
                     qty = max(1, qty // 2)
                     log.info(f"    [G6.7] REDUCE: High-impact economic event tomorrow — qty {old_qty}->{qty}")
                     steps.append("G6.7:ECON_EVENT_REDUCE")
-            except:
-                pass
+            except Exception:                    pass
                 
         except Exception as e:
             log.info(f"    [G6.7] ERROR: {e} — proceeding without pro data")
@@ -2201,8 +2192,7 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
                 vwap_above=tv.get('vwap_above'), confluence=tv.get('confluence'),
                 ema_9=tv.get('ema_9'), ema_21=tv.get('ema_21'),
                 volume_ratio=tv.get('volume_ratio'), price=price)
-        except:
-            pass
+        except Exception:                pass
 
     # ══════════════════════════════════════════════
     # GATE 7: EXECUTE — All gates passed!
@@ -2389,8 +2379,7 @@ async def position_monitor():
             sa = SentimentAnalyst()
             fg = sa.get_fear_greed()
             _cached_vix = fg.get('vix', 18.0)
-        except:
-            pass
+        except Exception:                pass
     try:
         positions = gateway.get_positions()
         if not positions:
@@ -2429,8 +2418,7 @@ async def position_monitor():
                                         fd = ft[0].get('data', {})
                                         fund_score = fd.get('score', 0)
                                         fund_verdict = fd.get('verdict', '')
-                                except:
-                                    pass
+                                except Exception:                                        pass
 
                             if p.symbol in blue_chip_set:
                                 bc_info = pg.get_blue_chip_info(p.symbol) if pg else {}
@@ -2473,8 +2461,7 @@ async def position_monitor():
                                 if channel:
                                     await channel.send(f"🔪 **LOSS CUT: {p.symbol}** {pct:.1f}% — selling {cut_qty} (not blue chip)")
                                 _tg(f"🔪 LOSS CUT: {p.symbol} {pct:.1f}%\nSelling {cut_qty} shares (non-blue-chip)")
-                            except:
-                                pass
+                            except Exception:                                    pass
                             continue
 
                     # V6: Smart trailing stops — don't trail at -0.0%, use ATR-based width
@@ -2501,8 +2488,7 @@ async def position_monitor():
                                                f"RED {pct:.1f}% — V6 trail {trail_pct:.1f}% ({trail_decision['reason']})", "60s")
                                     _pg_log("PROTECT", symbol=p.symbol, qty=trail_qty,
                                             reason=f"V6: RED {pct:.1f}%, trail={trail_pct:.1f}%", source="60s")
-                                except:
-                                    pass
+                                except Exception:                                        pass
                         else:
                             # Fallback: old behavior but with -1% minimum
                             if pct < -1.0:
@@ -2514,10 +2500,8 @@ async def position_monitor():
                                     _log_trade("TRAILING STOP", p.symbol, trail_qty, 0,
                                                f"RED {pct:.1f}% — protecting {trail_qty} shares", "60s")
                                     _pg_log("PROTECT", symbol=p.symbol, qty=trail_qty, reason=f"RED {pct:.1f}%", source="60s")
-                                except:
-                                    pass
-            except:
-                pass
+                                except Exception:                                        pass
+            except Exception:                    pass
 
         for p in positions:
             prev = _prev_prices.get(p.symbol, p.current_price)
@@ -2532,8 +2516,7 @@ async def position_monitor():
             if pg:
                 try:
                     pg.update_price(p.symbol, p.current_price)
-                except:
-                    pass
+                except Exception:                        pass
 
             if _is_trading_hours() and avail > 0:
                 # ── V6 SMART SELL: TV-aware + ATR-based dynamic targets ──
@@ -2550,8 +2533,7 @@ async def position_monitor():
                             ft = pg.get_trends(symbol=p.symbol, trend_type='fundamentals')
                             if ft:
                                 fund_upside = ft[0].get('data', {}).get('upside', 0)
-                        except:
-                            pass
+                        except Exception:                                pass
 
                     # V6: Get TV signals for this position to check if trend is still alive
                     tv_now = _tv_cache.get(p.symbol, (0, {}))[1] if _tv_cache.get(p.symbol) else {}
@@ -2647,8 +2629,7 @@ async def position_monitor():
                                         await channel.send(
                                             f"📉🟢 **RELOAD: {p.symbol}** {dip_pct:.1f}% dip from ${intraday_high:.2f}\n"
                                             f"Buy {reload_qty} @ ${buy_price} → scalp at +2%")
-                        except:
-                            pass
+                        except Exception:                                pass
 
             # ── PYRAMIDING: add to winning positions that keep running ──
             if _is_trading_hours() and pct >= 3.0 and avail == 0:
@@ -2729,8 +2710,7 @@ async def position_monitor():
                                     await channel.send(
                                         f"📉 **[60s] AKASH DIP BUY: {sym}** {day_change:+.1f}%\n"
                                         f"Buy {qty} @ ${buy_price} | Exit: +2% (${buy_price * 1.02:.2f})")
-                        except:
-                            pass
+                        except Exception:                                pass
             except Exception as e:
                 log.debug(f"Dip scan: {e}")
 
@@ -2758,8 +2738,7 @@ async def position_monitor():
                                         f"Check catalyst before buying. Use `!scan {sym}` for deep analysis.")
                                 log.info(f"  🏆 Phase 0: past winner {sym} +{day_change:.1f}%")
                                 _pg_log("ALERT", symbol=sym, reason=f"Past winner running +{day_change:.1f}%", source="Phase0")
-                        except:
-                            pass
+                        except Exception:                                pass
             except Exception as e:
                 log.debug(f"Phase 0 scan: {e}")
 
@@ -2854,10 +2833,8 @@ async def full_scan():
                             pct = (price - prev) / prev * 100
                             if abs(pct) > 1.5 and sym not in scan_symbols:
                                 scan_symbols.append(sym)
-                        except:
-                            pass
-            except:
-                pass
+                        except Exception:                                pass
+            except Exception:                    pass
         log.info(f"  Scan coverage: {len(held)} held + {len(scan_symbols)-len(held)} watchlist movers = {len(scan_symbols)} total")
 
         # Track for snapshot
@@ -2873,8 +2850,7 @@ async def full_scan():
             if 'SPY' in snap:
                 s = snap['SPY']
                 spy_change = (float(s.daily_bar.close) - float(s.previous_daily_bar.close)) / float(s.previous_daily_bar.close)
-        except:
-            pass
+        except Exception:                pass
         regime = regime_det.detect(spy_change)
 
         # ══════════════════════════════════════════════════
@@ -2952,8 +2928,7 @@ async def full_scan():
             t0 = time.time()
             try:
                 results['_market'] = sa.analyze_market()
-            except:
-                pass
+            except Exception:                    pass
             timings['_market'] = int((time.time() - t0) * 1000)
             return results, timings
         t_step = time.time()
@@ -3021,8 +2996,7 @@ async def full_scan():
         if pg:
             try:
                 learning_digest = pg.get_learning_digest_for_ai(scan_symbols[:16])
-            except:
-                pass
+            except Exception:                    pass
         perf['learning'] = {'total_ms': int((time.time() - t_step) * 1000), 'digest_len': len(learning_digest)}
 
         # ── STEP 4: AI ANALYSIS (AFTER all data, WITH learning context) ──
@@ -3053,8 +3027,7 @@ async def full_scan():
                                 stock_learning = f"HISTORY: {wins}/{total} wins. "
                                 if lessons:
                                     stock_learning += f"Lessons: {'; '.join(l[:60] for l in lessons[:3])}"
-                        except:
-                            pass
+                        except Exception:                                pass
                     batch_data[sym] = {
                         'price': pos.current_price, 'entry': pos.avg_entry,
                         'pnl': pos.unrealized_pl, 'qty': pos.qty,
@@ -3183,8 +3156,7 @@ async def full_scan():
                 try:
                     pg.save_ai_verdict(sym, v.get('action','HOLD'), v.get('confidence',0),
                                       v.get('reasoning',''), v.get('ai_source','GPT-4o'), '5min')
-                except:
-                    pass
+                except Exception:                        pass
 
         # ── MARKET CONTEXT ──
         market_status = "MARKET" if _is_market_hours() else ("EXTENDED" if _is_extended_hours() else "CLOSED")
@@ -3518,8 +3490,7 @@ async def fast_runner_scan():
                                 pg = _get_pg()
                                 if pg:
                                     pg.add_to_watchlist(sym, source='most_active', pct=round(pct, 1), volume=vol)
-                        except:
-                            pass
+                        except Exception:                                pass
             except Exception as e:
                 log.debug(f"Most actives scan: {e}")
 
@@ -3536,10 +3507,8 @@ async def fast_runner_scan():
                             vol = int(s.daily_bar.volume) if s.daily_bar else 0
                             if price > 5 and abs(pct) > 1.5:
                                 runners.append({'symbol': sym, 'price': price, 'pct': pct, 'volume': vol, 'prev': prev})
-                        except:
-                            pass
-            except:
-                pass
+                        except Exception:                                pass
+            except Exception:                    pass
 
             return sorted(runners, key=lambda x: -abs(x['pct']))
 
@@ -3567,7 +3536,7 @@ async def fast_runner_scan():
                 sa = SentimentAnalyst()
                 sent = sa.analyze(sym)
                 sent_score = sent.total_score
-            except:
+            except Exception:
                 sent_score = 0
 
             # Rule 29: Don't chase +5% without catalyst (sentiment >= 3)
@@ -3666,19 +3635,19 @@ async def claude_deep_scan():
             for p in positions:
                 try:
                     all_intel[p.symbol] = sa.full_stock_intel(p.symbol)
-                except:
+                except Exception:
                     all_intel[p.symbol] = {}
 
             # 2. Market-wide sentiment
             try:
                 market_intel['full_market'] = sa.full_market_sentiment()
-            except:
+            except Exception:
                 market_intel['full_market'] = {}
 
             # 3. Fear & Greed
             try:
                 market_intel['fear_greed'] = sa.get_fear_greed()
-            except:
+            except Exception:
                 market_intel['fear_greed'] = {}
 
             # 3.5 MARKET INTELLIGENCE (congressional, insider, sector, econ, squeeze)
@@ -3699,8 +3668,7 @@ async def claude_deep_scan():
                     try:
                         stock_data = mi.full_intel(p.symbol)
                         all_intel[p.symbol] = {**(all_intel.get(p.symbol) or {}), **stock_data}
-                    except:
-                        pass
+                    except Exception:                            pass
                 
                 # Store everything to DB for learning
                 mi.store_intel_to_db()
@@ -3720,8 +3688,7 @@ async def claude_deep_scan():
                     ind = _get_tv_indicators(p.symbol)
                     if ind:
                         tv_intel[p.symbol] = ind
-                except:
-                    pass
+                except Exception:                        pass
             market_intel['tv_data'] = tv_intel
 
             # 5. Today's runners
@@ -3741,16 +3708,13 @@ async def claude_deep_scan():
                             prev = float(s.previous_daily_bar.close)
                             pct = (price - prev) / prev * 100
                             past_winner_status[sym] = {'price': price, 'change_pct': round(pct, 1)}
-                        except:
-                            pass
-            except:
-                pass
+                        except Exception:                                pass
+            except Exception:                    pass
 
             # 5. Finviz runners
             try:
                 runner_data.extend(sa.scan_finviz_runners())
-            except:
-                pass
+            except Exception:                    pass
 
         await asyncio.to_thread(_collect_everything)
 
@@ -3763,7 +3727,7 @@ async def claude_deep_scan():
         try:
             from correlation_check import CorrelationChecker
             corr = CorrelationChecker().check(positions)
-        except:
+        except Exception:
             corr = {}
 
         # 8. Regime
@@ -3771,8 +3735,7 @@ async def claude_deep_scan():
         spy_change = 0
         try:
             regime_val = regime_det.detect(spy_change).value
-        except:
-            pass
+        except Exception:                pass
 
         # ═══════════════════════════════════════════════
         # PHASE 2: Build MASSIVE data package for Claude
@@ -4108,12 +4071,9 @@ async def ai_background_learning():
                                                 gap = (post - pre) / pre * 100
                                                 pg.learn_earnings_pattern(sym, str(earn_date)[:10],
                                                                          pre, post, beat, gap)
-                                        except:
-                                            pass
-                                except:
-                                    pass
-                    except:
-                        pass
+                                        except Exception:                                                pass
+                                except Exception:                                        pass
+                    except Exception:                            pass
 
                     # 2. PRICE BEHAVIOR: Support/resistance, avg daily range
                     try:
@@ -4134,8 +4094,7 @@ async def ai_background_learning():
                                       'support': round(support, 2),
                                       'resistance': round(resistance, 2),
                                       'current': closes[-1] if closes else 0})
-                    except:
-                        pass
+                    except Exception:                            pass
 
                     # 3. Get earnings pattern summary and store as trend
                     try:
@@ -4145,8 +4104,7 @@ async def ai_background_learning():
                                 f"{pattern['tendency']}: avg {pattern['avg_gap_pct']:+.1f}% gap. {pattern['play']}",
                                 confidence=min(90, 50 + pattern['samples'] * 10),
                                 data=pattern)
-                    except:
-                        pass
+                    except Exception:                            pass
 
                     # 4. FUNDAMENTAL ANALYSIS: PE, PEG, growth, analyst targets
                     try:
@@ -4172,8 +4130,7 @@ async def ai_background_learning():
                                 })
                             if score >= 40:
                                 log.info(f"    {sym}: {verdict} score={score} PE={fund.get('forward_pe',0)} Rev={fund.get('revenue_growth_pct',0)}%")
-                    except:
-                        pass
+                    except Exception:                            pass
 
                     # 4.5 SCALP vs SWING CLASSIFICATION
                     # Uses: daily range, fundamentals upside, our win rate, price pattern
@@ -4241,8 +4198,7 @@ async def ai_background_learning():
                                 'win_rate': win_rate,
                                 'avg_hold_min': avg_hold,
                             })
-                    except:
-                        pass
+                    except Exception:                            pass
 
                     # 5. Ask GPT-4o for deeper insight (if available)
                     try:
@@ -4264,8 +4220,7 @@ async def ai_background_learning():
                                     result.get('reasoning', '')[:500],
                                     confidence=result.get('confidence', 50),
                                     data={'action': result.get('action'), 'source': 'background_learning'})
-                    except:
-                        pass
+                    except Exception:                            pass
 
                 except Exception as e:
                     log.debug(f"Background learn {sym}: {e}")
@@ -4382,8 +4337,7 @@ async def outcome_grader():
                     symbol_or_symbols=sym, feed='iex'))
                 if snap and sym in snap:
                     return float(snap[sym].latest_trade.price)
-            except:
-                pass
+            except Exception:                    pass
             return 0
         tl_graded = grade_trade_log(pg, _get_price)
         if tl_graded:
@@ -4400,8 +4354,7 @@ async def outcome_grader():
                         symbol_or_symbols=sym, feed='iex'))
                     if snap and sym in snap:
                         return float(snap[sym].latest_trade.price)
-                except:
-                    pass
+                except Exception:                        pass
                 return 0
             findings = sell_tracker.grade_pending(_get_price2)
             if findings:
@@ -4450,8 +4403,7 @@ async def claude_daily_deep_learn():
                 for sym in ['GOOGL', 'NVDA', 'AMD', 'TSLA', 'COIN', 'META'][:4]:
                     try:
                         backtest_data[sym] = bt.run_all_strategies(sym, 90)
-                    except:
-                        pass
+                    except Exception:                            pass
                 log.info(f"  [DAILY LEARN] Backtests done: {len(backtest_data)} results")
             except Exception as e:
                 log.warning(f"  Backtest error: {e}")
@@ -4502,13 +4454,11 @@ async def claude_daily_deep_learn():
             market = {}
             try:
                 market = sa.full_market_sentiment()
-            except:
-                pass
+            except Exception:                    pass
             fg = {}
             try:
                 fg = sa.get_fear_greed()
-            except:
-                pass
+            except Exception:                    pass
 
             log.info("  [DAILY LEARN] Step 3b: V6 learning data (post-sell, catalysts)...")
 
@@ -4719,8 +4669,7 @@ Sector momentum (hot/cold sectors):
                                 reason=f"Claude API error: {resp.status_code}",
                                 source='daily_claude',
                                 data={'status': resp.status_code, 'error': resp.text[:500]})
-                        except:
-                            pass
+                        except Exception:                                pass
 
                 if brain._gpt_available:
                     log.info("  [DAILY LEARN] Using GPT-5.4 fallback...")
@@ -4731,8 +4680,7 @@ Sector momentum (hot/cold sectors):
                             reason=f"3AM GPT fallback response",
                             source='daily_gpt',
                             data={'response': str(result)[:3000], 'model': 'GPT-5.4'})
-                    except:
-                        pass
+                    except Exception:                            pass
                     return result
             except Exception as e:
                 log.warning(f"  [DAILY LEARN] AI call failed: {e}")
@@ -4741,8 +4689,7 @@ Sector momentum (hot/cold sectors):
                         reason=f"3AM AI call exception: {str(e)[:200]}",
                         source='daily_claude',
                         data={'error': str(e), 'traceback': traceback.format_exc()[:500]})
-                except:
-                    pass
+                except Exception:                        pass
             return {}
 
         insights = await asyncio.to_thread(_gather_and_analyze)
@@ -4941,10 +4888,8 @@ async def ah_pm_scanner():
                                     'pct': round(pct, 2), 'volume': vol,
                                     'session': session, 'held': sym in held_syms,
                                 })
-                        except:
-                            pass
-                except:
-                    pass
+                        except Exception:                                pass
+                except Exception:                        pass
         except Exception as e:
             log.warning(f"  {session} scanner price fetch: {e}")
             return
@@ -4968,8 +4913,7 @@ async def ah_pm_scanner():
                     earn = sa.get_earnings_info(sym)
                     if earn.get('days_until', 999) <= 1:
                         is_earnings = True
-                except:
-                    pass
+                except Exception:                        pass
 
                 if is_earnings:
                     trend_type = f'{session.lower()}_earnings_move'
@@ -5223,8 +5167,7 @@ async def on_ready():
     try:
         from tv_cdp_client import TVClient
         tv_ok = TVClient().health_check()
-    except:
-        pass
+    except Exception:            pass
     log.info(f"   TradingView: {'✅' if tv_ok else '❌'}")
     pg = _get_pg()
     pg_ok = pg and pg.conn
@@ -5341,3 +5284,4 @@ if __name__ == '__main__':
         sys.exit(1)
     print("🦍 Starting Beast Discord Bot with Autonomous Loop...")
     bot.run(token)
+

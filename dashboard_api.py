@@ -2060,6 +2060,157 @@ def v5_short_squeeze():
         return jsonify({'error': str(e)}), 500
 
 
+# ══════════════════════════════════════════════════════════
+# V6 API ENDPOINTS — Intelligence + Sell Outcomes
+# ══════════════════════════════════════════════════════════
+
+@app.route('/api/v6/intelligence')
+@require_auth
+def v6_intelligence():
+    """Stock DNA profiles, earnings patterns, strategy scores, sector momentum."""
+    try:
+        db = _get_db()
+        result = {}
+        # Stock DNA
+        result['stock_dna'] = db._exec(
+            """SELECT symbol, insight, confidence, data FROM ai_trends
+               WHERE trend_type = 'stock_dna' AND is_active = true
+               ORDER BY confidence DESC LIMIT 30""",
+            fetch=True
+        ) or []
+        # Earnings patterns
+        result['earnings_patterns'] = db._exec(
+            """SELECT symbol, insight, confidence, data FROM ai_trends
+               WHERE trend_type = 'earnings_pattern' AND is_active = true
+               ORDER BY confidence DESC LIMIT 20""",
+            fetch=True
+        ) or []
+        # Strategy scores
+        result['strategy_scores'] = db._exec(
+            """SELECT symbol, insight, confidence, data FROM ai_trends
+               WHERE trend_type = 'strategy_scores' AND is_active = true
+               ORDER BY confidence DESC LIMIT 30""",
+            fetch=True
+        ) or []
+        # Sector momentum
+        result['sector_momentum'] = db._exec(
+            """SELECT data FROM ai_trends
+               WHERE trend_type = 'sector_momentum' AND is_active = true
+               ORDER BY updated_at DESC LIMIT 1""",
+            fetch=True
+        ) or []
+        # Latest intelligence scan
+        result['last_scan'] = db._exec(
+            """SELECT created_at, reason, data FROM activity_log
+               WHERE action_type = 'INTELLIGENCE'
+               ORDER BY created_at DESC LIMIT 1""",
+            fetch=True
+        ) or []
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/v6/sell-outcomes')
+@require_auth
+def v6_sell_outcomes():
+    """Post-sell price tracking — sold too early detection."""
+    try:
+        db = _get_db()
+        result = {}
+        result['recent'] = db._exec(
+            """SELECT symbol, sell_price, sell_time, sell_reason, sell_strategy,
+                      price_15m, price_1h, price_4h, max_price_after,
+                      pct_move_15m, pct_move_1h, pct_move_4h, pct_max_missed,
+                      was_premature, optimal_action, graded_at
+               FROM sell_outcomes
+               ORDER BY sell_time DESC LIMIT 30""",
+            fetch=True
+        ) or []
+        result['premature_count'] = db._exec(
+            "SELECT COUNT(*) as cnt FROM sell_outcomes WHERE was_premature = true",
+            fetch=True
+        ) or [{'cnt': 0}]
+        result['total_count'] = db._exec(
+            "SELECT COUNT(*) as cnt FROM sell_outcomes",
+            fetch=True
+        ) or [{'cnt': 0}]
+        result['avg_missed_pct'] = db._exec(
+            "SELECT AVG(pct_max_missed) as avg FROM sell_outcomes WHERE was_premature = true",
+            fetch=True
+        ) or [{'avg': 0}]
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/v6/daily-playbook')
+@require_auth
+def v6_daily_playbook():
+    """Latest 3AM Claude playbook + learning data."""
+    try:
+        db = _get_db()
+        result = {}
+        # Latest playbook
+        result['playbook'] = db._exec(
+            """SELECT data, created_at FROM ai_trends
+               WHERE trend_type = 'daily_playbook' AND symbol = 'PORTFOLIO'
+               ORDER BY updated_at DESC LIMIT 1""",
+            fetch=True
+        ) or []
+        # Claude buy/avoid lists
+        result['buy_list'] = db._exec(
+            """SELECT symbol, insight, confidence, data FROM ai_trends
+               WHERE trend_type = 'claude_daily_buy'
+               ORDER BY updated_at DESC LIMIT 10""",
+            fetch=True
+        ) or []
+        result['avoid_list'] = db._exec(
+            """SELECT symbol, insight, confidence, data FROM ai_trends
+               WHERE trend_type = 'claude_daily_avoid'
+               ORDER BY updated_at DESC LIMIT 10""",
+            fetch=True
+        ) or []
+        # 3AM debug logs
+        result['learn_logs'] = db._exec(
+            """SELECT created_at, action_type, reason FROM activity_log
+               WHERE action_type LIKE 'DAILY_LEARN%%'
+               ORDER BY created_at DESC LIMIT 10""",
+            fetch=True
+        ) or []
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/v6/trade-grades')
+@require_auth
+def v6_trade_grades():
+    """Graded trades with pnl_1h, 4h, lessons."""
+    try:
+        db = _get_db()
+        result = {}
+        result['graded'] = db._exec(
+            """SELECT symbol, side, price, strategy, source,
+                      pnl_1h, pnl_4h, pnl_eod, was_profitable, lesson_learned,
+                      created_at
+               FROM trade_log
+               WHERE pnl_1h IS NOT NULL OR lesson_learned IS NOT NULL
+               ORDER BY created_at DESC LIMIT 50""",
+            fetch=True
+        ) or []
+        result['ungraded_count'] = db._exec(
+            "SELECT COUNT(*) as cnt FROM trade_log WHERE pnl_1h IS NULL",
+            fetch=True
+        ) or [{'cnt': 0}]
+        result['win_rate'] = db._exec(
+            """SELECT COUNT(*) as total,
+                      SUM(CASE WHEN was_profitable THEN 1 ELSE 0 END) as wins
+               FROM trade_log WHERE was_profitable IS NOT NULL""",
+            fetch=True
+        ) or [{'total': 0, 'wins': 0}]
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     print("Beast V4 Dashboard API starting on port 8080...")
     app.run(host='0.0.0.0', port=8080, debug=False)
