@@ -1453,21 +1453,44 @@ def _get_tv_indicators(symbol: str) -> dict:
                 reason=f"{len(studies)} studies ({retries} retries): {', '.join(study_names[:6])}",
                 source="tv_read", data={'studies': study_names, 'retries': retries})
 
+        # Fetch current quote so VWAP comparison works (was empty → VWAP always "below")
+        quote_data = {}
+        try:
+            quote_data = _tv_client.get_quote() or {}
+            if not quote_data:
+                # Fallback: get price from Alpaca
+                try:
+                    snap = alpaca_data.get_snapshot(symbol, feed='iex')
+                    if snap and snap.latest_trade:
+                        quote_data = {'last': float(snap.latest_trade.price)}
+                except Exception:
+                    pass
+        except Exception as qe:
+            log.debug(f"  TV quote fetch for {symbol}: {qe}")
+
         # Parse via TV analyst
         from tv_analyst import TradingViewAnalyst
         tva = TradingViewAnalyst()
         result = tva.analyze(symbol, mcp_tools={
-            'studies': studies, 'quote': {}, 'labels': [], 'tables': []
+            'studies': studies, 'quote': quote_data, 'labels': [], 'tables': []
         })
         if result:
-            return {
+            tv_dict = {
                 'rsi': result.rsi, 'macd_hist': result.macd_histogram,
                 'vwap_above': result.above_vwap,
                 'bb_position': 'upper' if getattr(result, 'above_upper_bb', False) else ('lower' if getattr(result, 'below_lower_bb', False) else 'mid'),
                 'confluence': result.confluence_score,
                 'ema_9': result.ema_9, 'ema_21': result.ema_21,
                 'volume_ratio': result.volume_ratio,
+                'price': quote_data.get('last', 0),
+                'vwap': result.vwap,
             }
+            # Debug logging for TV signal quality
+            log.info(f"  📺 TV {symbol} PARSED: RSI={result.rsi:.1f} MACD_H={result.macd_histogram:.3f} "
+                     f"VWAP={result.vwap:.2f} price_vs_vwap={result.price_vs_vwap:.2f} "
+                     f"above_vwap={result.above_vwap} confluence={result.confluence_score} "
+                     f"EMA9={result.ema_9:.2f} EMA21={result.ema_21:.2f}")
+            return tv_dict
         log.debug(f"  TV: analyze returned None for {symbol}")
     except Exception as e:
         log.warning(f"  TV indicators {symbol}: {e}")
@@ -2010,10 +2033,37 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
             acct = gateway.get_account()
             equity = float(acct.get('equity', 100000))
             
+            # Get equity snapshots for loss limit calculation
+            s_today = equity  # fallback
+            s_week = equity
+            s_month = equity
+            try:
+                snaps = pg._exec(
+                    """SELECT equity FROM equity_snapshots
+                       WHERE created_at >= CURRENT_DATE
+                       ORDER BY created_at ASC LIMIT 1""",
+                    fetch=True
+                )
+                if snaps and snaps[0].get('equity'):
+                    s_today = float(snaps[0]['equity'])
+                snaps_w = pg._exec(
+                    """SELECT equity FROM equity_snapshots
+                       WHERE created_at >= date_trunc('week', CURRENT_DATE)
+                       ORDER BY created_at ASC LIMIT 1""",
+                    fetch=True
+                )
+                if snaps_w and snaps_w[0].get('equity'):
+                    s_week = float(snaps_w[0]['equity'])
+            except Exception:
+                pass
+
             risk_result = risk_mgr.approve_trade(
                 symbol=symbol, side='buy', qty=qty,
                 price=price, conviction=_confidence / 100.0,
-                positions=positions, equity=equity
+                positions=positions, equity=equity,
+                starting_equity_today=s_today,
+                starting_equity_week=s_week,
+                starting_equity_month=s_month,
             )
             
             if not risk_result.get('approved', True):
@@ -4738,6 +4788,18 @@ async def fill_tracker():
 
                         # Update session stats
                         pg.update_session_stats(trades=1, pnl=realized_pnl or 0)
+
+                        # Write realized_pl to orders table (RiskManager reads this for Kelly sizing)
+                        if realized_pnl is not None:
+                            try:
+                                pg._exec(
+                                    """UPDATE orders SET realized_pl = %s, updated_at = NOW()
+                                       WHERE alpaca_order_id = %s""",
+                                    (realized_pnl, str(o.id))
+                                )
+                                log.info(f"    [FILL] Updated orders.realized_pl={realized_pnl:+.2f} for {sym}")
+                            except Exception as oe:
+                                log.debug(f"    [FILL] orders table update failed: {oe}")
 
                 return fills
             except Exception as e:

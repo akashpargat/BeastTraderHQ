@@ -198,16 +198,45 @@ class RiskManager:
 
     def _get_trade_stats(self, symbol: str) -> dict:
         """Pull win_rate, avg_win, avg_loss from trade history.
-        Uses BeastDB._exec(fetch=True) which returns list of DICTS, not tuples.
-        Table: orders (not trades). Column: realized_pl."""
+        Checks orders table first, falls back to trade_log for historical PnL.
+        Uses BeastDB._exec(fetch=True) which returns list of DICTS."""
         try:
+            # Primary: orders table (fill_tracker writes realized_pl here)
             rows = self.db._exec(
                 """SELECT realized_pl as pnl FROM orders
                    WHERE symbol = %s AND status = 'filled' AND side = 'sell'
-                   AND realized_pl IS NOT NULL
+                   AND realized_pl IS NOT NULL AND realized_pl != 0
                    ORDER BY created_at DESC LIMIT 100""",
                 (symbol,), fetch=True
             )
+            # Fallback: trade_log table (has more historical PnL data)
+            if not rows or len(rows) < 3:
+                tl_rows = self.db._exec(
+                    """SELECT pnl_eod as pnl FROM trade_log
+                       WHERE symbol = %s AND pnl_eod IS NOT NULL AND pnl_eod != 0
+                       ORDER BY created_at DESC LIMIT 100""",
+                    (symbol,), fetch=True
+                )
+                if tl_rows:
+                    rows = (rows or []) + tl_rows
+            # Also get portfolio-wide stats if per-symbol data is thin
+            if not rows or len(rows) < 5:
+                all_rows = self.db._exec(
+                    """SELECT realized_pl as pnl FROM orders
+                       WHERE status = 'filled' AND side = 'sell'
+                       AND realized_pl IS NOT NULL AND realized_pl != 0
+                       ORDER BY created_at DESC LIMIT 200""",
+                    fetch=True
+                )
+                tl_all = self.db._exec(
+                    """SELECT pnl_eod as pnl FROM trade_log
+                       WHERE pnl_eod IS NOT NULL AND pnl_eod != 0
+                       ORDER BY created_at DESC LIMIT 200""",
+                    fetch=True
+                )
+                all_combined = (all_rows or []) + (tl_all or [])
+                if len(all_combined) > len(rows or []):
+                    rows = all_combined
             if not rows or len(rows) < 5:
                 return {
                     "win_rate": DEFAULT_WIN_RATE,
@@ -638,8 +667,12 @@ class RiskManager:
                 self._log_check(symbol, "earnings", True, 0, 0, "no-earnings", result)
                 return result
 
+            # Convert datetime.date to datetime (yfinance returns date, not datetime)
+            import datetime as dt_module
+            if isinstance(earnings_date, dt_module.date) and not isinstance(earnings_date, datetime):
+                earnings_date = datetime(earnings_date.year, earnings_date.month, earnings_date.day, tzinfo=timezone.utc)
             # Make timezone-aware if needed
-            if earnings_date.tzinfo is None:
+            elif hasattr(earnings_date, 'tzinfo') and earnings_date.tzinfo is None:
                 earnings_date = earnings_date.replace(tzinfo=timezone.utc)
 
             hours_until = (earnings_date - now).total_seconds() / 3600.0
@@ -737,8 +770,12 @@ class RiskManager:
         if side.lower() == "buy" and adjusted_qty > 0:
             kelly = self.kelly_position_size(symbol, conviction, price, atr)
             if kelly["shares"] < adjusted_qty:
-                adjusted_qty = kelly["shares"]
-                adj_list.append(f"kelly-capped-to-{kelly['shares']}")
+                if kelly["shares"] <= 0:
+                    rejections.append(f"kelly-size-zero (risk_pct={kelly.get('risk_pct', 0):.4f})")
+                    adjusted_qty = 0
+                else:
+                    adjusted_qty = kelly["shares"]
+                    adj_list.append(f"kelly-capped-to-{kelly['shares']}")
 
         # ── Correlation ──────────────────────────────────────────────
         corr: dict = {}
