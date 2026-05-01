@@ -1428,7 +1428,7 @@ def _tg(message: str):
             _notifier = Notifier()
         _notifier.send(message)
     except Exception as e:
-        log.debug(f"Telegram send failed: {e}")
+        log.warning(f"Telegram send failed: {e}")
 
 def _get_tv_indicators(symbol: str) -> dict:
     """Read RSI/MACD/VWAP/BB from TradingView CDP. Returns dict or empty."""
@@ -1527,7 +1527,7 @@ def _get_tv_indicators(symbol: str) -> dict:
                     source="headless_ta")
             return result
     except Exception as he:
-        log.debug(f"  Headless TA also failed for {symbol}: {he}")
+        log.warning(f"  Headless TA also failed for {symbol}: {he}")
 
     return {}
 
@@ -1574,7 +1574,7 @@ def _get_market_internals() -> dict:
                         result['add'] = spy_move * 200
                         result['vold'] = spy_move * 500
         except Exception as e:
-            log.debug(f"[INTERNALS] SPY snapshot failed: {e}")
+            log.warning(f"[INTERNALS] SPY snapshot failed: {e}")
         
         # Score the internals
         tick = result.get('tick') or 0
@@ -1601,7 +1601,7 @@ def _get_market_internals() -> dict:
         _market_internals_cache = {'ts': time.time(), 'data': result}
         
     except Exception as e:
-        log.debug(f"[INTERNALS] Market internals error: {e}")
+        log.warning(f"[INTERNALS] Market internals error: {e}")
     
     return result
 
@@ -2181,7 +2181,7 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
         else:
             steps.append("G6.9:SKIP no_data")
     except Exception as e:
-        log.debug(f"    [G6.9] ERROR: {e}")
+        log.warning(f"    [G6.9] ERROR: {e}")
         steps.append("G6.9:ERROR")
 
     # ── Persist TV reading ──
@@ -2309,7 +2309,7 @@ def _log_trade(action, symbol, qty, price, reason, scan_type="60s"):
             db.log_entry(symbol=symbol, qty=qty, price=price,
                         strategy=scan_type, reason=f"{action}: {reason}")
         except Exception as e:
-            log.debug(f"Trade DB write failed: {e}")
+            log.warning(f"Trade DB write failed: {e}")
     # Persist to PostgreSQL (V4)
     side = 'sell' if 'SELL' in action.upper() else 'buy'
     _pg_log(action.split('(')[0].strip(), symbol=symbol, side=side,
@@ -2331,7 +2331,7 @@ def _pg_log(action_type, symbol=None, side=None, qty=None, price=None,
                 data=data
             )
         except Exception as e:
-            log.debug(f"PG log failed: {e}")
+            log.warning(f"PG log failed: {e}")
 
 def _is_market_hours() -> bool:
     from datetime import datetime
@@ -2779,9 +2779,7 @@ async def position_monitor():
         _pg_log("MONITOR", reason=f"#{_cycle_count} {len(positions)} pos P&L=${total_pl:+.2f}", source="60s")
     except Exception as e:
         log.error(f"Position monitor error: {e}")
-
-
-@tasks.loop(minutes=5)
+        _pg_log("TASK_ERROR", reason=f"position_monitor: {str(e)[:200]}", source="position_monitor")
 async def full_scan():
     """Every 5 min: MANDATORY full scan — TV + ALL sentiment + confidence engine + AI.
     NO EXCEPTIONS. Every source runs. Confidence is generated. AI analyzes AFTER data.
@@ -3331,6 +3329,7 @@ async def full_scan():
 
     except Exception as e:
         log.error(f"Full scan error: {e}\n{traceback.format_exc()}")
+        _pg_log("TASK_ERROR", reason=f"full_scan: {str(e)[:200]}", source="full_scan")
 
 
 @tasks.loop(minutes=10)
@@ -3439,6 +3438,7 @@ async def decision_report():
 
     except Exception as e:
         log.error(f"Decision report error: {e}")
+        _pg_log("TASK_ERROR", reason=f"decision_report: {str(e)[:200]}", source="decision_report")
 
 
 @tasks.loop(seconds=120)
@@ -3575,6 +3575,7 @@ async def fast_runner_scan():
 
     except Exception as e:
         log.error(f"Fast runner scan error: {e}")
+        _pg_log("TASK_ERROR", reason=f"fast_runner_scan: {str(e)[:200]}", source="fast_runner_scan")
 
 
 @tasks.loop(minutes=30)
@@ -4819,9 +4820,7 @@ Sector momentum (hot/cold sectors):
 
     except Exception as e:
         log.error(f"Daily learn error: {e}\n{traceback.format_exc()}")
-
-
-@claude_daily_deep_learn.before_loop
+        _pg_log("TASK_ERROR", reason=f"claude_daily_deep_learn: {str(e)[:200]}", source="claude_daily")
 async def before_daily_learn():
     await bot.wait_until_ready()
     now = datetime.now(ZoneInfo("America/New_York"))
@@ -5118,7 +5117,7 @@ async def fill_tracker():
                                 )
                                 log.info(f"    [FILL] Updated orders.realized_pl={realized_pnl:+.2f} for {sym}")
                             except Exception as oe:
-                                log.debug(f"    [FILL] orders table update failed: {oe}")
+                                log.warning(f"    [FILL] orders table update failed: {oe}")
 
                 return fills
             except Exception as e:
