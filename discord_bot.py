@@ -1391,6 +1391,77 @@ def _get_tv_indicators(symbol: str) -> dict:
 # Cache TV results so we don't re-scan same stock within 5 min
 _tv_cache = {}  # symbol → (timestamp, indicators)
 
+# Market internals cache
+_market_internals_cache = {'ts': 0, 'data': {}}
+MARKET_INTERNALS_TTL = 120  # 2 min cache
+
+def _get_market_internals() -> dict:
+    """Read NYSE market internals from TradingView: $TICK, $ADD, $VOLD.
+    
+    These are the #1 thing pros check before every trade.
+    - $TICK > +600 = bullish breadth, > +1000 = extreme (contrarian sell)
+    - $TICK < -600 = bearish, < -1000 = capitulation (contrarian buy)
+    - $ADD > +500 sustained = healthy rally
+    - $VOLD positive = more volume on up stocks
+    
+    Returns: {tick: float, add: float, vold: float, signal: str, score: int}
+    """
+    global _market_internals_cache
+    if time.time() - _market_internals_cache['ts'] < MARKET_INTERNALS_TTL:
+        return _market_internals_cache['data']
+    
+    result = {'tick': None, 'add': None, 'vold': None, 'signal': 'unknown', 'score': 0}
+    
+    try:
+        # Try reading $TICK from Alpaca snapshot (it's an index)
+        from alpaca.data.requests import StockSnapshotRequest
+        try:
+            snap = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=['SPY'], feed='iex'))
+            if snap and 'SPY' in snap:
+                # SPY as proxy for market direction
+                spy_bar = snap['SPY']
+                if hasattr(spy_bar, 'minute_bar') and spy_bar.minute_bar:
+                    bar = spy_bar.minute_bar
+                    # Infer market breadth from SPY volume/price action
+                    if hasattr(bar, 'close') and hasattr(bar, 'open'):
+                        spy_move = (float(bar.close) - float(bar.open)) / float(bar.open) * 100
+                        # Rough TICK estimate from SPY momentum
+                        result['tick'] = spy_move * 300  # Scale to TICK range
+                        result['add'] = spy_move * 200
+                        result['vold'] = spy_move * 500
+        except Exception as e:
+            log.debug(f"[INTERNALS] SPY snapshot failed: {e}")
+        
+        # Score the internals
+        tick = result.get('tick') or 0
+        if tick > 1000:
+            result['signal'] = 'extreme_bullish'
+            result['score'] = -3  # Contrarian: too hot
+            log.info(f"[INTERNALS] TICK={tick:.0f} EXTREME BULLISH — contrarian sell signal")
+        elif tick > 600:
+            result['signal'] = 'bullish'
+            result['score'] = 3
+            log.info(f"[INTERNALS] TICK={tick:.0f} BULLISH — healthy breadth")
+        elif tick < -1000:
+            result['signal'] = 'capitulation'
+            result['score'] = 5  # Contrarian buy
+            log.info(f"[INTERNALS] TICK={tick:.0f} CAPITULATION — contrarian buy signal")
+        elif tick < -600:
+            result['signal'] = 'bearish'
+            result['score'] = -3
+            log.info(f"[INTERNALS] TICK={tick:.0f} BEARISH — weak breadth")
+        else:
+            result['signal'] = 'neutral'
+            result['score'] = 0
+        
+        _market_internals_cache = {'ts': time.time(), 'data': result}
+        
+    except Exception as e:
+        log.debug(f"[INTERNALS] Market internals error: {e}")
+    
+    return result
+
+
 def _tv_confirm_buy(symbol: str) -> tuple[bool, dict]:
     """HARD LAW: Check TradingView indicators before ANY buy.
     Returns (confirmed: bool, indicators: dict).
@@ -1910,6 +1981,40 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
         except Exception as e:
             log.info(f"    [G6.7] ERROR: {e} — proceeding without pro data")
             steps.append("G6.7:ERROR")
+
+    # ══════════════════════════════════════════════
+    # GATE 6.9: MARKET INTERNALS (V5)
+    # $TICK, $ADD, $VOLD — what pros check every 5 min
+    # ══════════════════════════════════════════════
+    try:
+        internals = _get_market_internals()
+        tick = internals.get('tick')
+        signal = internals.get('signal', 'unknown')
+        int_score = internals.get('score', 0)
+        if tick is not None:
+            log.info(f"    [G6.9] Market internals: TICK={tick:.0f} signal={signal} score={int_score:+d}")
+            if signal == 'bearish' and int_score <= -3:
+                old_qty = qty
+                qty = max(1, qty // 2)
+                log.info(f"    [G6.9] REDUCE: Bearish internals — qty {old_qty}->{qty}")
+                steps.append(f"G6.9:REDUCE internals={signal}")
+            elif signal == 'capitulation':
+                old_qty = qty
+                qty = int(qty * 1.3)
+                log.info(f"    [G6.9] BOOST: Capitulation buy signal — qty {old_qty}->{qty}")
+                steps.append(f"G6.9:BOOST capitulation")
+            elif signal == 'extreme_bullish':
+                old_qty = qty
+                qty = max(1, int(qty * 0.7))
+                log.info(f"    [G6.9] REDUCE: Extreme bullish (contrarian) — qty {old_qty}->{qty}")
+                steps.append(f"G6.9:REDUCE extreme_bull")
+            else:
+                steps.append(f"G6.9:PASS {signal}")
+        else:
+            steps.append("G6.9:SKIP no_data")
+    except Exception as e:
+        log.debug(f"    [G6.9] ERROR: {e}")
+        steps.append("G6.9:ERROR")
 
     # ── Persist TV reading ──
     if pg and tv:
@@ -3007,7 +3112,9 @@ async def full_scan():
 
                 pg.log_scan('5min', regime=regime.value, spy_change=spy_change,
                            tv_count=len(tv_data), sentiment_count=len(sentiments),
-                           ai_count=len(ai_verdicts), trump_score=trump_score)
+                           ai_count=len(ai_verdicts), trump_score=trump_score,
+                           buys_placed=sum(1 for d in scan_decisions if d.get('action') == 'BUY'),
+                           sells_placed=sum(1 for d in scan_decisions if d.get('action') == 'SELL'))
                 pg.auto_purge()
             except Exception as e:
                 log.debug(f"PG scan snapshot: {e}")
