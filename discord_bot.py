@@ -195,6 +195,15 @@ try:
 except Exception as e:
     _slog(f'  ⚠️ V6 SmartExits FAILED: {e}', 'WARNING')
 
+# V6: Intelligence Engine (background learning)
+intel_engine = None
+try:
+    from intelligence_engine import IntelligenceEngine
+    intel_engine = IntelligenceEngine()
+    _slog('  ✅ V6 IntelligenceEngine loaded — EarningsPattern, StockDNA, StrategyScorer, SectorRadar')
+except Exception as e:
+    _slog(f'  ⚠️ V6 IntelligenceEngine FAILED: {e}', 'WARNING')
+
 _slog('Initializing Alpaca data client...')
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockSnapshotRequest
@@ -4514,7 +4523,59 @@ async def claude_daily_deep_learn():
             except Exception as e:
                 log.warning(f"  V6 learning data: {e}")
 
+            # ── STEP 3c: INTELLIGENCE ENGINE DATA ──
+            intel_data = {}
+            try:
+                if intel_engine:
+                    intel_data = intel_engine.get_full_intelligence()
+                    log.info(f"  [DAILY LEARN] Intelligence: "
+                             f"{len(intel_data.get('stock_dna', []))} DNA profiles, "
+                             f"{len(intel_data.get('earnings_pattern', []))} earnings patterns, "
+                             f"{len(intel_data.get('strategy_scores', []))} strategy scores")
+            except Exception as e:
+                log.warning(f"  Intelligence data: {e}")
+
             log.info("  [DAILY LEARN] Step 4: Sending to AI for analysis...")
+
+            # ── LOG THE FULL PROMPT FOR DEBUGGING ──
+            prompt_len = len(prompt)
+            log.info(f"  [DAILY LEARN] Prompt length: {prompt_len} chars")
+            # Log prompt sections to PostgreSQL for debugging
+            try:
+                pg.log_activity('DAILY_LEARN_PROMPT', category='ai',
+                    reason=f"3AM prompt: {prompt_len} chars, "
+                           f"V6: {len(v6_data.get('premature_sells', []))} premature, "
+                           f"{len(v6_data.get('graded_trades', []))} graded, "
+                           f"{len(v6_data.get('catalysts', []))} catalysts | "
+                           f"Intel: {len(intel_data.get('stock_dna', []))} DNA, "
+                           f"{len(intel_data.get('earnings_pattern', []))} earnings",
+                    source='daily_claude',
+                    data={
+                        'prompt_length': prompt_len,
+                        'prompt_preview': prompt[:2000],
+                        'v6_summary': {
+                            'premature_sells': len(v6_data.get('premature_sells', [])),
+                            'graded_trades': len(v6_data.get('graded_trades', [])),
+                            'catalysts': len(v6_data.get('catalysts', [])),
+                            'rebuys': len(v6_data.get('rebuys', [])),
+                        },
+                        'intel_summary': {
+                            'stock_dna': len(intel_data.get('stock_dna', [])),
+                            'earnings_patterns': len(intel_data.get('earnings_pattern', [])),
+                            'strategy_scores': len(intel_data.get('strategy_scores', [])),
+                        },
+                        'data_sections': {
+                            'backtest': bool(backtest_data),
+                            'decision_accuracy': bool(decision_acc),
+                            'missed_trades': len(missed) if missed else 0,
+                            'win_rates': bool(win_rates),
+                            'positions': len(held),
+                            'tv_summary': len(tv_summary),
+                            'market': bool(market),
+                        }
+                    })
+            except Exception as le:
+                log.debug(f"  Prompt logging: {le}")
 
             # ── STEP 4: AI ANALYSIS with institutional frameworks ──
             prompt = f"""You are a senior portfolio manager at a top quantitative hedge fund.
@@ -4565,12 +4626,28 @@ Sell→Rebuy events (bot sold then bought back higher):
 Strategy performance by win rate:
 {_json.dumps(v6_data.get('strategy_performance', []), default=str)[:400]}
 
+=== INTELLIGENCE ENGINE DATA (deep stock analysis) ===
+Stock DNA profiles (personality of each stock):
+{_json.dumps(intel_data.get('stock_dna', [])[:15], default=str)[:800]}
+
+Earnings patterns (how stocks behave around earnings):
+{_json.dumps(intel_data.get('earnings_pattern', [])[:10], default=str)[:600]}
+
+Strategy scores (which strategy works on which stock):
+{_json.dumps(intel_data.get('strategy_scores', [])[:10], default=str)[:600]}
+
+Sector momentum (hot/cold sectors):
+{_json.dumps(intel_data.get('sector_momentum', [])[:5], default=str)[:400]}
+
 === SPECIFIC QUESTIONS YOU MUST ANSWER ===
 1. Are our scalp targets too tight? Should we hold longer? What target % per stock?
 2. Are our trailing stops too tight? What ATR multiple should we use?
 3. Which stocks should NEVER be scalped (should be SWING or CORE positions)?
 4. What catalysts predict sustained runs vs dead-cat bounces?
 5. Based on premature sells data: which specific stocks and strategies need wider targets?
+6. Based on Stock DNA: what DNA type is each stock and what strategy matches?
+7. Based on earnings patterns: any upcoming earnings we should prepare for?
+8. Which sectors should we overweight/underweight tomorrow?
 
 === USE THESE FRAMEWORKS ===
 1. BUFFETT: Moat, quality, hold winners. Which stocks have durable advantages?
@@ -4603,49 +4680,135 @@ Strategy performance by win rate:
             try:
                 if brain._claude_available:
                     import requests
+                    log.info("  [DAILY LEARN] Calling Claude API...")
                     resp = requests.post(
                         f"{os.getenv('AI_API_URL', 'https://ai.beast-trader.com')}/analyze",
                         json={'prompt': prompt, 'system_prompt': 'Senior quant PM. Self-learning trading bot. Your output becomes the bot intelligence for tomorrow. Be specific with numbers. Output valid JSON only.'},
                         headers={'X-API-Key': os.getenv('AI_API_KEY', ''), 'Content-Type': 'application/json'},
                         timeout=120)
+                    log.info(f"  [DAILY LEARN] Claude response: status={resp.status_code} len={len(resp.text)}")
                     if resp.status_code == 200:
-                        log.info("  [DAILY LEARN] Claude analysis complete")
-                        return resp.json()
+                        result = resp.json()
+                        # Log the full response for debugging
+                        try:
+                            pg.log_activity('DAILY_LEARN_RESPONSE', category='ai',
+                                reason=f"3AM Claude response: {len(resp.text)} chars, "
+                                       f"buy_list={len(result.get('buy_list', []))}, "
+                                       f"avoid_list={len(result.get('avoid_list', []))}, "
+                                       f"scalp_adj={len(result.get('scalp_adjustments', []))}",
+                                source='daily_claude',
+                                data={
+                                    'response_length': len(resp.text),
+                                    'response_preview': resp.text[:3000],
+                                    'keys': list(result.keys()) if isinstance(result, dict) else [],
+                                    'buy_list': result.get('buy_list', []),
+                                    'avoid_list': result.get('avoid_list', []),
+                                    'scalp_adjustments': result.get('scalp_adjustments', []),
+                                    'trail_adjustments': result.get('trail_adjustments', []),
+                                    'sold_too_early_fixes': result.get('sold_too_early_fixes', ''),
+                                    'key_insight': result.get('key_insight', ''),
+                                })
+                        except Exception as le:
+                            log.debug(f"  Response logging: {le}")
+                        log.info("  [DAILY LEARN] Claude analysis complete ✅")
+                        return result
+                    else:
+                        log.warning(f"  [DAILY LEARN] Claude API error: {resp.status_code} — {resp.text[:200]}")
+                        try:
+                            pg.log_activity('DAILY_LEARN_ERROR', category='ai',
+                                reason=f"Claude API error: {resp.status_code}",
+                                source='daily_claude',
+                                data={'status': resp.status_code, 'error': resp.text[:500]})
+                        except:
+                            pass
+
                 if brain._gpt_available:
-                    log.info("  [DAILY LEARN] Using GPT-5.4 fallback")
-                    return brain.analyze_stock('PORTFOLIO', {'deep_analysis_prompt': prompt})
+                    log.info("  [DAILY LEARN] Using GPT-5.4 fallback...")
+                    result = brain.analyze_stock('PORTFOLIO', {'deep_analysis_prompt': prompt})
+                    log.info(f"  [DAILY LEARN] GPT response: {type(result)} keys={list(result.keys()) if isinstance(result, dict) else 'N/A'}")
+                    try:
+                        pg.log_activity('DAILY_LEARN_RESPONSE', category='ai',
+                            reason=f"3AM GPT fallback response",
+                            source='daily_gpt',
+                            data={'response': str(result)[:3000], 'model': 'GPT-5.4'})
+                    except:
+                        pass
+                    return result
             except Exception as e:
-                log.warning(f"Claude daily: {e}")
+                log.warning(f"  [DAILY LEARN] AI call failed: {e}")
+                try:
+                    pg.log_activity('DAILY_LEARN_ERROR', category='ai',
+                        reason=f"3AM AI call exception: {str(e)[:200]}",
+                        source='daily_claude',
+                        data={'error': str(e), 'traceback': traceback.format_exc()[:500]})
+                except:
+                    pass
             return {}
 
         insights = await asyncio.to_thread(_gather_and_analyze)
         if not insights:
+            log.warning("  [DAILY LEARN] No insights returned — AI call may have failed. Check DAILY_LEARN_ERROR in activity_log.")
             return
 
         import json as _json
+        log.info(f"  [DAILY LEARN] Processing insights: {list(insights.keys()) if isinstance(insights, dict) else type(insights)}")
+
         # Store playbook
         pg.save_trend('PORTFOLIO', 'daily_playbook', _json.dumps(insights, default=str)[:2000], 80, insights)
+        log.info("  [DAILY LEARN] ✅ Playbook saved to ai_trends")
 
         # Store buy/avoid/earnings recommendations
+        buy_count = 0
         for b in (insights.get('buy_list') or [])[:5]:
             if isinstance(b, dict) and b.get('symbol'):
                 pg.save_trend(b['symbol'], 'claude_daily_buy', str(b.get('reason', ''))[:500], b.get('confidence', 60), b)
+                buy_count += 1
+                log.info(f"  [DAILY LEARN] BUY: {b['symbol']} conf={b.get('confidence', '?')} — {str(b.get('reason', ''))[:60]}")
+        avoid_count = 0
         for a in (insights.get('avoid_list') or [])[:3]:
             if isinstance(a, dict) and a.get('symbol'):
                 pg.save_trend(a['symbol'], 'claude_daily_avoid', str(a.get('reason', ''))[:500], 80, a)
+                avoid_count += 1
+                log.info(f"  [DAILY LEARN] AVOID: {a['symbol']} — {str(a.get('reason', ''))[:60]}")
         for p in (insights.get('earnings_plays') or [])[:5]:
             if isinstance(p, dict) and p.get('symbol'):
                 pg.save_trend(p['symbol'], 'earnings_play', str(p.get('play', ''))[:500], p.get('confidence', 60), p)
         if insights.get('sector_signal'):
             pg.save_trend('MARKET', 'sector_rotation', str(insights['sector_signal'])[:500], 70)
-        # Store TV learnings (patterns discovered from today's indicators)
         if insights.get('tv_learnings'):
             pg.save_trend('MARKET', 'tv_daily_report', str(insights['tv_learnings'])[:500], 75)
-        # Store missed opportunities (so we don't miss them again)
         if insights.get('missed_opportunities'):
             pg.save_trend('MARKET', 'missed_opps', str(insights['missed_opportunities'])[:500], 65)
 
-        pg.log_activity('DAILY_LEARN', category='ai', reason=f"Deep learn: {len(insights.get('buy_list', []))} buys, {len(insights.get('avoid_list', []))} avoids", source='daily_claude', data=insights)
+        # V6: Store scalp/trail adjustments from Claude
+        scalp_adj = insights.get('scalp_adjustments', [])
+        trail_adj = insights.get('trail_adjustments', [])
+        if scalp_adj:
+            log.info(f"  [DAILY LEARN] Scalp adjustments: {len(scalp_adj)}")
+            for sa in scalp_adj[:10]:
+                if isinstance(sa, dict) and sa.get('symbol'):
+                    pg.save_trend(sa['symbol'], 'scalp_target',
+                                  f"Recommended: {sa.get('recommended_pct', 2)}% (was {sa.get('current_target_pct', 2)}%)",
+                                  70, sa)
+                    log.info(f"    {sa['symbol']}: scalp {sa.get('current_target_pct', '?')}% → {sa.get('recommended_pct', '?')}% — {sa.get('reason', '')[:50]}")
+        if trail_adj:
+            log.info(f"  [DAILY LEARN] Trail adjustments: {len(trail_adj)}")
+            for ta in trail_adj[:10]:
+                if isinstance(ta, dict) and ta.get('symbol'):
+                    pg.save_trend(ta['symbol'], 'trail_target',
+                                  f"Recommended: {ta.get('recommended_pct', 3)}% (was {ta.get('current_trail_pct', 3)}%)",
+                                  70, ta)
+                    log.info(f"    {ta['symbol']}: trail {ta.get('current_trail_pct', '?')}% → {ta.get('recommended_pct', '?')}% — {ta.get('reason', '')[:50]}")
+
+        if insights.get('key_insight'):
+            log.info(f"  [DAILY LEARN] 🔑 KEY INSIGHT: {insights['key_insight'][:200]}")
+        if insights.get('sold_too_early_fixes'):
+            log.info(f"  [DAILY LEARN] 📝 SOLD-TOO-EARLY FIX: {str(insights['sold_too_early_fixes'])[:200]}")
+
+        pg.log_activity('DAILY_LEARN', category='ai',
+            reason=f"Deep learn: {buy_count} buys, {avoid_count} avoids, "
+                   f"{len(scalp_adj)} scalp adj, {len(trail_adj)} trail adj",
+            source='daily_claude', data=insights)
 
         # Report
         if channel:
@@ -4861,6 +5024,53 @@ async def before_ah_pm():
 
 
 # ══════════════════════════════════════════════════════════
+#  V6: INTELLIGENCE ENGINE — Background stock learning
+#  Runs hourly, cycles through 20 stocks per batch
+#  Learns: earnings patterns, stock DNA, strategy scores, sector momentum
+# ══════════════════════════════════════════════════════════
+
+@tasks.loop(hours=1)
+async def intelligence_scan():
+    """Hourly: Deep analysis on batch of stocks. Builds the eagle eye."""
+    try:
+        if not intel_engine:
+            return
+        pg = _get_pg()
+        if not pg:
+            return
+
+        intel_engine.set_db(pg)
+        symbols = list(DIP_BUY_WATCHLIST) if 'DIP_BUY_WATCHLIST' in dir() else []
+        if not symbols:
+            return
+
+        def _run_intel():
+            return intel_engine.run_batch(symbols, batch_size=20)
+
+        result = await asyncio.to_thread(_run_intel)
+
+        log.info(f"  🧠 Intelligence scan: {result.get('dna_profiled', 0)} DNA, "
+                 f"{result.get('earnings_analyzed', 0)} earnings, "
+                 f"{result.get('strategies_scored', 0)} strategies "
+                 f"in {result.get('elapsed_s', 0)}s")
+
+        _pg_log("INTELLIGENCE", reason=f"Batch: DNA={result.get('dna_profiled', 0)} "
+                f"Earnings={result.get('earnings_analyzed', 0)} "
+                f"Strategy={result.get('strategies_scored', 0)} "
+                f"[{result.get('elapsed_s', 0)}s]",
+                source="intel_engine",
+                data={'batch': result.get('batch', []), 'sectors': result.get('sectors', {})})
+
+    except Exception as e:
+        log.warning(f"Intelligence scan error: {e}")
+
+@intelligence_scan.before_loop
+async def before_intel():
+    await bot.wait_until_ready()
+    await asyncio.sleep(300)  # 5 min warmup (let other systems stabilize first)
+
+
+# ══════════════════════════════════════════════════════════
 #  FILL TRACKER: Monitors order fills, records realized P&L
 #  Runs every 5 min, checks Alpaca for recently filled orders
 #  Stores profit/loss per trade for the learning engine
@@ -5040,6 +5250,9 @@ async def on_ready():
             if catalyst_tracker:
                 catalyst_tracker.set_db(pg)
                 log.info('   ✅ [V6] CatalystTracker connected to PostgreSQL')
+            if intel_engine:
+                intel_engine.set_db(pg)
+                log.info('   ✅ [V6] IntelligenceEngine connected to PostgreSQL')
             _flush_startup_log()
             log.info('   ✅ [V5] Startup log flushed to PostgreSQL')
         except Exception as e:
@@ -5096,6 +5309,9 @@ async def on_ready():
     if not claude_daily_deep_learn.is_running():
         claude_daily_deep_learn.start()
         log.info("   ✅ Claude daily deep learn: once/day at 3 AM ET")
+    if not intelligence_scan.is_running():
+        intelligence_scan.start()
+        log.info("   ✅ V6 Intelligence scan: every 1 hour (stock DNA, earnings, strategies)")
 
     channel = bot.get_channel(SCAN_CHANNEL_ID)
     if channel:
