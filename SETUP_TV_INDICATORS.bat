@@ -1,5 +1,6 @@
 @echo off
 echo Adding TradingView indicators...
+set PY=C:\Users\beastadmin\AppData\Local\Programs\Python\Python312\python.exe
 cd /d C:\beast-test2
-C:\Python312\python.exe setup_tv_indicators.py
+%PY% setup_tv_indicators.py
 pause
