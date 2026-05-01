@@ -125,6 +125,10 @@ intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
 # Components — every init logged
+api_key = os.getenv('ALPACA_API_KEY', '')
+secret = os.getenv('ALPACA_SECRET_KEY', '')
+_slog(f'Alpaca keys: {"SET" if api_key else "MISSING"} / {"SET" if secret else "MISSING"}')
+
 _slog('Initializing OrderGateway...')
 gateway = OrderGateway(api_key, secret, paper=True)
 _slog(f'  OrderGateway OK — anti-buyback timeout={gateway.ANTI_BUYBACK_TIMEOUT_MIN}min')
