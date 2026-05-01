@@ -34,7 +34,7 @@ import time
 import subprocess
 import discord
 from discord.ext import commands, tasks
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # ── VERSION TRACKING ──
@@ -1473,12 +1473,15 @@ def _get_tv_indicators(symbol: str) -> dict:
         quote_data = {}
         try:
             quote_data = _tv_client.get_quote() or {}
-            if not quote_data:
+            log.debug(f"  TV quote for {symbol}: {list(quote_data.keys()) if quote_data else 'empty'}")
+            if not quote_data or not quote_data.get('last'):
                 # Fallback: get price from Alpaca
                 try:
-                    snap = alpaca_data.get_snapshot(symbol, feed='iex')
-                    if snap and snap.latest_trade:
-                        quote_data = {'last': float(snap.latest_trade.price)}
+                    snap = data_client.get_stock_snapshot(
+                        StockSnapshotRequest(symbol_or_symbols=symbol, feed='iex'))
+                    if snap and symbol in snap and snap[symbol].latest_trade:
+                        quote_data = {'last': float(snap[symbol].latest_trade.price)}
+                        log.debug(f"  TV quote fallback Alpaca: {symbol} ${quote_data['last']:.2f}")
                 except Exception:
                     pass
         except Exception as qe:
@@ -2780,6 +2783,9 @@ async def position_monitor():
     except Exception as e:
         log.error(f"Position monitor error: {e}")
         _pg_log("TASK_ERROR", reason=f"position_monitor: {str(e)[:200]}", source="position_monitor")
+
+
+@tasks.loop(minutes=5)
 async def full_scan():
     """Every 5 min: MANDATORY full scan — TV + ALL sentiment + confidence engine + AI.
     NO EXCEPTIONS. Every source runs. Confidence is generated. AI analyzes AFTER data.
@@ -4821,6 +4827,9 @@ Sector momentum (hot/cold sectors):
     except Exception as e:
         log.error(f"Daily learn error: {e}\n{traceback.format_exc()}")
         _pg_log("TASK_ERROR", reason=f"claude_daily_deep_learn: {str(e)[:200]}", source="claude_daily")
+
+
+@claude_daily_deep_learn.before_loop
 async def before_daily_learn():
     await bot.wait_until_ready()
     now = datetime.now(ZoneInfo("America/New_York"))
