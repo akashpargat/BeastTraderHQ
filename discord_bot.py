@@ -4643,70 +4643,121 @@ Sector momentum (hot/cold sectors):
   "trail_adjustments": [{{"symbol": "X", "current_trail_pct": 3.0, "recommended_pct": 4.5, "reason": "ATR based"}}],
   "sold_too_early_fixes": "specific recommendations to stop premature sells"}}"""
 
-            try:
-                if brain._claude_available:
-                    import requests
-                    log.info("  [DAILY LEARN] Calling Claude API...")
-                    resp = requests.post(
-                        f"{os.getenv('AI_API_URL', 'https://ai.beast-trader.com')}/analyze",
-                        json={'prompt': prompt, 'system_prompt': 'Senior quant PM. Self-learning trading bot. Your output becomes the bot intelligence for tomorrow. Be specific with numbers. Output valid JSON only.'},
-                        headers={'X-API-Key': os.getenv('AI_API_KEY', ''), 'Content-Type': 'application/json'},
-                        timeout=120)
-                    log.info(f"  [DAILY LEARN] Claude response: status={resp.status_code} len={len(resp.text)}")
-                    if resp.status_code == 200:
-                        result = resp.json()
-                        # Log the full response for debugging
-                        try:
-                            pg.log_activity('DAILY_LEARN_RESPONSE', category='ai',
-                                reason=f"3AM Claude response: {len(resp.text)} chars, "
-                                       f"buy_list={len(result.get('buy_list', []))}, "
-                                       f"avoid_list={len(result.get('avoid_list', []))}, "
-                                       f"scalp_adj={len(result.get('scalp_adjustments', []))}",
-                                source='daily_claude',
-                                data={
-                                    'response_length': len(resp.text),
-                                    'response_preview': resp.text[:3000],
-                                    'keys': list(result.keys()) if isinstance(result, dict) else [],
-                                    'buy_list': result.get('buy_list', []),
-                                    'avoid_list': result.get('avoid_list', []),
-                                    'scalp_adjustments': result.get('scalp_adjustments', []),
-                                    'trail_adjustments': result.get('trail_adjustments', []),
-                                    'sold_too_early_fixes': result.get('sold_too_early_fixes', ''),
-                                    'key_insight': result.get('key_insight', ''),
-                                })
-                        except Exception as le:
-                            log.debug(f"  Response logging: {le}")
-                        log.info("  [DAILY LEARN] Claude analysis complete ✅")
-                        return result
-                    else:
-                        log.warning(f"  [DAILY LEARN] Claude API error: {resp.status_code} — {resp.text[:200]}")
-                        try:
-                            pg.log_activity('DAILY_LEARN_ERROR', category='ai',
-                                reason=f"Claude API error: {resp.status_code}",
-                                source='daily_claude',
-                                data={'status': resp.status_code, 'error': resp.text[:500]})
-                        except Exception:                                pass
 
-                if brain._gpt_available:
-                    log.info("  [DAILY LEARN] Using GPT-5.4 fallback...")
-                    result = brain.analyze_stock('PORTFOLIO', {'deep_analysis_prompt': prompt})
-                    log.info(f"  [DAILY LEARN] GPT response: {type(result)} keys={list(result.keys()) if isinstance(result, dict) else 'N/A'}")
-                    try:
-                        pg.log_activity('DAILY_LEARN_RESPONSE', category='ai',
-                            reason=f"3AM GPT fallback response",
-                            source='daily_gpt',
-                            data={'response': str(result)[:3000], 'model': 'GPT-5.4'})
-                    except Exception:                            pass
-                    return result
-            except Exception as e:
-                log.warning(f"  [DAILY LEARN] AI call failed: {e}")
+            # ══════════════════════════════════════════════════════════
+            # BATCHED AI CALLS — 3 focused prompts, each tries Claude → GPT
+            # This prevents throttling and ensures partial results on failure
+            # ══════════════════════════════════════════════════════════
+
+            import time as _t
+
+            def _ai_call(batch_name, batch_prompt, timeout=120):
+                """Send one AI batch. Try Claude -> GPT -> return empty dict."""
+                log.info(f"  [3AM] Batch '{batch_name}': {len(batch_prompt)} chars (~{len(batch_prompt)//4} tokens)")
+                _pg_log("DAILY_LEARN_BATCH", reason=f"Batch '{batch_name}': {len(batch_prompt)} chars",
+                        source="daily_batch", data={"batch": batch_name, "prompt_len": len(batch_prompt), "prompt_preview": batch_prompt[:1000]})
+                # Try Claude
                 try:
-                    pg.log_activity('DAILY_LEARN_ERROR', category='ai',
-                        reason=f"3AM AI call exception: {str(e)[:200]}",
-                        source='daily_claude',
-                        data={'error': str(e), 'traceback': traceback.format_exc()[:500]})
-                except Exception:                        pass
-            return {}
+                    if brain._claude_available:
+                        import requests as _rq
+                        resp = _rq.post(
+                            f"{os.getenv('AI_API_URL', 'https://ai.beast-trader.com')}/analyze",
+                            json={"prompt": batch_prompt, "system_prompt": f"Batch: {batch_name}. Output valid JSON only."},
+                            headers={"X-API-Key": os.getenv("AI_API_KEY", ""), "Content-Type": "application/json"},
+                            timeout=timeout)
+                        if resp.status_code == 200:
+                            try:
+                                r = resp.json()
+                                log.info(f"  [3AM] '{batch_name}' Claude OK ({len(resp.text)} chars)")
+                                return r
+                            except Exception:
+                                log.warning(f"  [3AM] '{batch_name}' Claude non-JSON: {resp.text[:150]}")
+                        else:
+                            log.warning(f"  [3AM] '{batch_name}' Claude HTTP {resp.status_code}")
+                except Exception as ce:
+                    log.warning(f"  [3AM] '{batch_name}' Claude: {ce}")
+                # Try GPT
+                try:
+                    if brain._gpt_available:
+                        log.info(f"  [3AM] '{batch_name}' trying GPT fallback...")
+                        r = brain.analyze_stock("PORTFOLIO", {"deep_analysis_prompt": batch_prompt})
+                        if r:
+                            if isinstance(r, dict) and "analysis" in r:
+                                inner = r.get("analysis", r)
+                                if isinstance(inner, str):
+                                    try:
+                                        r = _json.loads(inner)
+                                    except Exception:
+                                        r = {"raw": inner[:500]}
+                            log.info(f"  [3AM] '{batch_name}' GPT OK")
+                            return r
+                except Exception as ge:
+                    log.warning(f"  [3AM] '{batch_name}' GPT: {ge}")
+                log.warning(f"  [3AM] '{batch_name}' FAILED — both AI unavailable")
+                _pg_log("DAILY_LEARN_ERROR", reason=f"Batch '{batch_name}' failed (Claude+GPT)", source="daily_batch")
+                return {}
+
+            # ── BATCH 1: Market + Buy/Avoid ──
+            log.info("  [3AM] === BATCH 1/3: Market Analysis ===")
+            b1 = _ai_call("market", f"""Analyze today and produce buy/avoid for tomorrow. JSON only.
+BACKTESTS: {_json.dumps(backtest_data.get('what_if', {}), default=str)[:1200]}
+ACCURACY: {_json.dumps(decision_acc, default=str)[:400]}
+POSITIONS: {_json.dumps(held, default=str)[:500]}
+MARKET: {_json.dumps(market, default=str)[:250]}
+SECTORS: {_json.dumps(intel_data.get('sector_momentum', [])[:5], default=str)[:350]}
+Output: {{"buy_list": [{{"symbol":"X","reason":"why","confidence":80}}], "avoid_list": [{{"symbol":"X","reason":"why"}}], "sector_signal":"analysis", "key_insight":"finding", "risk_alerts":["risks"]}}""")
+            _t.sleep(5)
+
+            # ── BATCH 2: Exit Optimization ──
+            log.info("  [3AM] === BATCH 2/3: Exit Strategy ===")
+            b2 = _ai_call("exits", f"""Analyze sell/exit performance. Our #1 problem: selling too early. JSON only.
+PREMATURE_SELLS: {_json.dumps(v6_data.get('premature_sells', []), default=str)[:700]}
+SCALPS: {_json.dumps(v6_data.get('scalp_stats', [])[:12], default=str)[:500]}
+GRADED_TRADES: {_json.dumps(v6_data.get('graded_trades', [])[:12], default=str)[:700]}
+REBUYS: {_json.dumps(v6_data.get('rebuys', [])[:5], default=str)[:350]}
+WIN_RATES: {_json.dumps(v6_data.get('strategy_performance', []), default=str)[:350]}
+Output: {{"scalp_adjustments":[{{"symbol":"X","current_target_pct":2.0,"recommended_pct":4.0,"reason":"why"}}], "trail_adjustments":[{{"symbol":"X","current_trail_pct":3.0,"recommended_pct":4.5,"reason":"why"}}], "sold_too_early_fixes":"fixes", "strategy_adjustments":"changes"}}""")
+            _t.sleep(5)
+
+            # ── BATCH 3: Intelligence + Earnings ──
+            log.info("  [3AM] === BATCH 3/3: Stock Intelligence ===")
+            b3 = _ai_call("intelligence", f"""Analyze stock DNA and earnings patterns. JSON only.
+DNA: {_json.dumps(intel_data.get('stock_dna', [])[:12], default=str)[:700]}
+EARNINGS: {_json.dumps(intel_data.get('earnings_pattern', [])[:8], default=str)[:500]}
+STRATEGIES: {_json.dumps(intel_data.get('strategy_scores', [])[:8], default=str)[:500]}
+CATALYSTS: {_json.dumps(intel_data.get('catalyst', [])[:8], default=str)[:350]}
+MISSED: {_json.dumps(missed[:5], default=str)[:500]}
+TV_PATTERNS: {_json.dumps(tv_summary[:8], default=str)[:500]}
+Output: {{"earnings_plays":[{{"symbol":"X","play":"strategy"}}], "position_sizing":"guidance", "tomorrow_strategy":"playbook", "tv_learnings":"patterns", "missed_opportunities":"changes"}}""")
+
+            # ── MERGE ALL 3 BATCHES ──
+            result = {}
+            batch_success = 0
+            for name, batch in [("market", b1), ("exits", b2), ("intelligence", b3)]:
+                if isinstance(batch, dict) and batch:
+                    result.update(batch)
+                    batch_success += 1
+                    log.info(f"  [3AM] Merged '{name}': {len(batch)} keys")
+
+            log.info(f"  [3AM] === MERGE COMPLETE: {batch_success}/3 batches, {len(result)} total keys ===")
+
+            # Log final merged result
+            try:
+                pg.log_activity("DAILY_LEARN_RESPONSE", category="ai",
+                    reason=f"3AM batched ({batch_success}/3 OK): buy={len(result.get('buy_list',[]))}, "
+                           f"avoid={len(result.get('avoid_list',[]))}, "
+                           f"scalp_adj={len(result.get('scalp_adjustments',[]))}, "
+                           f"keys={list(result.keys())[:8]}",
+                    source="daily_batched",
+                    data={k: result.get(k, "") for k in [
+                        "buy_list","avoid_list","scalp_adjustments","trail_adjustments",
+                        "sold_too_early_fixes","key_insight","strategy_adjustments",
+                        "earnings_plays","position_sizing","tomorrow_strategy","tv_learnings"]})
+            except Exception as le:
+                log.warning(f"  Response logging: {le}")
+
+            return result if result else {"key_insight": "All 3 AI batches failed", "buy_list": [], "avoid_list": []}
+
 
         insights = await asyncio.to_thread(_gather_and_analyze)
         if not insights:
