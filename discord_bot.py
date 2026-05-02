@@ -4503,146 +4503,25 @@ async def claude_daily_deep_learn():
 
             log.info("  [DAILY LEARN] Step 4: Sending to AI for analysis...")
 
-            # ── LOG THE FULL PROMPT FOR DEBUGGING ──
-            prompt_len = len(prompt)
-            log.info(f"  [DAILY LEARN] Prompt length: {prompt_len} chars")
-            # Log prompt sections to PostgreSQL for debugging
+            # Log data summary to DB before AI calls
             try:
                 pg.log_activity('DAILY_LEARN_PROMPT', category='ai',
-                    reason=f"3AM prompt: {prompt_len} chars, "
-                           f"V6: {len(v6_data.get('premature_sells', []))} premature, "
-                           f"{len(v6_data.get('graded_trades', []))} graded, "
-                           f"{len(v6_data.get('catalysts', []))} catalysts | "
-                           f"Intel: {len(intel_data.get('stock_dna', []))} DNA, "
-                           f"{len(intel_data.get('earnings_pattern', []))} earnings",
+                    reason=f"3AM data: V6={len(v6_data.get('graded_trades',[]))} trades, "
+                           f"{len(v6_data.get('premature_sells',[]))} premature | "
+                           f"Intel={len(intel_data.get('stock_dna',[]))} DNA, "
+                           f"{len(intel_data.get('earnings_pattern',[]))} earnings | "
+                           f"backtest={'yes' if backtest_data else 'no'}",
                     source='daily_claude',
                     data={
-                        'prompt_length': prompt_len,
-                        'prompt_preview': prompt[:2000],
-                        'v6_summary': {
-                            'premature_sells': len(v6_data.get('premature_sells', [])),
-                            'graded_trades': len(v6_data.get('graded_trades', [])),
-                            'catalysts': len(v6_data.get('catalysts', [])),
-                            'rebuys': len(v6_data.get('rebuys', [])),
-                        },
-                        'intel_summary': {
-                            'stock_dna': len(intel_data.get('stock_dna', [])),
-                            'earnings_patterns': len(intel_data.get('earnings_pattern', [])),
-                            'strategy_scores': len(intel_data.get('strategy_scores', [])),
-                        },
-                        'data_sections': {
-                            'backtest': bool(backtest_data),
-                            'decision_accuracy': bool(decision_acc),
-                            'missed_trades': len(missed) if missed else 0,
-                            'win_rates': bool(win_rates),
-                            'positions': len(held),
-                            'tv_summary': len(tv_summary),
-                            'market': bool(market),
-                        }
+                        'v6_summary': {k: len(v) if isinstance(v, list) else 0 for k, v in v6_data.items()},
+                        'intel_summary': {k: len(v) if isinstance(v, list) else 0 for k, v in intel_data.items()},
+                        'has_backtest': bool(backtest_data),
+                        'positions': len(held),
                     })
-            except Exception as le:
-                log.debug(f"  Prompt logging: {le}")
+            except Exception:
+                pass
 
-            # ── STEP 4: AI ANALYSIS with institutional frameworks ──
-            prompt = f"""You are a senior portfolio manager at a top quantitative hedge fund.
-The bot has been trading all day. Now at 3 AM, you must analyze EVERYTHING
-and produce tomorrow's playbook. The bot will use your output ALL DAY tomorrow.
-
-THIS IS THE SELF-LEARNING LOOP: Your insights become the bot's intelligence.
-
-=== BACKTEST RESULTS (90-day historical simulation) ===
-What-if scenarios (would different settings have made more money?):
-{_json.dumps(backtest_data.get('what_if', {}), default=str)[:1500]}
-
-Historical strategy performance on key stocks:
-{_json.dumps({{k: v for k, v in backtest_data.items() if k != 'what_if'}}, default=str)[:2000]}
-
-=== OUR DECISION ACCURACY (last 7 days) ===
-{_json.dumps(decision_acc, default=str)[:500]}
-
-=== MISSED OPPORTUNITIES (we blocked these but they went UP) ===
-{_json.dumps(missed[:5], default=str)[:600]}
-
-=== STRATEGY WIN RATES (30 days of actual trades) ===
-{_json.dumps(win_rates, default=str)[:800]}
-
-=== TODAY'S DATA ===
-Positions: {_json.dumps(held, default=str)[:600]}
-TV patterns: {_json.dumps(tv_summary[:10], default=str)[:600]}
-Activity: {_json.dumps(activity_summary, default=str)[:400]}
-Blocks: {_json.dumps(tv_blocks[:5], default=str)[:300]}
-Earnings: {_json.dumps(earnings[:10], default=str)[:600]}
-Market: {_json.dumps(market, default=str)[:300]}
-VIX: {_json.dumps(fg, default=str)[:150]}
-Trends: {_json.dumps([{{'s': t.get('symbol'), 'i': t.get('insight','')[:50]}} for t in trends[:10]], default=str)[:600]}
-
-=== V6: SOLD TOO EARLY ANALYSIS (CRITICAL — this is our #1 problem) ===
-Premature sells (sold then stock kept running):
-{_json.dumps(v6_data.get('premature_sells', []), default=str)[:800]}
-
-Graded trades with 1h/4h outcomes:
-{_json.dumps(v6_data.get('graded_trades', [])[:10], default=str)[:800]}
-
-Runner catalysts (what made stocks move):
-{_json.dumps(v6_data.get('catalysts', [])[:10], default=str)[:600]}
-
-Sell→Rebuy events (bot sold then bought back higher):
-{_json.dumps(v6_data.get('rebuys', [])[:5], default=str)[:400]}
-
-Strategy performance by win rate:
-{_json.dumps(v6_data.get('strategy_performance', []), default=str)[:400]}
-
-=== INTELLIGENCE ENGINE DATA (deep stock analysis) ===
-Stock DNA profiles (personality of each stock):
-{_json.dumps(intel_data.get('stock_dna', [])[:15], default=str)[:800]}
-
-Earnings patterns (how stocks behave around earnings):
-{_json.dumps(intel_data.get('earnings_pattern', [])[:10], default=str)[:600]}
-
-Strategy scores (which strategy works on which stock):
-{_json.dumps(intel_data.get('strategy_scores', [])[:10], default=str)[:600]}
-
-Sector momentum (hot/cold sectors):
-{_json.dumps(intel_data.get('sector_momentum', [])[:5], default=str)[:400]}
-
-=== SPECIFIC QUESTIONS YOU MUST ANSWER ===
-1. Are our scalp targets too tight? Should we hold longer? What target % per stock?
-2. Are our trailing stops too tight? What ATR multiple should we use?
-3. Which stocks should NEVER be scalped (should be SWING or CORE positions)?
-4. What catalysts predict sustained runs vs dead-cat bounces?
-5. Based on premature sells data: which specific stocks and strategies need wider targets?
-6. Based on Stock DNA: what DNA type is each stock and what strategy matches?
-7. Based on earnings patterns: any upcoming earnings we should prepare for?
-8. Which sectors should we overweight/underweight tomorrow?
-
-=== USE THESE FRAMEWORKS ===
-1. BUFFETT: Moat, quality, hold winners. Which stocks have durable advantages?
-2. LYNCH: P/E growth, categorize each stock (stalwart/fast grower/turnaround)
-3. DALIO: Where in the cycle? Risk parity across sectors?
-4. LIVERMORE: Follow the trend. Only trade with the market direction.
-5. CANSLIM: Earnings growth + new products + institutional buying?
-6. MOMENTUM: Which stocks are winning? Don't fight the tape.
-7. MEAN REVERSION: Oversold bounces? RSI<30 setups for tomorrow?
-8. OUR BACKTESTS: Which strategy wins on which stock? Use the data above.
-9. MISSED TRADES: What should we change to not miss winners?
-10. RISK: Correlation risk? Too concentrated in one sector?
-
-=== OUTPUT (valid JSON) ===
-{{"buy_list": [{{"symbol": "X", "reason": "why (cite framework + backtest data)", "confidence": 80, "strategy": "best backtest strategy for this stock"}}],
-  "avoid_list": [{{"symbol": "X", "reason": "why (cite framework)"}}],
-  "sector_signal": "rotation analysis",
-  "earnings_plays": [{{"symbol": "X", "play": "specific play with entry/exit"}}],
-  "risk_alerts": ["specific risks"],
-  "tomorrow_strategy": "detailed playbook based on backtests + frameworks",
-  "key_insight": "most important discovery from the data",
-  "tv_learnings": "what TV patterns predict moves",
-  "missed_opportunities": "what settings to change (from what-if analysis)",
-  "strategy_adjustments": "which strategies to use more/less based on win rates",
-  "position_sizing": "which stocks deserve bigger positions based on backtest win rates",
-  "scalp_adjustments": [{{"symbol": "X", "current_target_pct": 2.0, "recommended_pct": 4.0, "reason": "runs +5% avg"}}],
-  "trail_adjustments": [{{"symbol": "X", "current_trail_pct": 3.0, "recommended_pct": 4.5, "reason": "ATR based"}}],
-  "sold_too_early_fixes": "specific recommendations to stop premature sells"}}"""
-
+            # ══════════════════════════════════════════════════════════
 
             # ══════════════════════════════════════════════════════════
             # BATCHED AI CALLS — 3 focused prompts, each tries Claude → GPT
