@@ -111,6 +111,143 @@ Azure VM → Azure GPT-5.4 (East US, "gpt54" deployment)
 3. Add `ANTHROPIC_API_KEY=...` to VM `.env`
 4. Bot auto-detects and starts using Claude — zero code changes needed
 
+## Local Machine Cleanup (May 3, 2026)
+
+After retiring the tunnel from code, the Cloudflare daemon was still running on the work laptop:
+
+### What Was Found
+| Item | State | Details |
+|------|-------|---------|
+| `cloudflared.exe` | **Running** (PID 6836) | Started Apr 28, 2026 — running 5 days serving nothing |
+| Cloudflared Windows Service | **Automatic** start | Would restart on every reboot |
+| Service command | `cloudflared tunnel run --token eyJh...` | Persistent tunnel with Cloudflare token |
+| Installed at | `C:\Program Files (x86)\cloudflared\cloudflared.exe` | Still installed (not uninstalled) |
+| copilot-api | Not running | Was not set up as a service |
+
+### What Was Done
+```powershell
+# 1. Stop the service
+Stop-Service -Name "Cloudflared" -Force
+
+# 2. Disable auto-start (won't run on reboot)
+Set-Service -Name "Cloudflared" -StartupType Disabled
+
+# 3. Verified: process killed, no tunnel processes running
+Get-Service -Name "Cloudflared"  # → Stopped, Disabled
+```
+
+### To Re-enable (if ever needed)
+```powershell
+Set-Service -Name "Cloudflared" -StartupType Automatic
+Start-Service -Name "Cloudflared"
+```
+
+### To Fully Uninstall (optional, not done)
+```powershell
+# Remove the service registration
+cloudflared service uninstall
+
+# Then uninstall via Programs & Features or:
+# Remove-Item "C:\Program Files (x86)\cloudflared" -Recurse -Force
+```
+
+### Cloudflare Account
+- The Cloudflare account may still have the tunnel and `beast-trader.com` domain configured
+- Login at https://dash.cloudflare.com to clean up if desired
+- Tunnels can be deleted from: Zero Trust → Networks → Tunnels
+- Domain can be removed from: Websites → beast-trader.com → Remove
+
+---
+
+## How to Rebuild the Tunnel From Scratch (if ever needed)
+
+### Step 1: Work Laptop — Install & Configure Cloudflared
+```powershell
+# Install cloudflared (if uninstalled)
+winget install Cloudflare.cloudflared
+
+# Login to Cloudflare (opens browser)
+cloudflared tunnel login
+
+# Create a new tunnel
+cloudflared tunnel create beast-ai
+
+# Note the tunnel ID and credentials file path it outputs
+# e.g., Tunnel ID: abc123-def456-...
+# Credentials: C:\Users\<you>\.cloudflared\abc123-def456.json
+```
+
+### Step 2: Work Laptop — Start the AI API Server
+```powershell
+# Install dependencies
+cd C:\OneBranch\Beast-Trader\archive_claude_tunnel
+pip install flask python-dotenv openai anthropic
+
+# Start the Flask AI server
+python ai_api_server.py
+# Should show: 🧠 AI API Server starting on port 5555...
+# Test: curl http://localhost:5555/health
+```
+
+### Step 3: Work Laptop — Start the Tunnel
+```powershell
+# Option A: Quick tunnel (random URL, no domain needed)
+cloudflared tunnel --url http://localhost:5555
+
+# Option B: Named tunnel with custom domain
+cloudflared tunnel route dns beast-ai ai.beast-trader.com
+cloudflared tunnel run beast-ai
+
+# Option C: Install as Windows service (auto-start on reboot)
+cloudflared service install
+# Then configure in: C:\Users\<you>\.cloudflared\config.yml
+```
+
+### Step 4: VM — Update .env
+```env
+# Add these to the VM's .env file
+AI_API_URL=https://ai.beast-trader.com    # or the random tunnel URL
+AI_API_KEY=beast-v3-sk-7f3a9e2b4d1c8f5e6a0b3d9c
+```
+
+### Step 5: Code — Restore Tunnel Fallback in ai_brain.py
+```python
+# Add back to top of ai_brain.py:
+CLAUDE_URL = os.getenv('AI_API_URL', '')
+CLAUDE_API_KEY = os.getenv('AI_API_KEY', '')
+
+# Add back to call_raw() after Claude Direct try block:
+# Try 2: Claude Tunnel (legacy proxy)
+if self._claude_available and not self._claude_direct:
+    try:
+        resp = requests.post(
+            f"{CLAUDE_URL}/analyze",
+            json={'prompt': prompt, 'system_prompt': system},
+            headers={'X-API-Key': CLAUDE_API_KEY, 'Content-Type': 'application/json'},
+            timeout=timeout)
+        if resp.status_code == 200:
+            result = resp.json()
+            return result
+    except Exception as e:
+        log.warning(f"Claude tunnel error: {e}")
+```
+
+### Step 6: Verify End-to-End
+```bash
+# From VM, test the tunnel:
+curl -X POST https://ai.beast-trader.com/analyze \
+  -H "X-API-Key: beast-v3-sk-7f3a9e2b4d1c8f5e6a0b3d9c" \
+  -H "Content-Type: application/json" \
+  -d '{"symbol": "AAPL"}'
+```
+
+### ⚠️ Remember Why We Retired This
+- Laptop must be ON, UNLOCKED, and VPN-connected 24/7
+- 3AM learning will fail if laptop sleeps
+- Cloudflare free tunnel URLs change on restart (unless using named tunnel)
+- Much better alternative: Direct Anthropic API or Azure Foundry Claude
+
 ---
 
 *Document created: May 3, 2026 — before removing tunnel code from codebase*
+*Updated: May 3, 2026 — local machine cleanup + full rebuild guide documented*
