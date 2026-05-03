@@ -1,24 +1,30 @@
 """
-Beast V3 — Hybrid AI Brain
+Beast V6 — AI Brain
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
-TWO AI engines working together:
 
-EVERY 5 MIN → Azure GPT-5.4 (fast, structured, maxed-out analysis)
-  - Gets ALL data: TV indicators, sentiment, confidence, positions
-  - References the last Claude deep intel briefing
-  - Returns: action, confidence, reasoning, targets
+CURRENT SETUP (V6):
+  ALL SCANS → Azure GPT-5.4 (gpt54 deployment on East US)
+    - 5-min scans: analyze_batch() — 16 stocks per batch
+    - 30-min deep: deep_analyze() — 8 stocks, deeper prompts
+    - 1-hr learning: analyze_stock() — 20 watchlist stocks
+    - 3AM daily learning: call_raw() — 3 batched prompts for playbook
 
-EVERY 30 MIN → Claude Opus 4.7 via work laptop tunnel (ULTRA DEEP)
-  - Full bull/bear institutional debate
-  - Multi-scenario analysis (best/worst/likely)
-  - Sector correlation check
-  - Earnings risk assessment
-  - Produces "Deep Intel Briefing" that GPT-5.4 reads
+CLAUDE STATUS: DISABLED (placeholder for future)
+  - Tunnel proxy (ai.beast-trader.com) removed — was unreliable
+  - Direct Anthropic API ready — just add ANTHROPIC_API_KEY to .env
+  - Auto-enables when key is set: CLAUDE_ENABLED = bool(ANTHROPIC_API_KEY)
 
-Both AIs are told: "You are the world's best stock trader.
-You do TradingView technical analysis on EVERY scan."
+TOKEN TRACKING:
+  - Every GPT call logs input_tokens + output_tokens to _ai_stats
+  - brain.get_token_stats() returns session totals + estimated USD cost
+  - Needed for 2 weeks to estimate Claude costs before purchasing
 
-Fallback: deterministic rules if both are offline.
+BRANCH RULES:
+  - V5 branch (feature/beast-v5-pro-upgrades) = production, DO NOT MODIFY
+  - V6 branch (feature/beast-v6-direct-claude) = AI changes go here
+  - Merge V6 → V5 only after testing
+
+Fallback chain: GPT-5.4 → Claude (when enabled) → deterministic rules
 """
 import os
 import logging
@@ -29,36 +35,62 @@ import threading
 from datetime import datetime
 from openai import AzureOpenAI
 
-log = logging.getLogger('Beast.HybridAI')
+log = logging.getLogger('Beast.AI')
 
-# ── Azure GPT-5.4 (ONLY model — no 4o fallback) ──
+# ═══════════════════════════════════════════════════════════
+# AZURE GPT-5.4 CONFIG
+# This is the ONLY active AI model. All scans use this.
+# Deployment name: "gpt54" on Azure East US
+# ═══════════════════════════════════════════════════════════
 AZURE_ENDPOINT = os.getenv('AZURE_OPENAI_ENDPOINT', 'https://eastus.api.cognitive.microsoft.com/')
 AZURE_KEY = os.getenv('AZURE_OPENAI_KEY', '')
-AZURE_DEPLOYMENT = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt54')  # GPT-5.4 — the only model
+AZURE_DEPLOYMENT = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt54')
 AZURE_API_VERSION = '2024-10-21'
 
-# ── Claude API (DISABLED — placeholder for future) ──
-# Enable when: ANTHROPIC_API_KEY is set AND CLAUDE_ENABLED = True
-# Code ready: call_raw() method supports direct Anthropic API
-# Cost estimate needed: see v7-token-tracking todo
+# ═══════════════════════════════════════════════════════════
+# CLAUDE API — DISABLED (placeholder for future)
+#
+# HOW TO ENABLE:
+#   1. Buy key at console.anthropic.com
+#   2. Add to .env: ANTHROPIC_API_KEY=sk-ant-...
+#   3. Bot auto-enables (CLAUDE_ENABLED = bool(key))
+#   4. call_raw() will prefer Claude over GPT for 3AM learning
+#
+# COST ESTIMATES (need 2 weeks of token tracking first):
+#   Sonnet 4 for all scans: ~$77/mo
+#   Opus 4.7 for 3AM only:  ~$3/mo
+#   See AI_ARCHITECTURE.md for full breakdown
+# ═══════════════════════════════════════════════════════════
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
-CLAUDE_URL = os.getenv('AI_API_URL', '')  # Legacy tunnel — disabled
+CLAUDE_URL = os.getenv('AI_API_URL', '')  # Legacy tunnel — REMOVED, don't use
 CLAUDE_API_KEY = os.getenv('AI_API_KEY', '')
 CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', 'claude-sonnet-4-20250514')
-CLAUDE_ENABLED = bool(ANTHROPIC_API_KEY)  # Auto-enable when key is added
+CLAUDE_ENABLED = bool(ANTHROPIC_API_KEY)  # Flips to True when key is added
 
-# ── Rate limiting + AI health tracking + TOKEN TRACKING ──
+# ═══════════════════════════════════════════════════════════
+# TOKEN TRACKING + RATE LIMITING
+#
+# WHY: We need accurate token counts to estimate Claude costs.
+# Every GPT call increments gpt_input_tokens and gpt_output_tokens.
+# After 2 weeks: brain.get_token_stats() → accurate monthly estimate.
+#
+# Rate limit: 2s between calls to avoid Azure 429 errors.
+# Stats tracked: calls, successes, errors, 429s, tokens, latency.
+# ═══════════════════════════════════════════════════════════
 _ai_last_call = 0
 _ai_lock = threading.Lock()
 _ai_stats = {
+    # GPT-5.4 stats
     'gpt_calls': 0, 'gpt_success': 0, 'gpt_errors': 0, 'gpt_429s': 0,
     'gpt_total_ms': 0, 'gpt_last_error': '', 'gpt_last_success': '',
-    'gpt_input_tokens': 0, 'gpt_output_tokens': 0,  # Token tracking for cost estimation
+    'gpt_input_tokens': 0,   # Running total — for cost estimation
+    'gpt_output_tokens': 0,  # Running total — for cost estimation
+    # Claude stats (will populate when enabled)
     'claude_calls': 0, 'claude_success': 0, 'claude_errors': 0,
     'claude_total_ms': 0, 'claude_last_error': '',
     'claude_input_tokens': 0, 'claude_output_tokens': 0,
 }
-AI_MIN_INTERVAL = 2  # 2 seconds between calls (300 RPM = 5/sec, but be safe)
+AI_MIN_INTERVAL = 2  # seconds between calls (Azure allows 300 RPM)
 
 def _rate_limit_gpt():
     """Wait if needed to avoid 429s."""
