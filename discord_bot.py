@@ -4622,7 +4622,7 @@ async def claude_daily_deep_learn():
             import time as _t
 
             def _ai_call(batch_name, batch_prompt, timeout=120):
-                """Send one AI batch via brain.call_raw() — tries Claude Direct → Tunnel → GPT Raw."""
+                """Send one AI batch via brain.call_raw() — tries Claude Direct → GPT Raw."""
                 log.info(f"  [3AM] Batch '{batch_name}': {len(batch_prompt)} chars (~{len(batch_prompt)//4} tokens)")
                 _pg_log("DAILY_LEARN_BATCH", reason=f"Batch '{batch_name}': {len(batch_prompt)} chars",
                         source="daily_batch", data={"batch": batch_name, "prompt_len": len(batch_prompt), "prompt_preview": batch_prompt[:1000]})

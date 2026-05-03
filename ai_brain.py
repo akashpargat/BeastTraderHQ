@@ -10,7 +10,7 @@ CURRENT SETUP (V6):
     - 3AM daily learning: call_raw() — 3 batched prompts for playbook
 
 CLAUDE STATUS: DISABLED (placeholder for future)
-  - Tunnel proxy (ai.beast-trader.com) removed — was unreliable
+  - Tunnel retired — see archive_claude_tunnel/TUNNEL_HISTORY.md
   - Direct Anthropic API ready — just add ANTHROPIC_API_KEY to .env
   - Auto-enables when key is set: CLAUDE_ENABLED = bool(ANTHROPIC_API_KEY)
 
@@ -62,8 +62,6 @@ AZURE_API_VERSION = '2024-10-21'
 #   See AI_ARCHITECTURE.md for full breakdown
 # ═══════════════════════════════════════════════════════════
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
-CLAUDE_URL = os.getenv('AI_API_URL', '')  # Legacy tunnel — REMOVED, don't use
-CLAUDE_API_KEY = os.getenv('AI_API_KEY', '')
 CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', 'claude-sonnet-4-20250514')
 CLAUDE_ENABLED = bool(ANTHROPIC_API_KEY)  # Flips to True when key is added
 
@@ -241,7 +239,7 @@ class AIBrain:
     def __init__(self):
         self._gpt_available = False
         self._claude_available = False
-        self._claude_direct = False  # True = Anthropic API, False = tunnel
+        self._claude_direct = False  # True when using Direct Anthropic API
         self._azure_client = None
 
         # Check Azure GPT-5.4
@@ -305,7 +303,7 @@ class AIBrain:
     # ══════════════════════════════════════════════════
     # RAW PROMPT CALL — for 3AM batched learning
     # Sends prompt directly, returns parsed JSON dict
-    # Tries: Claude Direct → Claude Tunnel → GPT Raw → {}
+    # Tries: Claude Direct → GPT Raw → {}
     # ══════════════════════════════════════════════════
 
     def call_raw(self, prompt: str, system: str = "Output valid JSON only.",
@@ -353,25 +351,7 @@ class AIBrain:
             except Exception as e:
                 log.warning(f"  [AI] Claude direct error: {e}")
 
-        # Try 2: Claude Tunnel (legacy proxy)
-        if self._claude_available and not self._claude_direct:
-            try:
-                resp = requests.post(
-                    f"{CLAUDE_URL}/analyze",
-                    json={'prompt': prompt, 'system_prompt': system},
-                    headers={'X-API-Key': CLAUDE_API_KEY, 'Content-Type': 'application/json'},
-                    timeout=timeout)
-                if resp.status_code == 200:
-                    try:
-                        result = resp.json()
-                        log.info(f"  [AI] Claude tunnel OK ({len(resp.text)} chars)")
-                        return result
-                    except Exception:
-                        log.warning(f"  [AI] Claude tunnel non-JSON")
-            except Exception as e:
-                log.warning(f"  [AI] Claude tunnel error: {e}")
-
-        # Try 3: Azure GPT Raw (direct OpenAI call, NOT analyze_stock)
+        # Try 2: Azure GPT Raw (direct OpenAI call, NOT analyze_stock)
         if self._gpt_available and self._azure_client:
             try:
                 t0 = time.time()
