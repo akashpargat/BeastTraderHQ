@@ -1,24 +1,30 @@
 """
-Beast V3 — Hybrid AI Brain
+Beast V6 — AI Brain
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
-TWO AI engines working together:
 
-EVERY 5 MIN → Azure GPT-4o (fast, structured, maxed-out analysis)
-  - Gets ALL data: TV indicators, sentiment, confidence, positions
-  - References the last Claude deep intel briefing
-  - Returns: action, confidence, reasoning, targets
+CURRENT SETUP (V6):
+  ALL SCANS → Azure GPT-5.4 (gpt54 deployment on East US)
+    - 5-min scans: analyze_batch() — 16 stocks per batch
+    - 30-min deep: deep_analyze() — 8 stocks, deeper prompts
+    - 1-hr learning: analyze_stock() — 20 watchlist stocks
+    - 3AM daily learning: call_raw() — 3 batched prompts for playbook
 
-EVERY 30 MIN → Claude Opus 4.7 via work laptop tunnel (ULTRA DEEP)
-  - Full bull/bear institutional debate
-  - Multi-scenario analysis (best/worst/likely)
-  - Sector correlation check
-  - Earnings risk assessment
-  - Produces "Deep Intel Briefing" that GPT-4o reads
+CLAUDE STATUS: DISABLED (placeholder for future)
+  - Tunnel retired — see archive_claude_tunnel/TUNNEL_HISTORY.md
+  - Direct Anthropic API ready — just add ANTHROPIC_API_KEY to .env
+  - Auto-enables when key is set: CLAUDE_ENABLED = bool(ANTHROPIC_API_KEY)
 
-Both AIs are told: "You are the world's best stock trader.
-You do TradingView technical analysis on EVERY scan."
+TOKEN TRACKING:
+  - Every GPT call logs input_tokens + output_tokens to _ai_stats
+  - brain.get_token_stats() returns session totals + estimated USD cost
+  - Needed for 2 weeks to estimate Claude costs before purchasing
 
-Fallback: deterministic rules if both are offline.
+BRANCH RULES:
+  - V5 branch (feature/beast-v5-pro-upgrades) = production, DO NOT MODIFY
+  - V6 branch (feature/beast-v6-direct-claude) = AI changes go here
+  - Merge V6 → V5 only after testing
+
+Fallback chain: GPT-5.4 → Claude (when enabled) → deterministic rules
 """
 import os
 import logging
@@ -29,29 +35,60 @@ import threading
 from datetime import datetime
 from openai import AzureOpenAI
 
-log = logging.getLogger('Beast.HybridAI')
+log = logging.getLogger('Beast.AI')
 
-# ── Azure GPT-5.4 (primary) + GPT-4o (fallback) ──
+# ═══════════════════════════════════════════════════════════
+# AZURE GPT-5.4 CONFIG
+# This is the ONLY active AI model. All scans use this.
+# Deployment name: "gpt54" on Azure East US
+# ═══════════════════════════════════════════════════════════
 AZURE_ENDPOINT = os.getenv('AZURE_OPENAI_ENDPOINT', 'https://eastus.api.cognitive.microsoft.com/')
 AZURE_KEY = os.getenv('AZURE_OPENAI_KEY', '')
-AZURE_DEPLOYMENT = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt54')  # GPT-5.4 — upgraded from gpt4o
-AZURE_DEPLOYMENT_FALLBACK = 'gpt4o'  # Fallback if gpt54 fails
+AZURE_DEPLOYMENT = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt54')
 AZURE_API_VERSION = '2024-10-21'
 
-# ── Claude Opus 4.7 via tunnel (30-min deep scans) ──
-CLAUDE_URL = os.getenv('AI_API_URL', 'https://ai.beast-trader.com')
-CLAUDE_API_KEY = os.getenv('AI_API_KEY', 'beast-v3-sk-7f3a9e2b4d1c8f5e6a0b3d9c')
+# ═══════════════════════════════════════════════════════════
+# CLAUDE API — DISABLED (placeholder for future)
+#
+# HOW TO ENABLE:
+#   1. Buy key at console.anthropic.com
+#   2. Add to .env: ANTHROPIC_API_KEY=sk-ant-...
+#   3. Bot auto-enables (CLAUDE_ENABLED = bool(key))
+#   4. call_raw() will prefer Claude over GPT for 3AM learning
+#
+# COST ESTIMATES (need 2 weeks of token tracking first):
+#   Sonnet 4 for all scans: ~$77/mo
+#   Opus 4.7 for 3AM only:  ~$3/mo
+#   See AI_ARCHITECTURE.md for full breakdown
+# ═══════════════════════════════════════════════════════════
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
+CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', 'claude-sonnet-4-20250514')
+CLAUDE_ENABLED = bool(ANTHROPIC_API_KEY)  # Flips to True when key is added
 
-# ── Rate limiting + AI health tracking ──
+# ═══════════════════════════════════════════════════════════
+# TOKEN TRACKING + RATE LIMITING
+#
+# WHY: We need accurate token counts to estimate Claude costs.
+# Every GPT call increments gpt_input_tokens and gpt_output_tokens.
+# After 2 weeks: brain.get_token_stats() → accurate monthly estimate.
+#
+# Rate limit: 2s between calls to avoid Azure 429 errors.
+# Stats tracked: calls, successes, errors, 429s, tokens, latency.
+# ═══════════════════════════════════════════════════════════
 _ai_last_call = 0
 _ai_lock = threading.Lock()
 _ai_stats = {
+    # GPT-5.4 stats
     'gpt_calls': 0, 'gpt_success': 0, 'gpt_errors': 0, 'gpt_429s': 0,
     'gpt_total_ms': 0, 'gpt_last_error': '', 'gpt_last_success': '',
+    'gpt_input_tokens': 0,   # Running total — for cost estimation
+    'gpt_output_tokens': 0,  # Running total — for cost estimation
+    # Claude stats (will populate when enabled)
     'claude_calls': 0, 'claude_success': 0, 'claude_errors': 0,
     'claude_total_ms': 0, 'claude_last_error': '',
+    'claude_input_tokens': 0, 'claude_output_tokens': 0,
 }
-AI_MIN_INTERVAL = 2  # 2 seconds between calls (300 RPM = 5/sec, but be safe)
+AI_MIN_INTERVAL = 2  # seconds between calls (Azure allows 300 RPM)
 
 def _rate_limit_gpt():
     """Wait if needed to avoid 429s."""
@@ -197,14 +234,15 @@ Output valid JSON:
 
 
 class AIBrain:
-    """Hybrid AI: GPT-4o (5min) + Claude Opus (30min)."""
+    """Hybrid AI: GPT-5.4 (all scans) + Claude Opus (30min)."""
 
     def __init__(self):
         self._gpt_available = False
         self._claude_available = False
+        self._claude_direct = False  # True when using Direct Anthropic API
         self._azure_client = None
 
-        # Check Azure GPT-4o
+        # Check Azure GPT-5.4
         if AZURE_KEY:
             try:
                 self._azure_client = AzureOpenAI(
@@ -213,33 +251,148 @@ class AIBrain:
                     api_version=AZURE_API_VERSION,
                 )
                 self._gpt_available = True
-                log.info(f"🤖 Azure GPT-4o ONLINE ({AZURE_ENDPOINT})")
+                log.info(f"🤖 Azure GPT-5.4 ONLINE ({AZURE_ENDPOINT})")
             except Exception as e:
-                log.warning(f"Azure GPT-4o init failed: {e}")
+                log.warning(f"Azure GPT-5.4 init failed: {e}")
 
-        # Check Claude tunnel
-        try:
-            resp = requests.get(f"{CLAUDE_URL}/health", timeout=5)
-            if resp.status_code == 200 and resp.json().get('ai_available'):
-                self._claude_available = True
-                log.info(f"🧠 Claude Opus 4.7 ONLINE ({CLAUDE_URL})")
-            else:
-                log.warning("🧠 Claude reachable but AI unavailable")
-        except:
-            log.warning("🧠 Claude OFFLINE — GPT-4o only mode")
+        # Claude — only check if CLAUDE_ENABLED (auto-enables when ANTHROPIC_API_KEY set)
+        if CLAUDE_ENABLED and ANTHROPIC_API_KEY:
+            try:
+                resp = requests.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": CLAUDE_MODEL, "max_tokens": 50, "messages": [{"role": "user", "content": "Say OK"}]},
+                    timeout=10)
+                if resp.status_code == 200:
+                    self._claude_available = True
+                    self._claude_direct = True
+                    log.info(f"🧠 Claude ONLINE — Direct Anthropic API ({CLAUDE_MODEL})")
+                else:
+                    log.warning(f"🧠 Claude API error: {resp.status_code}")
+            except Exception as e:
+                log.warning(f"🧠 Claude API failed: {e}")
+
+        if not self._claude_available:
+            log.info("🧠 Claude DISABLED — GPT-only mode (set ANTHROPIC_API_KEY to enable)")
 
     @property
     def is_available(self) -> bool:
         return self._gpt_available or self._claude_available
 
     # ══════════════════════════════════════════════════
-    # 5-MIN SCAN: GPT-4o (fast, maxed out)
+    # TOKEN TRACKING — for cost estimation
+    # ══════════════════════════════════════════════════
+
+    def get_token_stats(self) -> dict:
+        """Get current session token usage for cost estimation."""
+        return {
+            'gpt_calls': _ai_stats['gpt_calls'],
+            'gpt_input_tokens': _ai_stats['gpt_input_tokens'],
+            'gpt_output_tokens': _ai_stats['gpt_output_tokens'],
+            'gpt_total_tokens': _ai_stats['gpt_input_tokens'] + _ai_stats['gpt_output_tokens'],
+            'claude_calls': _ai_stats['claude_calls'],
+            'claude_input_tokens': _ai_stats['claude_input_tokens'],
+            'claude_output_tokens': _ai_stats['claude_output_tokens'],
+            'claude_enabled': self._claude_available,
+            # Cost estimates (per MTok pricing)
+            'est_gpt_cost_usd': round(
+                _ai_stats['gpt_input_tokens'] / 1_000_000 * 2.50 +
+                _ai_stats['gpt_output_tokens'] / 1_000_000 * 10.0, 4),
+        }
+
+    # ══════════════════════════════════════════════════
+    # RAW PROMPT CALL — for 3AM batched learning
+    # Sends prompt directly, returns parsed JSON dict
+    # Tries: Claude Direct → GPT Raw → {}
+    # ══════════════════════════════════════════════════
+
+    def call_raw(self, prompt: str, system: str = "Output valid JSON only.",
+                 timeout: int = 120) -> dict:
+        """Send a raw prompt to AI and get JSON back. Used by 3AM learning.
+        Does NOT go through analyze_stock (which wraps in its own format)."""
+        import json as _json
+
+        # Try 1: Claude Direct (Anthropic API)
+        if self._claude_available and self._claude_direct and ANTHROPIC_API_KEY:
+            try:
+                t0 = time.time()
+                resp = requests.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": CLAUDE_MODEL,
+                        "max_tokens": 4096,
+                        "system": system,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                    timeout=timeout)
+                elapsed = int((time.time() - t0) * 1000)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    text = data.get('content', [{}])[0].get('text', '{}')
+                    # Extract JSON from possible markdown wrapping
+                    if '```json' in text:
+                        text = text.split('```json')[1].split('```')[0].strip()
+                    elif '```' in text:
+                        text = text.split('```')[1].split('```')[0].strip()
+                    try:
+                        result = _json.loads(text)
+                        log.info(f"  [AI] Claude direct OK ({elapsed}ms, {len(text)} chars)")
+                        return result
+                    except _json.JSONDecodeError:
+                        log.warning(f"  [AI] Claude direct non-JSON: {text[:150]}")
+                        return {'raw_response': text[:1000]}
+                else:
+                    log.warning(f"  [AI] Claude direct HTTP {resp.status_code}: {resp.text[:150]}")
+            except Exception as e:
+                log.warning(f"  [AI] Claude direct error: {e}")
+
+        # Try 2: Azure GPT Raw (direct OpenAI call, NOT analyze_stock)
+        if self._gpt_available and self._azure_client:
+            try:
+                t0 = time.time()
+                response = self._azure_client.chat.completions.create(
+                    model=AZURE_DEPLOYMENT,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.3,
+                    max_tokens=4096,
+                    response_format={"type": "json_object"},
+                )
+                elapsed = int((time.time() - t0) * 1000)
+                usage = response.usage if hasattr(response, 'usage') and response.usage else None
+                tok_in = usage.prompt_tokens if usage else 0
+                tok_out = usage.completion_tokens if usage else 0
+                _ai_stats['gpt_input_tokens'] += tok_in
+                _ai_stats['gpt_output_tokens'] += tok_out
+                text = response.choices[0].message.content or '{}'
+                try:
+                    result = _json.loads(text)
+                    log.info(f"  [AI] GPT-5.4 raw OK ({elapsed}ms, {tok_in}+{tok_out} tok, daily={_ai_stats['gpt_input_tokens']+_ai_stats['gpt_output_tokens']:,})")
+                    return result
+                except _json.JSONDecodeError:
+                    log.warning(f"  [AI] GPT-5.4 raw non-JSON: {text[:150]}")
+                    return {'raw_response': text[:1000]}
+            except Exception as e:
+                log.warning(f"  [AI] GPT-5.4 raw error: {e}")
+
+        log.warning("  [AI] All AI providers failed for raw call")
+        return {}
+
+    # ══════════════════════════════════════════════════
+    # 5-MIN SCAN: GPT-5.4 (fast, maxed out)
     # ══════════════════════════════════════════════════
 
     def analyze_stock(self, symbol: str, data: dict) -> dict:
         """5-min scan: GPT-5.4 primary → Claude fallback → deterministic."""
         if self._gpt_available:
-            return self._gpt4o_analyze(symbol, data)
+            return self._gpt_analyze(symbol, data)
         elif self._claude_available:
             log.info(f"  [AI] GPT offline — using Claude quick for {symbol}")
             return self._claude_quick(symbol, data)
@@ -326,7 +479,9 @@ Rules: RSI>75=SELL. RSI<30=BUY. PnL>+3% momentum=ADD_MORE. PnL<-5% bad sentiment
             usage = response.usage if hasattr(response, 'usage') and response.usage else None
             tokens_in = usage.prompt_tokens if usage else 0
             tokens_out = usage.completion_tokens if usage else 0
-            log.info(f"  [AI GPT-5.4] BATCH done — {elapsed_ms}ms | {tokens_in}+{tokens_out}={tokens_in+tokens_out} tokens")
+            _ai_stats['gpt_input_tokens'] += tokens_in
+            _ai_stats['gpt_output_tokens'] += tokens_out
+            log.info(f"  [AI GPT-5.4] BATCH done — {elapsed_ms}ms | {tokens_in}+{tokens_out}={tokens_in+tokens_out} tokens | daily_total={_ai_stats['gpt_input_tokens']+_ai_stats['gpt_output_tokens']:,}")
 
             raw_content = response.choices[0].message.content
             if tokens_out >= 3900:
@@ -374,17 +529,17 @@ Rules: RSI>75=SELL. RSI<30=BUY. PnL>+3% momentum=ADD_MORE. PnL<-5% bad sentiment
             return {sym: self._deterministic_fallback(sym, data) for sym, data in stocks_data.items()}
 
     def deep_analysis(self, symbol: str, data: dict) -> dict:
-        """30-min ultra deep: Claude Opus preferred, GPT-4o fallback."""
+        """30-min ultra deep: Claude Opus preferred, GPT-5.4."""
         if self._claude_available:
             result = self._claude_deep(symbol, data)
             if result:
                 _last_deep_briefing[symbol] = result
             return result
         elif self._gpt_available:
-            return self._gpt4o_analyze(symbol, data)
+            return self._gpt_analyze(symbol, data)
         return self._deterministic_fallback(symbol, data)
 
-    def _gpt4o_analyze(self, symbol: str, data: dict) -> dict:
+    def _gpt_analyze(self, symbol: str, data: dict) -> dict:
         """GPT-5.4: EXTREME per-stock analysis with all data sources."""
         try:
             deep_ref = ""
@@ -428,6 +583,8 @@ Trade decision? JSON: action, confidence (30-100 never 0), reasoning (20 words m
             usage = response.usage if hasattr(response, 'usage') and response.usage else None
             tokens_in = usage.prompt_tokens if usage else 0
             tokens_out = usage.completion_tokens if usage else 0
+            _ai_stats['gpt_input_tokens'] += tokens_in
+            _ai_stats['gpt_output_tokens'] += tokens_out
 
             raw_content = response.choices[0].message.content
             result = _safe_parse_json(raw_content)
@@ -438,8 +595,10 @@ Trade decision? JSON: action, confidence (30-100 never 0), reasoning (20 words m
             result['scan_type'] = '5min'
             result['response_ms'] = elapsed_ms
             result['tokens_used'] = tokens_in + tokens_out
+            result['tokens_in'] = tokens_in
+            result['tokens_out'] = tokens_out
             log.info(f"  [AI GPT-5.4] {symbol}: {result.get('action')} ({result.get('confidence')}%) "
-                     f"[{elapsed_ms}ms, {tokens_in+tokens_out} tokens] — {str(result.get('key_signal',''))[:50]}")
+                     f"[{elapsed_ms}ms, {tokens_in}+{tokens_out} tok] — {str(result.get('key_signal',''))[:50]}")
             return result
 
         except Exception as e:
@@ -481,13 +640,13 @@ Trade decision? JSON: action, confidence (30-100 never 0), reasoning (20 words m
 
         if self._claude_available:
             result = self._claude_deep(symbol, data)
-            # Cache for GPT-4o to reference
+            # Cache for GPT-5.4 to reference
             _last_deep_briefing[symbol] = result
             _last_deep_time = datetime.now()
             return result
         elif self._gpt_available:
-            # Fallback: use GPT-4o with deeper prompt
-            return self._gpt4o_analyze(symbol, data)
+            # Fallback: use GPT-5.4 with deeper prompt
+            return self._gpt_analyze(symbol, data)
         return self._deterministic_fallback(symbol, data)
 
     def _claude_deep(self, symbol: str, data: dict) -> dict:
@@ -515,7 +674,7 @@ Trade decision? JSON: action, confidence (30-100 never 0), reasoning (20 words m
         return self._deterministic_fallback(symbol, data)
 
     def _claude_quick(self, symbol: str, data: dict) -> dict:
-        """Claude fallback for 5-min when GPT-4o is down."""
+        """Claude fallback for 5-min when GPT-5.4 is down."""
         try:
             data['symbol'] = symbol
             resp = requests.post(
@@ -538,11 +697,11 @@ Trade decision? JSON: action, confidence (30-100 never 0), reasoning (20 words m
     # ══════════════════════════════════════════════════
 
     def bull_bear_debate(self, symbol: str, data: dict) -> dict:
-        """Full bull vs bear debate — uses Claude if available, else GPT-4o."""
+        """Full bull vs bear debate — uses Claude if available, else GPT-5.4."""
         if self._claude_available:
             return self.deep_analyze(symbol, data)
         elif self._gpt_available:
-            return self._gpt4o_analyze(symbol, data)
+            return self._gpt_analyze(symbol, data)
         return {'bull_case': '', 'bear_case': '', 'verdict': 'HOLD',
                 'bull_confidence': 50, 'bear_confidence': 50}
 

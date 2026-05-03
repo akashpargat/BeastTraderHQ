@@ -187,7 +187,7 @@ class BeastModeLoop:
         self.sectors = SectorScanner()
         self.notify = Notifier()
 
-        # AI Brain (remote via tunnel)
+        # AI Brain (Azure GPT-5.4 direct)
         self.ai = None
         try:
             from ai_brain import AIBrain

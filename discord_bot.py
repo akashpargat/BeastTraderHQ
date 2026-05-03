@@ -204,6 +204,18 @@ try:
 except Exception as e:
     _slog(f'  ⚠️ V6 IntelligenceEngine FAILED: {e}', 'WARNING')
 
+# V6: Market-Aware Scheduler (saves 74% AI costs)
+_sched_available = False
+_sched_last_run = {}  # task_name → last run timestamp
+_event_trigger = None
+try:
+    from market_scheduler import should_task_run, get_market_period, log_schedule_status, EventTrigger, ai_should_run
+    _sched_available = True
+    _event_trigger = EventTrigger()
+    _slog('  ✅ V6 MarketScheduler loaded — AI off at night/weekend, runner 24/7')
+except Exception as e:
+    _slog(f'  ⚠️ V6 MarketScheduler FAILED (running 24/7 mode): {e}', 'WARNING')
+
 _slog('Initializing Alpaca data client...')
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockSnapshotRequest
@@ -2361,6 +2373,12 @@ def _is_trading_hours() -> bool:
 @tasks.loop(seconds=60)
 async def position_monitor():
     """Every 60s: check positions, alert drops, auto-scalp, auto-protect, auto-buy dips."""
+    # V6 Scheduler: check if this task should run now
+    if _sched_available:
+        _now = time.time()
+        if not should_task_run("position_monitor", _sched_last_run.get("position_monitor", 0), _now):
+            return
+        _sched_last_run["position_monitor"] = _now
     global _prev_prices, _cycle_count, _cached_vix
     _cycle_count += 1
     pg = _get_pg()
@@ -2792,6 +2810,13 @@ async def full_scan():
     DEEP LOGGED: Every scan saved as a complete snapshot for learning."""
     global _last_full_scan
     try:
+        # V6 Scheduler: check if this task should run now
+        if _sched_available:
+            _now = time.time()
+            if not should_task_run("full_scan", _sched_last_run.get("full_scan", 0), _now):
+                return
+            _sched_last_run["full_scan"] = _now
+
         channel = bot.get_channel(SCAN_CHANNEL_ID)
         if not channel:
             return
@@ -3342,6 +3367,13 @@ async def full_scan():
 async def decision_report():
     """Every 10 min: trading decisions with AI, strategy breakdown, risk analysis."""
     try:
+        # V6 Scheduler: check if this task should run now
+        if _sched_available:
+            _now = time.time()
+            if not should_task_run("decision_report", _sched_last_run.get("decision_report", 0), _now):
+                return
+            _sched_last_run["decision_report"] = _now
+
         channel = bot.get_channel(SCAN_CHANNEL_ID)
         if not channel:
             return
@@ -3453,6 +3485,13 @@ async def fast_runner_scan():
     Finds stocks running >3%, checks sentiment, auto-buys if confidence high.
     This is the FASTEST money-making loop — catches runners before they're gone."""
     try:
+        # V6 Scheduler: check if this task should run now
+        if _sched_available:
+            _now = time.time()
+            if not should_task_run("fast_runner_scan", _sched_last_run.get("fast_runner_scan", 0), _now):
+                return
+            _sched_last_run["fast_runner_scan"] = _now
+
         from datetime import datetime
         from zoneinfo import ZoneInfo
         now = datetime.now(ZoneInfo("America/New_York"))
@@ -3525,6 +3564,31 @@ async def fast_runner_scan():
 
         log.info(f"  🏃 Runner scan: {len(runners)} stocks running >3%")
         _pg_log("RUNNER_SCAN", reason=f"{len(runners)} stocks running >3%", source="2min")
+
+        # V6: Event trigger — if outside market hours, fire immediate AI scan
+        if _sched_available and _event_trigger and not ai_should_run():
+            for r in runners[:3]:
+                evt = _event_trigger.check_event(r['symbol'], r.get('price', 0))
+                if evt.get('triggered'):
+                    log.info(f"  ⚡ [EVENT] {evt['reason']} — triggering AI scan outside market hours")
+                    _pg_log("EVENT_TRIGGER", symbol=r['symbol'],
+                            reason=f"Runner event: {evt['reason']} — firing AI scan",
+                            source="runner_event")
+                    # Fire immediate single-stock AI analysis
+                    try:
+                        if brain and brain.is_available:
+                            ai_result = brain.analyze_stock(r['symbol'], {
+                                'price': r.get('price', 0),
+                                'rsi': 50, 'macd_hist': 0, 'vwap_above': True,
+                                'sentiment': 0, 'volume_ratio': r.get('volume', 0) / 100000,
+                                'regime': 'BULL', 'confidence_engine': 60,
+                            })
+                            log.info(f"  ⚡ [EVENT] AI verdict for {r['symbol']}: {ai_result.get('action')} ({ai_result.get('confidence')}%)")
+                            _pg_log("EVENT_AI_VERDICT", symbol=r['symbol'],
+                                    reason=f"Event AI: {ai_result.get('action')} conf={ai_result.get('confidence')}%",
+                                    source="runner_event", data=ai_result)
+                    except Exception as ae:
+                        log.warning(f"  ⚡ [EVENT] AI scan failed: {ae}")
 
         acct = gateway.get_account()
         equity = float(acct.get('equity', 100000))
@@ -3606,6 +3670,12 @@ async def claude_deep_scan():
     Claude's briefing is cached → GPT-4o references it in subsequent 5-min scans.
     """
     try:
+        # V6 Scheduler: check if this task should run now
+        if _sched_available:
+            _now = time.time()
+            if not should_task_run("claude_deep_scan", _sched_last_run.get("claude_deep_scan", 0), _now):
+                return
+            _sched_last_run["claude_deep_scan"] = _now
         channel = bot.get_channel(SCAN_CHANNEL_ID)
         if not channel:
             return
@@ -4017,6 +4087,13 @@ async def ai_background_learning():
     Uses yfinance for 90-day history, GPT-4o for pattern analysis.
     Runs in background — doesn't block trading."""
     try:
+        # V6 Scheduler: check if this task should run now
+        if _sched_available:
+            _now = time.time()
+            if not should_task_run("ai_background_learning", _sched_last_run.get("ai_background_learning", 0), _now):
+                return
+            _sched_last_run["ai_background_learning"] = _now
+
         pg = _get_pg()
         if not pg:
             return
@@ -4251,6 +4328,13 @@ async def outcome_grader():
     """Every 30 min: Grade past trade decisions — did we make the right call?
     This is what makes the bot ACTUALLY learn. Without this, learning is fake."""
     try:
+        # V6 Scheduler: check if this task should run now
+        if _sched_available:
+            _now = time.time()
+            if not should_task_run("outcome_grader", _sched_last_run.get("outcome_grader", 0), _now):
+                return
+            _sched_last_run["outcome_grader"] = _now
+
         pg = _get_pg()
         if not pg:
             return
@@ -4395,6 +4479,13 @@ async def claude_daily_deep_learn():
     """Once per day (3 AM ET): Claude EXTREME deep analysis on all trends.
     Takes everything hourly learning found → asks Claude for playbook."""
     try:
+        # V6 Scheduler: check if this task should run now
+        if _sched_available:
+            _now = time.time()
+            if not should_task_run("claude_daily_deep_learn", _sched_last_run.get("claude_daily_deep_learn", 0), _now):
+                return
+            _sched_last_run["claude_daily_deep_learn"] = _now
+
         pg = _get_pg()
         if not pg or not brain:
             return
@@ -4531,47 +4622,23 @@ async def claude_daily_deep_learn():
             import time as _t
 
             def _ai_call(batch_name, batch_prompt, timeout=120):
-                """Send one AI batch. Try Claude -> GPT -> return empty dict."""
+                """Send one AI batch via brain.call_raw() — tries Claude Direct → GPT Raw."""
                 log.info(f"  [3AM] Batch '{batch_name}': {len(batch_prompt)} chars (~{len(batch_prompt)//4} tokens)")
                 _pg_log("DAILY_LEARN_BATCH", reason=f"Batch '{batch_name}': {len(batch_prompt)} chars",
                         source="daily_batch", data={"batch": batch_name, "prompt_len": len(batch_prompt), "prompt_preview": batch_prompt[:1000]})
-                # Try Claude
                 try:
-                    if brain._claude_available:
-                        import requests as _rq
-                        resp = _rq.post(
-                            f"{os.getenv('AI_API_URL', 'https://ai.beast-trader.com')}/analyze",
-                            json={"prompt": batch_prompt, "system_prompt": f"Batch: {batch_name}. Output valid JSON only."},
-                            headers={"X-API-Key": os.getenv("AI_API_KEY", ""), "Content-Type": "application/json"},
-                            timeout=timeout)
-                        if resp.status_code == 200:
-                            try:
-                                r = resp.json()
-                                log.info(f"  [3AM] '{batch_name}' Claude OK ({len(resp.text)} chars)")
-                                return r
-                            except Exception:
-                                log.warning(f"  [3AM] '{batch_name}' Claude non-JSON: {resp.text[:150]}")
-                        else:
-                            log.warning(f"  [3AM] '{batch_name}' Claude HTTP {resp.status_code}")
-                except Exception as ce:
-                    log.warning(f"  [3AM] '{batch_name}' Claude: {ce}")
-                # Try GPT
-                try:
-                    if brain._gpt_available:
-                        log.info(f"  [3AM] '{batch_name}' trying GPT fallback...")
-                        r = brain.analyze_stock("PORTFOLIO", {"deep_analysis_prompt": batch_prompt})
-                        if r:
-                            if isinstance(r, dict) and "analysis" in r:
-                                inner = r.get("analysis", r)
-                                if isinstance(inner, str):
-                                    try:
-                                        r = _json.loads(inner)
-                                    except Exception:
-                                        r = {"raw": inner[:500]}
-                            log.info(f"  [3AM] '{batch_name}' GPT OK")
-                            return r
-                except Exception as ge:
-                    log.warning(f"  [3AM] '{batch_name}' GPT: {ge}")
+                    r = brain.call_raw(
+                        batch_prompt,
+                        system=f"You are a senior quant PM. Batch: {batch_name}. Output valid JSON only. No markdown, no explanation, just the JSON object.",
+                        timeout=timeout
+                    )
+                    if r:
+                        log.info(f"  [3AM] '{batch_name}' OK: {list(r.keys())[:6]}")
+                        return r
+                    else:
+                        log.warning(f"  [3AM] '{batch_name}' returned empty")
+                except Exception as e:
+                    log.warning(f"  [3AM] '{batch_name}' error: {e}")
                 log.warning(f"  [3AM] '{batch_name}' FAILED — both AI unavailable")
                 _pg_log("DAILY_LEARN_ERROR", reason=f"Batch '{batch_name}' failed (Claude+GPT)", source="daily_batch")
                 return {}
@@ -4785,6 +4852,13 @@ async def ah_pm_scanner():
     META dropped -9% AH on earnings - this scanner catches that and stores the pattern.
     Pre-market: catches gap ups/downs before open so the bot is ready."""
     try:
+        # V6 Scheduler: check if this task should run now
+        if _sched_available:
+            _now = time.time()
+            if not should_task_run("ah_pm_scanner", _sched_last_run.get("ah_pm_scanner", 0), _now):
+                return
+            _sched_last_run["ah_pm_scanner"] = _now
+
         if _is_market_hours():
             return  # Only run during extended hours
 
@@ -4924,6 +4998,13 @@ async def before_ah_pm():
 async def intelligence_scan():
     """Hourly: Deep analysis on batch of stocks. Builds the eagle eye."""
     try:
+        # V6 Scheduler: check if this task should run now
+        if _sched_available:
+            _now = time.time()
+            if not should_task_run("intelligence_scan", _sched_last_run.get("intelligence_scan", 0), _now):
+                return
+            _sched_last_run["intelligence_scan"] = _now
+
         if not intel_engine:
             log.warning("[V6] intelligence_scan: intel_engine is None — skipping")
             return
@@ -4978,6 +5059,13 @@ async def fill_tracker():
     """Every 5 min: check for filled orders and record realized P&L.
     This closes the learning loop: buy→fill→sell→fill→profit/loss recorded."""
     try:
+        # V6 Scheduler: check if this task should run now
+        if _sched_available:
+            _now = time.time()
+            if not should_task_run("fill_tracker", _sched_last_run.get("fill_tracker", 0), _now):
+                return
+            _sched_last_run["fill_tracker"] = _now
+
         pg = _get_pg()
         if not pg:
             return
@@ -5220,6 +5308,11 @@ async def on_ready():
                      'outcome_grader(30min)', 'ah_pm(15min)', 'fill_tracker(5min)',
                      'claude_3am(daily)', 'intelligence(1hr)']
     _pg_log("TASKS_STARTED", reason=f"11 tasks: {', '.join(tasks_started)}", source="on_ready")
+
+    # V6: Log scheduler status
+    if _sched_available:
+        log_schedule_status()
+        _pg_log("SCHEDULER", reason=f"Market-aware scheduler active: {get_market_period()}", source="on_ready")
 
     channel = bot.get_channel(SCAN_CHANNEL_ID)
     if channel:

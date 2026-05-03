@@ -477,15 +477,14 @@ def analytics():
 @app.route('/api/system')
 @require_auth
 def system_status():
-    """System health: AI, TV, tunnel, uptime."""
+    """System health: AI, TV, uptime."""
     import requests as req
 
-    # AI health
+    # AI health — check Azure GPT directly
     ai_ok = False
-    ai_url = os.getenv('AI_API_URL', '')
     try:
-        r = req.get(f"{ai_url}/health", timeout=5)
-        ai_ok = r.status_code == 200 and r.json().get('ai_available', False)
+        from ai_brain import AIBrain
+        ai_ok = AIBrain().is_available
     except:
         pass
 
@@ -508,7 +507,7 @@ def system_status():
         pass
 
     return jsonify({
-        'ai': {'status': 'online' if ai_ok else 'offline', 'url': ai_url},
+        'ai': {'status': 'online' if ai_ok else 'offline'},
         'tv': {'status': 'connected' if tv_ok else 'disconnected'},
         'bot': {'status': 'running' if bot_running else 'stopped'},
         'timestamp': datetime.now(ET).isoformat(),
