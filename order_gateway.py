@@ -46,7 +46,11 @@ class OrderGateway:
         self.active_orders: dict[str, OrderRecord] = {}
         self.last_sell_times: dict[str, datetime] = {}
         self.last_sell_prices: dict[str, float] = {}  # Anti-buyback-higher tracking
+        self.last_sell_times_precise: dict[str, datetime] = {}  # Precise sell timestamps for anti-buyback timeout
         self._exit_timers: dict[str, datetime] = {}  # Track Law 6 compliance
+        self.ANTI_BUYBACK_TIMEOUT_MIN = 30  # Reset anti-buyback after 30 minutes
+        self.ANTI_BUYBACK_PRICE_RESET_PCT = 0.03  # Reset if price > sold+3% (new trend)
+        self.ANTI_BUYBACK_AI_OVERRIDE_CONF = 80  # AI confidence >= 80% can override
         log.info("🔒 OrderGateway initialized (single-writer mode)")
 
     # ── Position Reconciliation ────────────────────────
@@ -177,7 +181,8 @@ class OrderGateway:
     def quick_buy(self, symbol: str, qty: int, limit_price: float,
                   reason: str = "dip buy", day_change_pct: float = 0,
                   sentiment_score: int = 0, vix: float = 0,
-                  tv_confirmed: bool = False) -> OrderRecord:
+                  tv_confirmed: bool = False, ai_confidence: int = 0,
+                  **kwargs) -> OrderRecord:
         """Simplified buy. Has safety checks. TV confirmation is HARD LAW."""
         with self._lock:
             try:
@@ -236,15 +241,44 @@ class OrderGateway:
                 except:
                     pass
 
-                # Anti-buyback-higher: refuse to buy if we sold this stock today at a lower price
+                # Anti-buyback-higher: refuse to buy if we sold this stock recently
+                # BUT with smart resets: timeout, price threshold, AI override
                 sold_price = self.last_sell_prices.get(symbol)
                 if sold_price and limit_price > sold_price * 1.01:
-                    log.warning(
-                        f"⛔ ANTI-BUYBACK: {symbol} — refusing to buy @ ${limit_price:.2f}, "
-                        f"we sold today @ ${sold_price:.2f}. Would lose ${(limit_price - sold_price) * qty:.2f}"
-                    )
-                    return OrderRecord(symbol=symbol, side=OrderSide.BUY, state=OrderState.REJECTED,
-                                       error=f"Anti-buyback: sold today @ ${sold_price:.2f}")
+                    sold_time = self.last_sell_times_precise.get(symbol)
+                    elapsed_min = (datetime.now() - sold_time).total_seconds() / 60 if sold_time else 999
+                    price_above_sold_pct = (limit_price - sold_price) / sold_price
+                    ai_conf = ai_confidence or kwargs.get('ai_confidence', 0)
+                    
+                    # Smart reset conditions
+                    reset_reason = None
+                    if elapsed_min >= self.ANTI_BUYBACK_TIMEOUT_MIN:
+                        reset_reason = f"timeout ({elapsed_min:.0f}min >= {self.ANTI_BUYBACK_TIMEOUT_MIN}min)"
+                    elif price_above_sold_pct >= self.ANTI_BUYBACK_PRICE_RESET_PCT:
+                        reset_reason = f"new trend (price +{price_above_sold_pct:.1%} above sold, threshold {self.ANTI_BUYBACK_PRICE_RESET_PCT:.0%})"
+                    elif ai_conf >= self.ANTI_BUYBACK_AI_OVERRIDE_CONF:
+                        reset_reason = f"AI override (confidence {ai_conf}% >= {self.ANTI_BUYBACK_AI_OVERRIDE_CONF}%)"
+                    
+                    if reset_reason:
+                        log.info(
+                            f"✅ ANTI-BUYBACK RESET for {symbol}: {reset_reason}. "
+                            f"Sold @ ${sold_price:.2f} ({elapsed_min:.0f}min ago), "
+                            f"buying @ ${limit_price:.2f} (+{price_above_sold_pct:.1%})"
+                        )
+                        # Clear the anti-buyback record
+                        del self.last_sell_prices[symbol]
+                        if symbol in self.last_sell_times_precise:
+                            del self.last_sell_times_precise[symbol]
+                    else:
+                        log.info(
+                            f"⛔ ANTI-BUYBACK BLOCK: {symbol} — buy @ ${limit_price:.2f}, "
+                            f"sold @ ${sold_price:.2f} ({elapsed_min:.0f}min ago, +{price_above_sold_pct:.1%}). "
+                            f"Resets: timeout={self.ANTI_BUYBACK_TIMEOUT_MIN - elapsed_min:.0f}min left, "
+                            f"price_threshold=needs +{self.ANTI_BUYBACK_PRICE_RESET_PCT:.0%}, "
+                            f"ai_conf={ai_conf}% (need {self.ANTI_BUYBACK_AI_OVERRIDE_CONF}%)"
+                        )
+                        return OrderRecord(symbol=symbol, side=OrderSide.BUY, state=OrderState.REJECTED,
+                                           error=f"Anti-buyback: sold @${sold_price:.2f}, now ${limit_price:.2f} (+{price_above_sold_pct:.1%}), {elapsed_min:.0f}min ago")
 
                 client_id = f"beast-quickbuy-{uuid.uuid4().hex[:8]}"
                 order_req = LimitOrderRequest(
@@ -333,9 +367,11 @@ class OrderGateway:
                 )
                 self.active_orders[record.id] = record
 
-                # Track cooldown (Iron Law 8) + anti-buyback price
+                # Track cooldown (Iron Law 8) + anti-buyback price + precise time
                 self.last_sell_times[symbol] = datetime.now()
                 self.last_sell_prices[symbol] = limit_price
+                self.last_sell_times_precise[symbol] = datetime.now()
+                log.info(f"[ANTI-BUYBACK] Recorded sell: {symbol} @ ${limit_price:.2f} — buyback blocked for {self.ANTI_BUYBACK_TIMEOUT_MIN}min or until +{self.ANTI_BUYBACK_PRICE_RESET_PCT:.0%}")
 
                 log.info(f"✅ SELL {qty}x {symbol} @ ${limit_price:.2f} ({reason})")
                 return record
@@ -647,3 +683,4 @@ class OrderGateway:
         except Exception as e:
             log.error(f"Stale order cleanup failed: {e}")
         return cancelled
+

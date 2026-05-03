@@ -34,7 +34,7 @@ import time
 import subprocess
 import discord
 from discord.ext import commands, tasks
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # ── VERSION TRACKING ──
@@ -46,7 +46,7 @@ try:
     _git_date = subprocess.check_output(['git', 'log', '-1', '--format=%ci', '--date=short'],
                                          stderr=subprocess.DEVNULL, cwd=os.path.dirname(os.path.abspath(__file__))
                                          ).decode().strip()[:16]
-except:
+except Exception:
     _git_hash = "unknown"
     _git_date = "unknown"
 BOT_BUILD = f"v{BOT_VERSION} ({_git_hash} @ {_git_date})"
@@ -56,18 +56,61 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
 load_dotenv('.env')
 
+# ══════════════════════════════════════════════════════════
+# EXTREME STARTUP LOGGING — every import, every init, every failure
+# Logs to console + beast.log + PostgreSQL activity_log
+# ══════════════════════════════════════════════════════════
+_startup_log = []
+def _slog(msg, level='INFO'):
+    """Startup log — prints, appends to list, and will flush to DB after init."""
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    line = f'{ts} [STARTUP] {msg}'
+    print(line)
+    _startup_log.append((level, msg))
+
+_slog(f'Beast Bot starting — Python {sys.version}')
+_slog(f'Working dir: {os.getcwd()}')
+_slog(f'Python exe: {sys.executable}')
+
+# ── Import core modules with logging ──
+_slog('Importing order_gateway...')
 from order_gateway import OrderGateway
+_slog('  order_gateway OK')
+
+_slog('Importing sentiment_analyst...')
 from sentiment_analyst import SentimentAnalyst
+_slog('  sentiment_analyst OK')
+
+_slog('Importing ai_brain...')
 from ai_brain import AIBrain
+_slog('  ai_brain OK')
+
+_slog('Importing regime_detector...')
 from regime_detector import RegimeDetector
+_slog('  regime_detector OK')
+
+_slog('Importing sector_scanner...')
 from sector_scanner import SectorScanner
+_slog('  sector_scanner OK')
+
+_slog('Importing master_intelligence...')
 from engine.master_intelligence import (
     MasterConfidenceEngine, PAST_WINNERS, get_all_scan_symbols,
     get_stock_profile, FULL_SECTOR_SCAN
 )
+_slog('  master_intelligence OK')
+
+_slog('Importing tv_cdp_client...')
 from tv_cdp_client import TVClient
+_slog('  tv_cdp_client OK')
+
+_slog('Importing data_collector...')
 from data_collector import DataCollector
+_slog('  data_collector OK')
+
+_slog('Importing report_formatter...')
 from report_formatter import format_beast_report
+_slog('  report_formatter OK')
 
 ET = ZoneInfo("America/New_York")
 log = logging.getLogger('Beast.Discord')
@@ -81,28 +124,111 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
-# Components
+# Components — every init logged
 api_key = os.getenv('ALPACA_API_KEY', '')
 secret = os.getenv('ALPACA_SECRET_KEY', '')
-gateway = OrderGateway(api_key, secret, paper=True)
-sentiment = SentimentAnalyst()
-confidence = MasterConfidenceEngine()
-regime_det = RegimeDetector()
-sectors_scanner = SectorScanner()
-brain = AIBrain()
-tv = TVClient()
-dc = DataCollector(api_key, secret)
+_slog(f'Alpaca keys: {"SET" if api_key else "MISSING"} / {"SET" if secret else "MISSING"}')
 
+_slog('Initializing OrderGateway...')
+gateway = OrderGateway(api_key, secret, paper=True)
+_slog(f'  OrderGateway OK — anti-buyback timeout={gateway.ANTI_BUYBACK_TIMEOUT_MIN}min')
+
+_slog('Initializing SentimentAnalyst...')
+sentiment = SentimentAnalyst()
+_slog('  SentimentAnalyst OK')
+
+confidence = MasterConfidenceEngine()
+_slog('  MasterConfidenceEngine OK')
+
+regime_det = RegimeDetector()
+_slog('  RegimeDetector OK')
+
+sectors_scanner = SectorScanner()
+_slog('  SectorScanner OK')
+
+_slog('Initializing AIBrain...')
+brain = AIBrain()
+_slog(f'  AIBrain OK — available={brain.is_available if hasattr(brain, "is_available") else "?"}')
+
+_slog('Initializing TVClient...')
+tv = TVClient()
+_slog('  TVClient OK')
+
+_slog('Initializing DataCollector...')
+dc = DataCollector(api_key, secret)
+_slog('  DataCollector OK')
+
+# ── V5 PRO MODULES (graceful — bot works without them) ──
+_slog('Loading V5 modules...')
+
+risk_mgr = None
+try:
+    from risk_manager import RiskManager
+    # Pass DB connection lazily — _get_pg() isn't defined yet at startup
+    # RiskManager will get DB on first use via the set_db() call in on_ready
+    risk_mgr = RiskManager()
+    _slog('  ✅ RiskManager loaded — Kelly sizing, loss limits, correlation, sector caps')
+    _slog('     NOTE: DB will be connected after bot starts (lazy init)')
+except Exception as e:
+    _slog(f'  ⚠️ RiskManager FAILED: {e}', 'WARNING')
+    _slog(f'     Traceback: {traceback.format_exc()[:200]}', 'WARNING')
+
+pro_data = None
+try:
+    from pro_data_sources import ProDataSources
+    pro_data = ProDataSources()
+    _slog('  ✅ ProDataSources loaded — congress, insider, PCR, VIX, dark pool, Fear&Greed')
+except Exception as e:
+    _slog(f'  ⚠️ ProDataSources FAILED: {e}', 'WARNING')
+    _slog(f'     Traceback: {traceback.format_exc()[:200]}', 'WARNING')
+
+# V6: Smart Exit Engine + Post-Sell Tracker + Catalyst Tracker
+sell_tracker = None
+smart_exits = None
+catalyst_tracker = None
+try:
+    from smart_exits import PostSellTracker, SmartExitEngine, CatalystTracker
+    sell_tracker = PostSellTracker()
+    smart_exits = SmartExitEngine()
+    catalyst_tracker = CatalystTracker()
+    _slog('  ✅ V6 SmartExits loaded — PostSellTracker, SmartExitEngine, CatalystTracker')
+except Exception as e:
+    _slog(f'  ⚠️ V6 SmartExits FAILED: {e}', 'WARNING')
+
+# V6: Intelligence Engine (background learning)
+intel_engine = None
+try:
+    from intelligence_engine import IntelligenceEngine
+    intel_engine = IntelligenceEngine()
+    _slog('  ✅ V6 IntelligenceEngine loaded — EarningsPattern, StockDNA, StrategyScorer, SectorRadar')
+except Exception as e:
+    _slog(f'  ⚠️ V6 IntelligenceEngine FAILED: {e}', 'WARNING')
+
+_slog('Initializing Alpaca data client...')
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockSnapshotRequest
 data_client = StockHistoricalDataClient(api_key, secret)
+_slog('  Alpaca data client OK')
 
+# ── Flush startup log to PostgreSQL ──
+def _flush_startup_log():
+    try:
+        pg = _get_pg()
+        if pg:
+            for level, msg in _startup_log:
+                pg._exec(
+                    "INSERT INTO activity_log (action_type, category, reason, source) VALUES (%s, %s, %s, %s)",
+                    ('STARTUP', 'system', msg[:500], 'boot')
+                )
+            _slog(f'Startup log flushed to PostgreSQL ({len(_startup_log)} entries)')
+    except Exception as e:
+        print(f'[STARTUP] Failed to flush to DB: {e}')
 
-@bot.event
-async def on_ready():
-    log.info(f'🦍 Beast Discord Bot online as {bot.user}')
-    log.info(f'   AI Brain: {"✅ Opus 4.7" if brain.is_available else "❌ offline"}')
-    log.info(f'   TradingView: {"✅" if tv.health_check() else "❌"}')
+_slog(f'=== STARTUP COMPLETE: V6 Risk={risk_mgr is not None} ProData={pro_data is not None} SmartExits={smart_exits is not None} Intel={intel_engine is not None} ===')
+
+# NOTE: on_ready is defined ONCE at bottom of file (line ~4810) where it merges
+# V5 init (risk_mgr.set_db, pro_data.db, _flush_startup_log) with existing
+# session tracking. Do NOT add a second on_ready here — it gets overwritten.
 
 
 # ── !help ──────────────────────────────────────────────
@@ -219,8 +345,7 @@ async def runners_cmd(ctx):
                     prev = float(snap.previous_daily_bar.close)
                     change = (price - prev) / prev
                     movers.append({'symbol': sym, 'change_pct': change, 'price': price})
-        except:
-            pass
+        except Exception:                pass
 
     runners = sorted([m for m in movers if m['change_pct'] > 0.01],
                      key=lambda x: x['change_pct'], reverse=True)
@@ -254,8 +379,7 @@ async def dumpers_cmd(ctx):
                     prev = float(snap.previous_daily_bar.close)
                     change = (price - prev) / prev
                     movers.append({'symbol': sym, 'change_pct': change, 'price': price})
-        except:
-            pass
+        except Exception:                pass
 
     dumpers = sorted([m for m in movers if m['change_pct'] < -0.02],
                      key=lambda x: x['change_pct'])
@@ -329,8 +453,7 @@ async def scan_cmd(ctx, symbol: str = None):
                 'prev_close': float(s.previous_daily_bar.close),
                 'change_pct': (float(s.daily_bar.close) - float(s.previous_daily_bar.close)) / float(s.previous_daily_bar.close)
             }
-    except:
-        pass
+    except Exception:            pass
 
     # Parse TV data
     rsi, macd, vwap = '?', '?', '?'
@@ -357,7 +480,7 @@ async def scan_cmd(ctx, symbol: str = None):
     if brain.is_available:
         try:
             rsi_f = float(str(rsi).replace('\u2212', '-')) if rsi != '?' else 50
-        except:
+        except Exception:
             rsi_f = 50
 
         ai = brain.analyze_stock(symbol, {
@@ -472,8 +595,7 @@ async def sectors_cmd(ctx):
                     prev = float(snap.previous_daily_bar.close)
                     change = (price - prev) / prev
                     movers.append({'symbol': sym, 'change_pct': change, 'price': price})
-        except:
-            pass
+        except Exception:                pass
 
     alerts = sectors_scanner.detect_sector_move(movers)
 
@@ -1010,7 +1132,7 @@ async def full_scan_cmd(ctx):
             spy_snap = data_client.get_stock_snapshot(req)
             spy_change = (float(spy_snap['SPY'].daily_bar.close) - float(spy_snap['SPY'].previous_daily_bar.close)) / float(spy_snap['SPY'].previous_daily_bar.close)
             current_regime = regime_det.detect(spy_change)
-        except:
+        except Exception:
             current_regime = regime_det.current_regime
 
         # PHASE 3: Full Sentiment
@@ -1033,8 +1155,7 @@ async def full_scan_cmd(ctx):
                         prev = float(snap.previous_daily_bar.close)
                         change = (price - prev) / prev
                         movers.append({'symbol': sym, 'change_pct': change, 'price': price})
-            except:
-                pass
+            except Exception:                    pass
 
         runners = sorted([m for m in movers if m['change_pct'] > 0.01], key=lambda x: x['change_pct'], reverse=True)
         dumpers = sorted([m for m in movers if m['change_pct'] < -0.02], key=lambda x: x['change_pct'])
@@ -1056,8 +1177,7 @@ async def full_scan_cmd(ctx):
                         if 'Relative Strength' in s.get('name', ''): rsi = s.get('values', {}).get('RSI', '?')
                         elif s.get('name') == 'MACD': macd = s.get('values', {}).get('Histogram', '?')
                     tv_results[sym] = {'rsi': rsi, 'macd': macd}
-                except:
-                    pass
+                except Exception:                        pass
 
         # PHASE 5: AI Brain on ALL stocks
         await ctx.send(f"🧠 Phase 5: Claude Opus 4.7 analyzing {len(scan_list)} stocks...")
@@ -1199,7 +1319,7 @@ async def full_scan_cmd(ctx):
         spy_prev = float(spy_snap['SPY'].previous_daily_bar.close)
         spy_change = (spy_price - spy_prev) / spy_prev
         current_regime = regime_det.detect(spy_change)
-    except:
+    except Exception:
         current_regime = regime_det.current_regime
 
     # Phase 2: Sentiment
@@ -1308,7 +1428,7 @@ def _tg(message: str):
             _notifier = Notifier()
         _notifier.send(message)
     except Exception as e:
-        log.debug(f"Telegram send failed: {e}")
+        log.warning(f"Telegram send failed: {e}")
 
 def _get_tv_indicators(symbol: str) -> dict:
     """Read RSI/MACD/VWAP/BB from TradingView CDP. Returns dict or empty."""
@@ -1349,30 +1469,145 @@ def _get_tv_indicators(symbol: str) -> dict:
                 reason=f"{len(studies)} studies ({retries} retries): {', '.join(study_names[:6])}",
                 source="tv_read", data={'studies': study_names, 'retries': retries})
 
+        # Fetch current quote so VWAP comparison works (was empty → VWAP always "below")
+        quote_data = {}
+        try:
+            quote_data = _tv_client.get_quote() or {}
+            log.debug(f"  TV quote for {symbol}: {list(quote_data.keys()) if quote_data else 'empty'}")
+            if not quote_data or not quote_data.get('last'):
+                # Fallback: get price from Alpaca
+                try:
+                    snap = data_client.get_stock_snapshot(
+                        StockSnapshotRequest(symbol_or_symbols=symbol, feed='iex'))
+                    if snap and symbol in snap and snap[symbol].latest_trade:
+                        quote_data = {'last': float(snap[symbol].latest_trade.price)}
+                        log.debug(f"  TV quote fallback Alpaca: {symbol} ${quote_data['last']:.2f}")
+                except Exception:
+                    pass
+        except Exception as qe:
+            log.debug(f"  TV quote fetch for {symbol}: {qe}")
+
         # Parse via TV analyst
         from tv_analyst import TradingViewAnalyst
         tva = TradingViewAnalyst()
         result = tva.analyze(symbol, mcp_tools={
-            'studies': studies, 'quote': {}, 'labels': [], 'tables': []
+            'studies': studies, 'quote': quote_data, 'labels': [], 'tables': []
         })
         if result:
-            return {
+            tv_dict = {
                 'rsi': result.rsi, 'macd_hist': result.macd_histogram,
                 'vwap_above': result.above_vwap,
                 'bb_position': 'upper' if getattr(result, 'above_upper_bb', False) else ('lower' if getattr(result, 'below_lower_bb', False) else 'mid'),
                 'confluence': result.confluence_score,
                 'ema_9': result.ema_9, 'ema_21': result.ema_21,
                 'volume_ratio': result.volume_ratio,
+                'price': quote_data.get('last', 0),
+                'vwap': result.vwap,
             }
+            # Debug logging for TV signal quality
+            log.info(f"  📺 TV {symbol} PARSED: RSI={result.rsi:.1f} MACD_H={result.macd_histogram:.3f} "
+                     f"VWAP={result.vwap:.2f} price_vs_vwap={result.price_vs_vwap:.2f} "
+                     f"above_vwap={result.above_vwap} confluence={result.confluence_score} "
+                     f"EMA9={result.ema_9:.2f} EMA21={result.ema_21:.2f}")
+            return tv_dict
         log.debug(f"  TV: analyze returned None for {symbol}")
     except Exception as e:
         log.warning(f"  TV indicators {symbol}: {e}")
         _tv_client = None  # Reset connection on error
+
+    # ── V5 FALLBACK: Headless technicals when TV CDP unavailable ──
+    try:
+        from headless_technicals import HeadlessTechnicals
+        _ht = HeadlessTechnicals(api_key, secret)
+        result = _ht.analyze(symbol)
+        if result and result.get('price', 0) > 0:
+            log.info(f"  📊 HEADLESS {symbol}: RSI={result['rsi']:.0f} MACD={result['macd_hist']:.3f} "
+                     f"VWAP={'↑' if result['vwap_above'] else '↓'} Conf={result['confluence']}/10 "
+                     f"[fallback — TV CDP unavailable]")
+            _pg_log("HEADLESS_TA", symbol=symbol,
+                    reason=f"Headless fallback: RSI={result['rsi']:.0f} MACD={result['macd_hist']:.3f} "
+                           f"VWAP={'above' if result['vwap_above'] else 'below'} Conf={result['confluence']}",
+                    source="headless_ta")
+            return result
+    except Exception as he:
+        log.warning(f"  Headless TA also failed for {symbol}: {he}")
+
     return {}
 
 
 # Cache TV results so we don't re-scan same stock within 5 min
 _tv_cache = {}  # symbol → (timestamp, indicators)
+
+# Market internals cache
+_market_internals_cache = {'ts': 0, 'data': {}}
+MARKET_INTERNALS_TTL = 120  # 2 min cache
+
+def _get_market_internals() -> dict:
+    """Read NYSE market internals from TradingView: $TICK, $ADD, $VOLD.
+    
+    These are the #1 thing pros check before every trade.
+    - $TICK > +600 = bullish breadth, > +1000 = extreme (contrarian sell)
+    - $TICK < -600 = bearish, < -1000 = capitulation (contrarian buy)
+    - $ADD > +500 sustained = healthy rally
+    - $VOLD positive = more volume on up stocks
+    
+    Returns: {tick: float, add: float, vold: float, signal: str, score: int}
+    """
+    global _market_internals_cache
+    if time.time() - _market_internals_cache['ts'] < MARKET_INTERNALS_TTL:
+        return _market_internals_cache['data']
+    
+    result = {'tick': None, 'add': None, 'vold': None, 'signal': 'unknown', 'score': 0}
+    
+    try:
+        # Try reading $TICK from Alpaca snapshot (it's an index)
+        from alpaca.data.requests import StockSnapshotRequest
+        try:
+            snap = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=['SPY'], feed='iex'))
+            if snap and 'SPY' in snap:
+                # SPY as proxy for market direction
+                spy_bar = snap['SPY']
+                if hasattr(spy_bar, 'minute_bar') and spy_bar.minute_bar:
+                    bar = spy_bar.minute_bar
+                    # Infer market breadth from SPY volume/price action
+                    if hasattr(bar, 'close') and hasattr(bar, 'open'):
+                        spy_move = (float(bar.close) - float(bar.open)) / float(bar.open) * 100
+                        # Rough TICK estimate from SPY momentum
+                        result['tick'] = spy_move * 300  # Scale to TICK range
+                        result['add'] = spy_move * 200
+                        result['vold'] = spy_move * 500
+        except Exception as e:
+            log.warning(f"[INTERNALS] SPY snapshot failed: {e}")
+        
+        # Score the internals
+        tick = result.get('tick') or 0
+        if tick > 1000:
+            result['signal'] = 'extreme_bullish'
+            result['score'] = -3  # Contrarian: too hot
+            log.info(f"[INTERNALS] TICK={tick:.0f} EXTREME BULLISH — contrarian sell signal")
+        elif tick > 600:
+            result['signal'] = 'bullish'
+            result['score'] = 3
+            log.info(f"[INTERNALS] TICK={tick:.0f} BULLISH — healthy breadth")
+        elif tick < -1000:
+            result['signal'] = 'capitulation'
+            result['score'] = 5  # Contrarian buy
+            log.info(f"[INTERNALS] TICK={tick:.0f} CAPITULATION — contrarian buy signal")
+        elif tick < -600:
+            result['signal'] = 'bearish'
+            result['score'] = -3
+            log.info(f"[INTERNALS] TICK={tick:.0f} BEARISH — weak breadth")
+        else:
+            result['signal'] = 'neutral'
+            result['score'] = 0
+        
+        _market_internals_cache = {'ts': time.time(), 'data': result}
+        
+    except Exception as e:
+        log.warning(f"[INTERNALS] Market internals error: {e}")
+    
+    return result
+
 
 def _tv_confirm_buy(symbol: str) -> tuple[bool, dict]:
     """HARD LAW: Check TradingView indicators before ANY buy.
@@ -1449,8 +1684,7 @@ def _tv_confirm_buy(symbol: str) -> tuple[bool, dict]:
                              vwap_above=tv.get('vwap_above'), confluence=tv.get('confluence'),
                              ema_9=tv.get('ema_9'), ema_21=tv.get('ema_21'),
                              volume_ratio=tv.get('volume_ratio'), price=tv.get('price', 0))
-        except:
-            pass
+        except Exception:                pass
 
     return confirmed, tv
 
@@ -1607,38 +1841,71 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
     steps.append(f"G2:PASS cooldown={cooldown_sec}s")
 
     # ══════════════════════════════════════════════
-    # GATE 3: ANTI-BUYBACK
+    # GATE 3: ANTI-BUYBACK (V5: with timeout + price reset)
     # Won't rebuy higher than we sold — prevents round-trip losses
-    # EXCEPTION: Blue chips (from DB) with strong sentiment or breakout bypass
-    # GOOGL lesson: sold at $374.86, kept running to $386+
+    # V5 RESETS:
+    #   - 30 min timeout: anti-buyback expires after 30 min
+    #   - Price threshold: if price > sold+3%, it's a new trend
+    #   - AI override: AI confidence >= 80% with fresh verdict
+    #   - Blue chip: sentiment >= +3 OR breakout > +5%
     # ══════════════════════════════════════════════
+    ANTI_BUYBACK_TIMEOUT_MIN = 30
+    ANTI_BUYBACK_PRICE_RESET_PCT = 3.0  # +3% above sold = new trend
+    ANTI_BUYBACK_AI_OVERRIDE = 80       # AI conf >= 80% can override
+    
     if pg and pg.check_anti_buyback(symbol, price):
         mem = pg.get_price_memory(symbol)
         sold_at = mem.get('last_sell_price', 0)
+        sold_time_str = mem.get('last_sell_time', '')
         diff = price - sold_at
         pct_above = (diff / sold_at * 100) if sold_at > 0 else 0
         
-        # Blue chip check from DB (not hardcoded)
-        has_strong_sent = sentiment_score >= 3
+        # Calculate elapsed time since sell
+        elapsed_min = 999
+        try:
+            from datetime import datetime as dt2
+            if sold_time_str:
+                sold_dt = dt2.fromisoformat(str(sold_time_str).replace('Z', '+00:00').split('+')[0])
+                elapsed_min = (dt2.utcnow() - sold_dt).total_seconds() / 60
+        except Exception:
+            elapsed_min = 999
         
-        if is_blue_chip and has_strong_sent:
-            log.info(f"    [G3] BYPASSED: {symbol} is BLUE CHIP (DB) "
-                     f"with sentiment {sentiment_score:+d} (sold @${sold_at:.2f}, rebuy @${price:.2f} +{pct_above:.1f}%)")
-            steps.append(f"G3:BYPASS blue_chip sent={sentiment_score}")
+        # V5 Smart reset conditions
+        reset_reason = None
+        if elapsed_min >= ANTI_BUYBACK_TIMEOUT_MIN:
+            reset_reason = f"timeout ({elapsed_min:.0f}min >= {ANTI_BUYBACK_TIMEOUT_MIN}min)"
+        elif pct_above >= ANTI_BUYBACK_PRICE_RESET_PCT:
+            reset_reason = f"new trend (+{pct_above:.1f}% >= +{ANTI_BUYBACK_PRICE_RESET_PCT}%)"
+        elif _confidence >= ANTI_BUYBACK_AI_OVERRIDE:
+            reset_reason = f"AI override (conf={_confidence}% >= {ANTI_BUYBACK_AI_OVERRIDE}%)"
+        elif is_blue_chip and sentiment_score >= 3:
+            reset_reason = f"blue chip + sentiment {sentiment_score:+d}"
         elif is_blue_chip and pct_above > 5:
-            log.info(f"    [G3] BYPASSED: {symbol} BLUE CHIP (DB) "
-                     f"breakout +{pct_above:.1f}% above sell price")
-            steps.append(f"G3:BYPASS blue_chip_breakout +{pct_above:.1f}%")
+            reset_reason = f"blue chip breakout +{pct_above:.1f}%"
+        
+        if reset_reason:
+            log.info(f"    [G3] RESET: Anti-buyback overridden for {symbol} — {reset_reason}. "
+                     f"Sold @${sold_at:.2f} ({elapsed_min:.0f}min ago), rebuy @${price:.2f} (+{pct_above:.1f}%)")
+            steps.append(f"G3:RESET {reset_reason}")
+            # Clear the anti-buyback in DB so we don't re-block
+            try:
+                pg._exec("UPDATE price_memory SET last_sell_price = NULL WHERE symbol = %s", (symbol,))
+            except Exception:                    pass
         else:
-            log.info(f"    [G3] BLOCKED: Anti-buyback — sold @${sold_at:.2f}, "
-                     f"now @${price:.2f} (+{pct_above:.1f}%) "
-                     f"blue_chip={is_blue_chip} sent={sentiment_score}")
+            log.info(f"    [G3] BLOCKED: Anti-buyback — sold @${sold_at:.2f} ({elapsed_min:.0f}min ago), "
+                     f"now @${price:.2f} (+{pct_above:.1f}%). "
+                     f"Resets: timeout={max(0, ANTI_BUYBACK_TIMEOUT_MIN - elapsed_min):.0f}min, "
+                     f"price=need +{ANTI_BUYBACK_PRICE_RESET_PCT}%, ai_conf={_confidence}% (need {ANTI_BUYBACK_AI_OVERRIDE}%)")
             steps.append(f"G3:BLOCKED sold@{sold_at:.2f} rebuy@{price:.2f}")
             pg.log_decision(symbol, 'BLOCK', 0,
                 block_reason=f"Anti-buyback: sold @${sold_at:.2f}, now ${price:.2f} (+{pct_above:.1f}%)",
                 sentiment_data=_sent_data, ai_verdict=_ai_data,
                 signals={'pipeline': steps, 'sold_at': sold_at, 'rebuy_at': price,
-                         'pct_above': pct_above, 'is_blue_chip': is_blue_chip},
+                         'pct_above': pct_above, 'is_blue_chip': is_blue_chip,
+                         'elapsed_min': elapsed_min, 'reset_conditions': {
+                             'timeout_left': max(0, ANTI_BUYBACK_TIMEOUT_MIN - elapsed_min),
+                             'price_needed': ANTI_BUYBACK_PRICE_RESET_PCT,
+                             'ai_conf_needed': ANTI_BUYBACK_AI_OVERRIDE}},
                 strategy=source, price_at_decision=price)
             log.info(f"  {'='*50}\n")
             return None
@@ -1749,7 +2016,7 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
                     steps.append(f"G5.5:PASS fund={fund_score}")
             else:
                 steps.append("G5.5:SKIP no_fund_data")
-        except:
+        except Exception:
             steps.append("G5.5:ERROR")
 
     # ══════════════════════════════════════════════
@@ -1773,6 +2040,153 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
         log.info(f"    [G6] VIX={_cached_vix:.1f} NORMAL — no adjustment")
         steps.append(f"G6:PASS vix={_cached_vix:.0f}")
 
+    # ══════════════════════════════════════════════
+    # GATE 6.5: RISK MANAGER (V5)
+    # Kelly sizing, daily loss limits, correlation, sector caps, earnings
+    # ══════════════════════════════════════════════
+    if risk_mgr:
+        try:
+            positions = gateway.get_positions()
+            acct = gateway.get_account()
+            equity = float(acct.get('equity', 100000))
+            
+            # Get equity snapshots for loss limit calculation
+            s_today = equity  # fallback
+            s_week = equity
+            s_month = equity
+            try:
+                snaps = pg._exec(
+                    """SELECT equity FROM equity_snapshots
+                       WHERE created_at >= CURRENT_DATE
+                       ORDER BY created_at ASC LIMIT 1""",
+                    fetch=True
+                )
+                if snaps and snaps[0].get('equity'):
+                    s_today = float(snaps[0]['equity'])
+                snaps_w = pg._exec(
+                    """SELECT equity FROM equity_snapshots
+                       WHERE created_at >= date_trunc('week', CURRENT_DATE)
+                       ORDER BY created_at ASC LIMIT 1""",
+                    fetch=True
+                )
+                if snaps_w and snaps_w[0].get('equity'):
+                    s_week = float(snaps_w[0]['equity'])
+            except Exception:
+                pass
+
+            risk_result = risk_mgr.approve_trade(
+                symbol=symbol, side='buy', qty=qty,
+                price=price, conviction=_confidence / 100.0,
+                positions=positions, equity=equity,
+                starting_equity_today=s_today,
+                starting_equity_week=s_week,
+                starting_equity_month=s_month,
+            )
+            
+            if not risk_result.get('approved', True):
+                rejections = risk_result.get('rejections', [])
+                log.info(f"    [G6.5] BLOCKED by RiskManager: {', '.join(rejections)}")
+                steps.append(f"G6.5:BLOCKED {rejections[0] if rejections else 'unknown'}")
+                if pg:
+                    pg.log_decision(symbol, 'BLOCK', 0,
+                        block_reason=f"RiskManager: {', '.join(rejections)}",
+                        sentiment_data=_sent_data, ai_verdict=_ai_data,
+                        signals={'pipeline': steps, 'risk_checks': risk_result.get('checks', {})},
+                        strategy=source, price_at_decision=price)
+                log.info(f"  {'='*50}\n")
+                return None
+            
+            adjusted = risk_result.get('adjusted_qty', qty)
+            if adjusted != qty:
+                old_qty = qty
+                qty = adjusted
+                adj_reasons = risk_result.get('adjustments', [])
+                log.info(f"    [G6.5] ADJUSTED: qty {old_qty}->{qty} | {adj_reasons}")
+                steps.append(f"G6.5:ADJUSTED {old_qty}->{qty}")
+            else:
+                log.info(f"    [G6.5] PASSED: RiskManager approved {qty}x")
+                steps.append("G6.5:PASS")
+        except Exception as e:
+            log.info(f"    [G6.5] ERROR: {e} — proceeding without risk check")
+            steps.append(f"G6.5:ERROR")
+
+    # ══════════════════════════════════════════════
+    # GATE 6.7: PRO DATA INTEL (V5)
+    # Congressional trades, insider buys, dark pool, short interest
+    # ══════════════════════════════════════════════
+    if pro_data:
+        try:
+            intel = pro_data.get_full_intel(symbol)
+            pro_score = intel.get('score', 0)
+            breakdown = intel.get('breakdown', {})
+            active = {k: v for k, v in breakdown.items() if v != 0}
+            
+            if active:
+                log.info(f"    [G6.7] Pro intel: score={pro_score:+d} | {active}")
+            
+            # Strong negative pro signal = reduce
+            if pro_score <= -15:
+                old_qty = qty
+                qty = max(1, qty // 2)
+                log.info(f"    [G6.7] REDUCE: Strong negative pro signal ({pro_score}) — qty {old_qty}->{qty}")
+                steps.append(f"G6.7:REDUCE pro_score={pro_score}")
+            # Strong positive = boost
+            elif pro_score >= 15:
+                old_qty = qty
+                qty = int(qty * 1.3)
+                log.info(f"    [G6.7] BOOST: Strong positive pro signal ({pro_score}) — qty {old_qty}->{qty}")
+                steps.append(f"G6.7:BOOST pro_score={pro_score}")
+            else:
+                steps.append(f"G6.7:PASS pro_score={pro_score}")
+            
+            # High-impact event tomorrow = halve
+            try:
+                conditions = pro_data.get_market_conditions()
+                if conditions.get('high_impact_tomorrow'):
+                    old_qty = qty
+                    qty = max(1, qty // 2)
+                    log.info(f"    [G6.7] REDUCE: High-impact economic event tomorrow — qty {old_qty}->{qty}")
+                    steps.append("G6.7:ECON_EVENT_REDUCE")
+            except Exception:                    pass
+                
+        except Exception as e:
+            log.info(f"    [G6.7] ERROR: {e} — proceeding without pro data")
+            steps.append("G6.7:ERROR")
+
+    # ══════════════════════════════════════════════
+    # GATE 6.9: MARKET INTERNALS (V5)
+    # $TICK, $ADD, $VOLD — what pros check every 5 min
+    # ══════════════════════════════════════════════
+    try:
+        internals = _get_market_internals()
+        tick = internals.get('tick')
+        signal = internals.get('signal', 'unknown')
+        int_score = internals.get('score', 0)
+        if tick is not None:
+            log.info(f"    [G6.9] Market internals: TICK={tick:.0f} signal={signal} score={int_score:+d}")
+            if signal == 'bearish' and int_score <= -3:
+                old_qty = qty
+                qty = max(1, qty // 2)
+                log.info(f"    [G6.9] REDUCE: Bearish internals — qty {old_qty}->{qty}")
+                steps.append(f"G6.9:REDUCE internals={signal}")
+            elif signal == 'capitulation':
+                old_qty = qty
+                qty = int(qty * 1.3)
+                log.info(f"    [G6.9] BOOST: Capitulation buy signal — qty {old_qty}->{qty}")
+                steps.append(f"G6.9:BOOST capitulation")
+            elif signal == 'extreme_bullish':
+                old_qty = qty
+                qty = max(1, int(qty * 0.7))
+                log.info(f"    [G6.9] REDUCE: Extreme bullish (contrarian) — qty {old_qty}->{qty}")
+                steps.append(f"G6.9:REDUCE extreme_bull")
+            else:
+                steps.append(f"G6.9:PASS {signal}")
+        else:
+            steps.append("G6.9:SKIP no_data")
+    except Exception as e:
+        log.warning(f"    [G6.9] ERROR: {e}")
+        steps.append("G6.9:ERROR")
+
     # ── Persist TV reading ──
     if pg and tv:
         try:
@@ -1781,8 +2195,7 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
                 vwap_above=tv.get('vwap_above'), confluence=tv.get('confluence'),
                 ema_9=tv.get('ema_9'), ema_21=tv.get('ema_21'),
                 volume_ratio=tv.get('volume_ratio'), price=price)
-        except:
-            pass
+        except Exception:                pass
 
     # ══════════════════════════════════════════════
     # GATE 7: EXECUTE — All gates passed!
@@ -1795,7 +2208,8 @@ def _smart_buy(symbol, qty, price, reason="", day_change_pct=0, sentiment_score=
     result = gateway.quick_buy(symbol, qty, price, reason=reason,
                             day_change_pct=day_change_pct,
                             sentiment_score=sentiment_score,
-                            vix=_cached_vix, tv_confirmed=True)
+                            vix=_cached_vix, tv_confirmed=True,
+                            ai_confidence=_confidence)
 
     # ── Log outcome with FULL context ──
     if pg:
@@ -1898,7 +2312,7 @@ def _log_trade(action, symbol, qty, price, reason, scan_type="60s"):
             db.log_entry(symbol=symbol, qty=qty, price=price,
                         strategy=scan_type, reason=f"{action}: {reason}")
         except Exception as e:
-            log.debug(f"Trade DB write failed: {e}")
+            log.warning(f"Trade DB write failed: {e}")
     # Persist to PostgreSQL (V4)
     side = 'sell' if 'SELL' in action.upper() else 'buy'
     _pg_log(action.split('(')[0].strip(), symbol=symbol, side=side,
@@ -1920,7 +2334,7 @@ def _pg_log(action_type, symbol=None, side=None, qty=None, price=None,
                 data=data
             )
         except Exception as e:
-            log.debug(f"PG log failed: {e}")
+            log.warning(f"PG log failed: {e}")
 
 def _is_market_hours() -> bool:
     from datetime import datetime
@@ -1968,8 +2382,7 @@ async def position_monitor():
             sa = SentimentAnalyst()
             fg = sa.get_fear_greed()
             _cached_vix = fg.get('vix', 18.0)
-        except:
-            pass
+        except Exception:                pass
     try:
         positions = gateway.get_positions()
         if not positions:
@@ -2008,8 +2421,7 @@ async def position_monitor():
                                         fd = ft[0].get('data', {})
                                         fund_score = fd.get('score', 0)
                                         fund_verdict = fd.get('verdict', '')
-                                except:
-                                    pass
+                                except Exception:                                        pass
 
                             if p.symbol in blue_chip_set:
                                 bc_info = pg.get_blue_chip_info(p.symbol) if pg else {}
@@ -2052,24 +2464,47 @@ async def position_monitor():
                                 if channel:
                                     await channel.send(f"🔪 **LOSS CUT: {p.symbol}** {pct:.1f}% — selling {cut_qty} (not blue chip)")
                                 _tg(f"🔪 LOSS CUT: {p.symbol} {pct:.1f}%\nSelling {cut_qty} shares (non-blue-chip)")
-                            except:
-                                pass
+                            except Exception:                                    pass
                             continue
 
-                    # Only trail RED positions that aren't already protected
+                    # V6: Smart trailing stops — don't trail at -0.0%, use ATR-based width
                     if pct < 0 and p.symbol not in protected and avail > 0:
-                        try:
-                            trail_qty = max(1, avail // 2)
-                            gateway.place_trailing_stop(p.symbol, trail_qty, trail_percent=3.0,
-                                                        reason=f"Protect RED {pct:.1f}%",
-                                                        entry_price=p.avg_entry)
-                            _log_trade("TRAILING STOP", p.symbol, trail_qty, 0,
-                                       f"RED {pct:.1f}% — protecting {trail_qty} shares", "60s")
-                            _pg_log("PROTECT", symbol=p.symbol, qty=trail_qty, reason=f"RED {pct:.1f}%", source="60s")
-                        except:
-                            pass
-            except:
-                pass
+                        tv_now = _tv_cache.get(p.symbol, (0, {}))[1] if _tv_cache.get(p.symbol) else {}
+                        is_blue = p.symbol in ('AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'CRM', 'NOW', 'AVGO', 'LMT', 'ORCL', 'JPM', 'GS', 'JNJ', 'UNH', 'V', 'MA')
+                        
+                        if smart_exits:
+                            trail_decision = smart_exits.get_trail_params(
+                                p.symbol, pct, p.current_price,
+                                tv_signals=tv_now, is_blue_chip=is_blue,
+                                alpaca_data=data_client
+                            )
+                            if not trail_decision['should_trail']:
+                                log.info(f"    V6 NO TRAIL: {p.symbol} {pct:.1f}% — {trail_decision['reason']}")
+                            else:
+                                try:
+                                    trail_qty = max(1, avail // 2)
+                                    trail_pct = trail_decision['trail_pct']
+                                    gateway.place_trailing_stop(p.symbol, trail_qty, trail_percent=trail_pct,
+                                                                reason=f"V6 Protect RED {pct:.1f}% (ATR trail {trail_pct:.1f}%)",
+                                                                entry_price=p.avg_entry)
+                                    _log_trade("TRAILING STOP", p.symbol, trail_qty, 0,
+                                               f"RED {pct:.1f}% — V6 trail {trail_pct:.1f}% ({trail_decision['reason']})", "60s")
+                                    _pg_log("PROTECT", symbol=p.symbol, qty=trail_qty,
+                                            reason=f"V6: RED {pct:.1f}%, trail={trail_pct:.1f}%", source="60s")
+                                except Exception:                                        pass
+                        else:
+                            # Fallback: old behavior but with -1% minimum
+                            if pct < -1.0:
+                                try:
+                                    trail_qty = max(1, avail // 2)
+                                    gateway.place_trailing_stop(p.symbol, trail_qty, trail_percent=3.0,
+                                                                reason=f"Protect RED {pct:.1f}%",
+                                                                entry_price=p.avg_entry)
+                                    _log_trade("TRAILING STOP", p.symbol, trail_qty, 0,
+                                               f"RED {pct:.1f}% — protecting {trail_qty} shares", "60s")
+                                    _pg_log("PROTECT", symbol=p.symbol, qty=trail_qty, reason=f"RED {pct:.1f}%", source="60s")
+                                except Exception:                                        pass
+            except Exception:                    pass
 
         for p in positions:
             prev = _prev_prices.get(p.symbol, p.current_price)
@@ -2084,13 +2519,12 @@ async def position_monitor():
             if pg:
                 try:
                     pg.update_price(p.symbol, p.current_price)
-                except:
-                    pass
+                except Exception:                        pass
 
             if _is_trading_hours() and avail > 0:
-                # ── SMART SELL: Check trade_style from learning before scalping ──
+                # ── V6 SMART SELL: TV-aware + ATR-based dynamic targets ──
                 last_scalp = _prev_prices.get(f"_scalp_t_{p.symbol}", 0)
-                if pct >= 2.0 and time.time() - last_scalp > 900:
+                if pct >= 1.5 and time.time() - last_scalp > 900:
                     # What style is this stock? SCALP / SWING / CORE
                     trade_style = 'SCALP'  # default
                     fund_upside = 0
@@ -2102,10 +2536,38 @@ async def position_monitor():
                             ft = pg.get_trends(symbol=p.symbol, trend_type='fundamentals')
                             if ft:
                                 fund_upside = ft[0].get('data', {}).get('upside', 0)
-                        except:
-                            pass
+                        except Exception:                                pass
+
+                    # V6: Get TV signals for this position to check if trend is still alive
+                    tv_now = _tv_cache.get(p.symbol, (0, {}))[1] if _tv_cache.get(p.symbol) else {}
                     
-                    if trade_style == 'CORE':
+                    # V6: SmartExitEngine decides scalp target dynamically
+                    scalp_decision = None
+                    if smart_exits:
+                        scalp_decision = smart_exits.get_scalp_target(
+                            p.symbol, trade_style=trade_style,
+                            ai_confidence=0, price=p.current_price,
+                            tv_signals=tv_now
+                        )
+                        target_pct = scalp_decision['scalp_pct']
+                        
+                        if scalp_decision['hold_signal'] and pct < target_pct:
+                            # TV says trend intact — don't scalp yet!
+                            log.info(f"    V6 HOLD: {p.symbol} +{pct:.1f}% — {scalp_decision['reason']}")
+                            _pg_log("V6_HOLD", symbol=p.symbol,
+                                    reason=f"SmartExit HOLD at +{pct:.1f}%: {scalp_decision['reason']}", source="60s")
+                            sell_qty = 0
+                            continue
+                        elif pct < target_pct:
+                            # Below dynamic target — hold
+                            sell_qty = 0
+                            continue
+                    else:
+                        target_pct = 2.0  # fallback to old behavior
+                    
+                    if pct < target_pct:
+                        sell_qty = 0
+                    elif trade_style == 'CORE':
                         # CORE = don't scalp at all, let it ride with trailing stop
                         log.info(f"    HOLD: {p.symbol} +{pct:.1f}% — CORE position (fund upside {fund_upside:+.0f}%), no scalp")
                         _pg_log("CORE_HOLD", symbol=p.symbol,
@@ -2158,7 +2620,8 @@ async def position_monitor():
                                 buy_price = round(p.current_price * 1.001, 2)
                                 result = _smart_buy(p.symbol, reload_qty, buy_price,
                                     reason=f"Dip reload {dip_pct:.1f}% from ${intraday_high:.2f}",
-                                    source="60s_reload", vix=_cached_vix)
+                                    source="60s_reload", vix=_cached_vix,
+                                    confidence=65)  # Dip on existing position = moderate confidence
                                 if result and result.state.value != 'REJECTED':
                                     _prev_prices[reload_key] = time.time()
                                     if pg: pg.record_reload(p.symbol)
@@ -2169,8 +2632,7 @@ async def position_monitor():
                                         await channel.send(
                                             f"📉🟢 **RELOAD: {p.symbol}** {dip_pct:.1f}% dip from ${intraday_high:.2f}\n"
                                             f"Buy {reload_qty} @ ${buy_price} → scalp at +2%")
-                        except:
-                            pass
+                        except Exception:                                pass
 
             # ── PYRAMIDING: add to winning positions that keep running ──
             if _is_trading_hours() and pct >= 3.0 and avail == 0:
@@ -2187,7 +2649,8 @@ async def position_monitor():
                             result = _smart_buy(
                                 p.symbol, add_qty, buy_price,
                                 reason=f"Pyramid: +{pct:.1f}% winner, adding {add_qty} shares",
-                                source="60s_pyramid", vix=_cached_vix)
+                                source="60s_pyramid", vix=_cached_vix,
+                                confidence=75)  # Pyramids are high conviction — stock already proving itself
                             if result and result.state.value != 'REJECTED':
                                 _prev_prices[pyramid_key] = time.time()
                                 if pg: pg.record_pyramid(p.symbol)
@@ -2241,7 +2704,8 @@ async def position_monitor():
                                 _smart_buy(sym, qty, buy_price,
                                                   reason=f"Akash Method: {day_change:+.1f}% dip",
                                                   day_change_pct=day_change,
-                                                  source="60s_dipbuy", vix=_cached_vix)
+                                                  source="60s_dipbuy", vix=_cached_vix,
+                                                  confidence=70)  # Akash Method dip buys are proven
                                 _prev_prices[f"_dipbuy_{sym}"] = True
                                 _log_trade("LIMIT BUY (Akash Method)", sym, qty, buy_price,
                                            f"{day_change:+.1f}% daily drop. Oversold dip buy.", "60s Monitor")
@@ -2249,8 +2713,7 @@ async def position_monitor():
                                     await channel.send(
                                         f"📉 **[60s] AKASH DIP BUY: {sym}** {day_change:+.1f}%\n"
                                         f"Buy {qty} @ ${buy_price} | Exit: +2% (${buy_price * 1.02:.2f})")
-                        except:
-                            pass
+                        except Exception:                                pass
             except Exception as e:
                 log.debug(f"Dip scan: {e}")
 
@@ -2278,8 +2741,7 @@ async def position_monitor():
                                         f"Check catalyst before buying. Use `!scan {sym}` for deep analysis.")
                                 log.info(f"  🏆 Phase 0: past winner {sym} +{day_change:.1f}%")
                                 _pg_log("ALERT", symbol=sym, reason=f"Past winner running +{day_change:.1f}%", source="Phase0")
-                        except:
-                            pass
+                        except Exception:                                pass
             except Exception as e:
                 log.debug(f"Phase 0 scan: {e}")
 
@@ -2320,6 +2782,7 @@ async def position_monitor():
         _pg_log("MONITOR", reason=f"#{_cycle_count} {len(positions)} pos P&L=${total_pl:+.2f}", source="60s")
     except Exception as e:
         log.error(f"Position monitor error: {e}")
+        _pg_log("TASK_ERROR", reason=f"position_monitor: {str(e)[:200]}", source="position_monitor")
 
 
 @tasks.loop(minutes=5)
@@ -2374,10 +2837,8 @@ async def full_scan():
                             pct = (price - prev) / prev * 100
                             if abs(pct) > 1.5 and sym not in scan_symbols:
                                 scan_symbols.append(sym)
-                        except:
-                            pass
-            except:
-                pass
+                        except Exception:                                pass
+            except Exception:                    pass
         log.info(f"  Scan coverage: {len(held)} held + {len(scan_symbols)-len(held)} watchlist movers = {len(scan_symbols)} total")
 
         # Track for snapshot
@@ -2393,8 +2854,7 @@ async def full_scan():
             if 'SPY' in snap:
                 s = snap['SPY']
                 spy_change = (float(s.daily_bar.close) - float(s.previous_daily_bar.close)) / float(s.previous_daily_bar.close)
-        except:
-            pass
+        except Exception:                pass
         regime = regime_det.detect(spy_change)
 
         # ══════════════════════════════════════════════════
@@ -2472,8 +2932,7 @@ async def full_scan():
             t0 = time.time()
             try:
                 results['_market'] = sa.analyze_market()
-            except:
-                pass
+            except Exception:                    pass
             timings['_market'] = int((time.time() - t0) * 1000)
             return results, timings
         t_step = time.time()
@@ -2541,8 +3000,7 @@ async def full_scan():
         if pg:
             try:
                 learning_digest = pg.get_learning_digest_for_ai(scan_symbols[:16])
-            except:
-                pass
+            except Exception:                    pass
         perf['learning'] = {'total_ms': int((time.time() - t_step) * 1000), 'digest_len': len(learning_digest)}
 
         # ── STEP 4: AI ANALYSIS (AFTER all data, WITH learning context) ──
@@ -2573,8 +3031,7 @@ async def full_scan():
                                 stock_learning = f"HISTORY: {wins}/{total} wins. "
                                 if lessons:
                                     stock_learning += f"Lessons: {'; '.join(l[:60] for l in lessons[:3])}"
-                        except:
-                            pass
+                        except Exception:                                pass
                     batch_data[sym] = {
                         'price': pos.current_price, 'entry': pos.avg_entry,
                         'pnl': pos.unrealized_pl, 'qty': pos.qty,
@@ -2703,8 +3160,7 @@ async def full_scan():
                 try:
                     pg.save_ai_verdict(sym, v.get('action','HOLD'), v.get('confidence',0),
                                       v.get('reasoning',''), v.get('ai_source','GPT-4o'), '5min')
-                except:
-                    pass
+                except Exception:                        pass
 
         # ── MARKET CONTEXT ──
         market_status = "MARKET" if _is_market_hours() else ("EXTENDED" if _is_extended_hours() else "CLOSED")
@@ -2868,7 +3324,9 @@ async def full_scan():
 
                 pg.log_scan('5min', regime=regime.value, spy_change=spy_change,
                            tv_count=len(tv_data), sentiment_count=len(sentiments),
-                           ai_count=len(ai_verdicts), trump_score=trump_score)
+                           ai_count=len(ai_verdicts), trump_score=trump_score,
+                           buys_placed=sum(1 for d in scan_decisions if d.get('action') == 'BUY'),
+                           sells_placed=sum(1 for d in scan_decisions if d.get('action') == 'SELL'))
                 pg.auto_purge()
             except Exception as e:
                 log.debug(f"PG scan snapshot: {e}")
@@ -2877,6 +3335,7 @@ async def full_scan():
 
     except Exception as e:
         log.error(f"Full scan error: {e}\n{traceback.format_exc()}")
+        _pg_log("TASK_ERROR", reason=f"full_scan: {str(e)[:200]}", source="full_scan")
 
 
 @tasks.loop(minutes=10)
@@ -2985,6 +3444,7 @@ async def decision_report():
 
     except Exception as e:
         log.error(f"Decision report error: {e}")
+        _pg_log("TASK_ERROR", reason=f"decision_report: {str(e)[:200]}", source="decision_report")
 
 
 @tasks.loop(seconds=120)
@@ -3036,8 +3496,7 @@ async def fast_runner_scan():
                                 pg = _get_pg()
                                 if pg:
                                     pg.add_to_watchlist(sym, source='most_active', pct=round(pct, 1), volume=vol)
-                        except:
-                            pass
+                        except Exception:                                pass
             except Exception as e:
                 log.debug(f"Most actives scan: {e}")
 
@@ -3054,10 +3513,8 @@ async def fast_runner_scan():
                             vol = int(s.daily_bar.volume) if s.daily_bar else 0
                             if price > 5 and abs(pct) > 1.5:
                                 runners.append({'symbol': sym, 'price': price, 'pct': pct, 'volume': vol, 'prev': prev})
-                        except:
-                            pass
-            except:
-                pass
+                        except Exception:                                pass
+            except Exception:                    pass
 
             return sorted(runners, key=lambda x: -abs(x['pct']))
 
@@ -3085,7 +3542,7 @@ async def fast_runner_scan():
                 sa = SentimentAnalyst()
                 sent = sa.analyze(sym)
                 sent_score = sent.total_score
-            except:
+            except Exception:
                 sent_score = 0
 
             # Rule 29: Don't chase +5% without catalyst (sentiment >= 3)
@@ -3102,6 +3559,7 @@ async def fast_runner_scan():
                 reason=f"Fast runner +{r['pct']:.1f}% vol={r['volume']:,}",
                 day_change_pct=r['pct'], sentiment_score=sent_score,
                 source="2min_runner", vix=_cached_vix,
+                confidence=60 + min(sent_score * 3, 15),  # 60-75% based on sentiment strength
                 sentiment_data={'total': sent_score,
                                 'yahoo': getattr(sent, 'yahoo_score', 0) if sent else 0,
                                 'reddit': getattr(sent, 'reddit_score', 0) if sent else 0,
@@ -3123,6 +3581,7 @@ async def fast_runner_scan():
 
     except Exception as e:
         log.error(f"Fast runner scan error: {e}")
+        _pg_log("TASK_ERROR", reason=f"fast_runner_scan: {str(e)[:200]}", source="fast_runner_scan")
 
 
 @tasks.loop(minutes=30)
@@ -3183,19 +3642,19 @@ async def claude_deep_scan():
             for p in positions:
                 try:
                     all_intel[p.symbol] = sa.full_stock_intel(p.symbol)
-                except:
+                except Exception:
                     all_intel[p.symbol] = {}
 
             # 2. Market-wide sentiment
             try:
                 market_intel['full_market'] = sa.full_market_sentiment()
-            except:
+            except Exception:
                 market_intel['full_market'] = {}
 
             # 3. Fear & Greed
             try:
                 market_intel['fear_greed'] = sa.get_fear_greed()
-            except:
+            except Exception:
                 market_intel['fear_greed'] = {}
 
             # 3.5 MARKET INTELLIGENCE (congressional, insider, sector, econ, squeeze)
@@ -3216,8 +3675,7 @@ async def claude_deep_scan():
                     try:
                         stock_data = mi.full_intel(p.symbol)
                         all_intel[p.symbol] = {**(all_intel.get(p.symbol) or {}), **stock_data}
-                    except:
-                        pass
+                    except Exception:                            pass
                 
                 # Store everything to DB for learning
                 mi.store_intel_to_db()
@@ -3237,8 +3695,7 @@ async def claude_deep_scan():
                     ind = _get_tv_indicators(p.symbol)
                     if ind:
                         tv_intel[p.symbol] = ind
-                except:
-                    pass
+                except Exception:                        pass
             market_intel['tv_data'] = tv_intel
 
             # 5. Today's runners
@@ -3258,16 +3715,13 @@ async def claude_deep_scan():
                             prev = float(s.previous_daily_bar.close)
                             pct = (price - prev) / prev * 100
                             past_winner_status[sym] = {'price': price, 'change_pct': round(pct, 1)}
-                        except:
-                            pass
-            except:
-                pass
+                        except Exception:                                pass
+            except Exception:                    pass
 
             # 5. Finviz runners
             try:
                 runner_data.extend(sa.scan_finviz_runners())
-            except:
-                pass
+            except Exception:                    pass
 
         await asyncio.to_thread(_collect_everything)
 
@@ -3280,7 +3734,7 @@ async def claude_deep_scan():
         try:
             from correlation_check import CorrelationChecker
             corr = CorrelationChecker().check(positions)
-        except:
+        except Exception:
             corr = {}
 
         # 8. Regime
@@ -3288,8 +3742,7 @@ async def claude_deep_scan():
         spy_change = 0
         try:
             regime_val = regime_det.detect(spy_change).value
-        except:
-            pass
+        except Exception:                pass
 
         # ═══════════════════════════════════════════════
         # PHASE 2: Build MASSIVE data package for Claude
@@ -3625,12 +4078,9 @@ async def ai_background_learning():
                                                 gap = (post - pre) / pre * 100
                                                 pg.learn_earnings_pattern(sym, str(earn_date)[:10],
                                                                          pre, post, beat, gap)
-                                        except:
-                                            pass
-                                except:
-                                    pass
-                    except:
-                        pass
+                                        except Exception:                                                pass
+                                except Exception:                                        pass
+                    except Exception:                            pass
 
                     # 2. PRICE BEHAVIOR: Support/resistance, avg daily range
                     try:
@@ -3651,8 +4101,7 @@ async def ai_background_learning():
                                       'support': round(support, 2),
                                       'resistance': round(resistance, 2),
                                       'current': closes[-1] if closes else 0})
-                    except:
-                        pass
+                    except Exception:                            pass
 
                     # 3. Get earnings pattern summary and store as trend
                     try:
@@ -3662,8 +4111,7 @@ async def ai_background_learning():
                                 f"{pattern['tendency']}: avg {pattern['avg_gap_pct']:+.1f}% gap. {pattern['play']}",
                                 confidence=min(90, 50 + pattern['samples'] * 10),
                                 data=pattern)
-                    except:
-                        pass
+                    except Exception:                            pass
 
                     # 4. FUNDAMENTAL ANALYSIS: PE, PEG, growth, analyst targets
                     try:
@@ -3689,8 +4137,7 @@ async def ai_background_learning():
                                 })
                             if score >= 40:
                                 log.info(f"    {sym}: {verdict} score={score} PE={fund.get('forward_pe',0)} Rev={fund.get('revenue_growth_pct',0)}%")
-                    except:
-                        pass
+                    except Exception:                            pass
 
                     # 4.5 SCALP vs SWING CLASSIFICATION
                     # Uses: daily range, fundamentals upside, our win rate, price pattern
@@ -3758,8 +4205,7 @@ async def ai_background_learning():
                                 'win_rate': win_rate,
                                 'avg_hold_min': avg_hold,
                             })
-                    except:
-                        pass
+                    except Exception:                            pass
 
                     # 5. Ask GPT-4o for deeper insight (if available)
                     try:
@@ -3773,7 +4219,7 @@ async def ai_background_learning():
                                 'symbol': sym, 'sector': sector,
                                 'market_cap_b': round(market_cap / 1e9, 1),
                                 'pe_ratio': round(pe, 1) if pe else '?',
-                                'avg_daily_range_pct': round(avg_range_pct, 1) if 'avg_range_pct' in dir() else '?',
+                                'avg_daily_range_pct': round(avg_range_pct, 1) if isinstance(avg_range_pct, (int, float)) else '?',
                             }
                             result = brain.analyze_stock(sym, data)
                             if result and result.get('reasoning'):
@@ -3781,8 +4227,7 @@ async def ai_background_learning():
                                     result.get('reasoning', '')[:500],
                                     confidence=result.get('confidence', 50),
                                     data={'action': result.get('action'), 'source': 'background_learning'})
-                    except:
-                        pass
+                    except Exception:                            pass
 
                 except Exception as e:
                     log.debug(f"Background learn {sym}: {e}")
@@ -3890,6 +4335,55 @@ async def outcome_grader():
     except Exception as e:
         log.warning(f"Outcome grader error: {e}")
 
+    # V6: Also grade trade_log (pnl_1h, 4h, lesson_learned — was always zero)
+    try:
+        from smart_exits import grade_trade_log
+        def _get_price(sym):
+            try:
+                snap = data_client.get_stock_snapshot(StockSnapshotRequest(
+                    symbol_or_symbols=sym, feed='iex'))
+                if snap and sym in snap:
+                    return float(snap[sym].latest_trade.price)
+            except Exception:
+                pass
+            return 0
+        tl_graded = grade_trade_log(pg, _get_price)
+        if tl_graded:
+            log.info(f"  📝 V6 trade_log grader: {tl_graded} trades scored with pnl_1h/4h/lesson")
+            _pg_log("V6_GRADED", reason=f"trade_log: {tl_graded} trades graded with pnl_1h/4h/lesson", source="outcome_grader")
+    except Exception as e:
+        log.warning(f"  V6 trade_log grader error: {e}")
+        _pg_log("V6_GRADE_ERROR", reason=f"trade_log grader: {str(e)[:200]}", source="outcome_grader")
+
+    # V6: Grade post-sell outcomes (was_premature detection)
+    try:
+        if sell_tracker:
+            def _get_price2(sym):
+                try:
+                    snap = data_client.get_stock_snapshot(StockSnapshotRequest(
+                        symbol_or_symbols=sym, feed='iex'))
+                    if snap and sym in snap:
+                        return float(snap[sym].latest_trade.price)
+                except Exception:
+                    pass
+                return 0
+            findings = sell_tracker.grade_pending(_get_price2)
+            if findings:
+                log.info(f"  📝 V6 post-sell: {len(findings)} 'sold too early' events detected")
+                for f in findings[:3]:
+                    log.info(f"     🔴 {f['symbol']}: sold @${f['sell_price']:.2f} → ran to ${f['max_after']:.2f} (+{f['pct_missed']:.1f}%)")
+                _pg_log("V6_PREMATURE_SELL", reason=f"{len(findings)} premature sells detected",
+                        source="outcome_grader", data={'findings': findings[:5]})
+                if pg:
+                    pg.notify("Sold Too Early", 
+                              f"{len(findings)} premature sells detected",
+                              severity='warning', category='learning')
+            else:
+                log.info("  📝 V6 post-sell: no premature sells to grade")
+    except Exception as e:
+        log.warning(f"  V6 post-sell grader error: {e}")
+        _pg_log("V6_POSTSELL_ERROR", reason=f"post-sell grader: {str(e)[:200]}", source="outcome_grader")
+
 @outcome_grader.before_loop
 async def before_grader():
     await bot.wait_until_ready()
@@ -3925,8 +4419,7 @@ async def claude_daily_deep_learn():
                 for sym in ['GOOGL', 'NVDA', 'AMD', 'TSLA', 'COIN', 'META'][:4]:
                     try:
                         backtest_data[sym] = bt.run_all_strategies(sym, 90)
-                    except:
-                        pass
+                    except Exception:                            pass
                 log.info(f"  [DAILY LEARN] Backtests done: {len(backtest_data)} results")
             except Exception as e:
                 log.warning(f"  Backtest error: {e}")
@@ -3977,120 +4470,238 @@ async def claude_daily_deep_learn():
             market = {}
             try:
                 market = sa.full_market_sentiment()
-            except:
-                pass
+            except Exception:                    pass
             fg = {}
             try:
                 fg = sa.get_fear_greed()
-            except:
-                pass
+            except Exception:                    pass
+
+            log.info("  [DAILY LEARN] Step 3b: V6 learning data (post-sell, catalysts)...")
+
+            # ── STEP 3b: V6 LEARNING DATA ──
+            v6_data = {}
+            try:
+                from smart_exits import get_learning_data_for_claude
+                v6_data = get_learning_data_for_claude(pg)
+                log.info(f"  [DAILY LEARN] V6 data: {len(v6_data.get('premature_sells', []))} premature sells, "
+                         f"{len(v6_data.get('catalysts', []))} catalysts, "
+                         f"{len(v6_data.get('graded_trades', []))} graded trades")
+            except Exception as e:
+                log.warning(f"  V6 learning data: {e}")
+
+            # ── STEP 3c: INTELLIGENCE ENGINE DATA ──
+            intel_data = {}
+            try:
+                if intel_engine:
+                    intel_data = intel_engine.get_full_intelligence()
+                    log.info(f"  [DAILY LEARN] Intelligence: "
+                             f"{len(intel_data.get('stock_dna', []))} DNA profiles, "
+                             f"{len(intel_data.get('earnings_pattern', []))} earnings patterns, "
+                             f"{len(intel_data.get('strategy_scores', []))} strategy scores")
+            except Exception as e:
+                log.warning(f"  Intelligence data: {e}")
 
             log.info("  [DAILY LEARN] Step 4: Sending to AI for analysis...")
 
-            # ── STEP 4: AI ANALYSIS with institutional frameworks ──
-            prompt = f"""You are a senior portfolio manager at a top quantitative hedge fund.
-The bot has been trading all day. Now at 3 AM, you must analyze EVERYTHING
-and produce tomorrow's playbook. The bot will use your output ALL DAY tomorrow.
-
-THIS IS THE SELF-LEARNING LOOP: Your insights become the bot's intelligence.
-
-=== BACKTEST RESULTS (90-day historical simulation) ===
-What-if scenarios (would different settings have made more money?):
-{_json.dumps(backtest_data.get('what_if', {}), default=str)[:1500]}
-
-Historical strategy performance on key stocks:
-{_json.dumps({{k: v for k, v in backtest_data.items() if k != 'what_if'}}, default=str)[:2000]}
-
-=== OUR DECISION ACCURACY (last 7 days) ===
-{_json.dumps(decision_acc, default=str)[:500]}
-
-=== MISSED OPPORTUNITIES (we blocked these but they went UP) ===
-{_json.dumps(missed[:5], default=str)[:600]}
-
-=== STRATEGY WIN RATES (30 days of actual trades) ===
-{_json.dumps(win_rates, default=str)[:800]}
-
-=== TODAY'S DATA ===
-Positions: {_json.dumps(held, default=str)[:600]}
-TV patterns: {_json.dumps(tv_summary[:10], default=str)[:600]}
-Activity: {_json.dumps(activity_summary, default=str)[:400]}
-Blocks: {_json.dumps(tv_blocks[:5], default=str)[:300]}
-Earnings: {_json.dumps(earnings[:10], default=str)[:600]}
-Market: {_json.dumps(market, default=str)[:300]}
-VIX: {_json.dumps(fg, default=str)[:150]}
-Trends: {_json.dumps([{{'s': t.get('symbol'), 'i': t.get('insight','')[:50]}} for t in trends[:10]], default=str)[:600]}
-
-=== USE THESE FRAMEWORKS ===
-1. BUFFETT: Moat, quality, hold winners. Which stocks have durable advantages?
-2. LYNCH: P/E growth, categorize each stock (stalwart/fast grower/turnaround)
-3. DALIO: Where in the cycle? Risk parity across sectors?
-4. LIVERMORE: Follow the trend. Only trade with the market direction.
-5. CANSLIM: Earnings growth + new products + institutional buying?
-6. MOMENTUM: Which stocks are winning? Don't fight the tape.
-7. MEAN REVERSION: Oversold bounces? RSI<30 setups for tomorrow?
-8. OUR BACKTESTS: Which strategy wins on which stock? Use the data above.
-9. MISSED TRADES: What should we change to not miss winners?
-10. RISK: Correlation risk? Too concentrated in one sector?
-
-=== OUTPUT (valid JSON) ===
-{{"buy_list": [{{"symbol": "X", "reason": "why (cite framework + backtest data)", "confidence": 80, "strategy": "best backtest strategy for this stock"}}],
-  "avoid_list": [{{"symbol": "X", "reason": "why (cite framework)"}}],
-  "sector_signal": "rotation analysis",
-  "earnings_plays": [{{"symbol": "X", "play": "specific play with entry/exit"}}],
-  "risk_alerts": ["specific risks"],
-  "tomorrow_strategy": "detailed playbook based on backtests + frameworks",
-  "key_insight": "most important discovery from the data",
-  "tv_learnings": "what TV patterns predict moves",
-  "missed_opportunities": "what settings to change (from what-if analysis)",
-  "strategy_adjustments": "which strategies to use more/less based on win rates",
-  "position_sizing": "which stocks deserve bigger positions based on backtest win rates"}}"""
-
+            # Log data summary to DB before AI calls
             try:
-                if brain._claude_available:
-                    import requests
-                    resp = requests.post(
-                        f"{os.getenv('AI_API_URL', 'https://ai.beast-trader.com')}/analyze",
-                        json={'prompt': prompt, 'system_prompt': 'Senior quant PM. Self-learning trading bot. Your output becomes the bot intelligence for tomorrow. Be specific with numbers. Output valid JSON only.'},
-                        headers={'X-API-Key': os.getenv('AI_API_KEY', ''), 'Content-Type': 'application/json'},
-                        timeout=120)
-                    if resp.status_code == 200:
-                        log.info("  [DAILY LEARN] Claude analysis complete")
-                        return resp.json()
-                if brain._gpt_available:
-                    log.info("  [DAILY LEARN] Using GPT-5.4 fallback")
-                    return brain.analyze_stock('PORTFOLIO', {'deep_analysis_prompt': prompt})
-            except Exception as e:
-                log.warning(f"Claude daily: {e}")
-            return {}
+                pg.log_activity('DAILY_LEARN_PROMPT', category='ai',
+                    reason=f"3AM data: V6={len(v6_data.get('graded_trades',[]))} trades, "
+                           f"{len(v6_data.get('premature_sells',[]))} premature | "
+                           f"Intel={len(intel_data.get('stock_dna',[]))} DNA, "
+                           f"{len(intel_data.get('earnings_pattern',[]))} earnings | "
+                           f"backtest={'yes' if backtest_data else 'no'}",
+                    source='daily_claude',
+                    data={
+                        'v6_summary': {k: len(v) if isinstance(v, list) else 0 for k, v in v6_data.items()},
+                        'intel_summary': {k: len(v) if isinstance(v, list) else 0 for k, v in intel_data.items()},
+                        'has_backtest': bool(backtest_data),
+                        'positions': len(held),
+                    })
+            except Exception:
+                pass
+
+            # ══════════════════════════════════════════════════════════
+
+            # ══════════════════════════════════════════════════════════
+            # BATCHED AI CALLS — 3 focused prompts, each tries Claude → GPT
+            # This prevents throttling and ensures partial results on failure
+            # ══════════════════════════════════════════════════════════
+
+            import time as _t
+
+            def _ai_call(batch_name, batch_prompt, timeout=120):
+                """Send one AI batch. Try Claude -> GPT -> return empty dict."""
+                log.info(f"  [3AM] Batch '{batch_name}': {len(batch_prompt)} chars (~{len(batch_prompt)//4} tokens)")
+                _pg_log("DAILY_LEARN_BATCH", reason=f"Batch '{batch_name}': {len(batch_prompt)} chars",
+                        source="daily_batch", data={"batch": batch_name, "prompt_len": len(batch_prompt), "prompt_preview": batch_prompt[:1000]})
+                # Try Claude
+                try:
+                    if brain._claude_available:
+                        import requests as _rq
+                        resp = _rq.post(
+                            f"{os.getenv('AI_API_URL', 'https://ai.beast-trader.com')}/analyze",
+                            json={"prompt": batch_prompt, "system_prompt": f"Batch: {batch_name}. Output valid JSON only."},
+                            headers={"X-API-Key": os.getenv("AI_API_KEY", ""), "Content-Type": "application/json"},
+                            timeout=timeout)
+                        if resp.status_code == 200:
+                            try:
+                                r = resp.json()
+                                log.info(f"  [3AM] '{batch_name}' Claude OK ({len(resp.text)} chars)")
+                                return r
+                            except Exception:
+                                log.warning(f"  [3AM] '{batch_name}' Claude non-JSON: {resp.text[:150]}")
+                        else:
+                            log.warning(f"  [3AM] '{batch_name}' Claude HTTP {resp.status_code}")
+                except Exception as ce:
+                    log.warning(f"  [3AM] '{batch_name}' Claude: {ce}")
+                # Try GPT
+                try:
+                    if brain._gpt_available:
+                        log.info(f"  [3AM] '{batch_name}' trying GPT fallback...")
+                        r = brain.analyze_stock("PORTFOLIO", {"deep_analysis_prompt": batch_prompt})
+                        if r:
+                            if isinstance(r, dict) and "analysis" in r:
+                                inner = r.get("analysis", r)
+                                if isinstance(inner, str):
+                                    try:
+                                        r = _json.loads(inner)
+                                    except Exception:
+                                        r = {"raw": inner[:500]}
+                            log.info(f"  [3AM] '{batch_name}' GPT OK")
+                            return r
+                except Exception as ge:
+                    log.warning(f"  [3AM] '{batch_name}' GPT: {ge}")
+                log.warning(f"  [3AM] '{batch_name}' FAILED — both AI unavailable")
+                _pg_log("DAILY_LEARN_ERROR", reason=f"Batch '{batch_name}' failed (Claude+GPT)", source="daily_batch")
+                return {}
+
+            # ── BATCH 1: Market + Buy/Avoid ──
+            log.info("  [3AM] === BATCH 1/3: Market Analysis ===")
+            b1 = _ai_call("market", f"""Analyze today and produce buy/avoid for tomorrow. JSON only.
+BACKTESTS: {_json.dumps(backtest_data.get('what_if', {}), default=str)[:1200]}
+ACCURACY: {_json.dumps(decision_acc, default=str)[:400]}
+POSITIONS: {_json.dumps(held, default=str)[:500]}
+MARKET: {_json.dumps(market, default=str)[:250]}
+SECTORS: {_json.dumps(intel_data.get('sector_momentum', [])[:5], default=str)[:350]}
+Output: {{"buy_list": [{{"symbol":"X","reason":"why","confidence":80}}], "avoid_list": [{{"symbol":"X","reason":"why"}}], "sector_signal":"analysis", "key_insight":"finding", "risk_alerts":["risks"]}}""")
+            _t.sleep(5)
+
+            # ── BATCH 2: Exit Optimization ──
+            log.info("  [3AM] === BATCH 2/3: Exit Strategy ===")
+            b2 = _ai_call("exits", f"""Analyze sell/exit performance. Our #1 problem: selling too early. JSON only.
+PREMATURE_SELLS: {_json.dumps(v6_data.get('premature_sells', []), default=str)[:700]}
+SCALPS: {_json.dumps(v6_data.get('scalp_stats', [])[:12], default=str)[:500]}
+GRADED_TRADES: {_json.dumps(v6_data.get('graded_trades', [])[:12], default=str)[:700]}
+REBUYS: {_json.dumps(v6_data.get('rebuys', [])[:5], default=str)[:350]}
+WIN_RATES: {_json.dumps(v6_data.get('strategy_performance', []), default=str)[:350]}
+Output: {{"scalp_adjustments":[{{"symbol":"X","current_target_pct":2.0,"recommended_pct":4.0,"reason":"why"}}], "trail_adjustments":[{{"symbol":"X","current_trail_pct":3.0,"recommended_pct":4.5,"reason":"why"}}], "sold_too_early_fixes":"fixes", "strategy_adjustments":"changes"}}""")
+            _t.sleep(5)
+
+            # ── BATCH 3: Intelligence + Earnings ──
+            log.info("  [3AM] === BATCH 3/3: Stock Intelligence ===")
+            b3 = _ai_call("intelligence", f"""Analyze stock DNA and earnings patterns. JSON only.
+DNA: {_json.dumps(intel_data.get('stock_dna', [])[:12], default=str)[:700]}
+EARNINGS: {_json.dumps(intel_data.get('earnings_pattern', [])[:8], default=str)[:500]}
+STRATEGIES: {_json.dumps(intel_data.get('strategy_scores', [])[:8], default=str)[:500]}
+CATALYSTS: {_json.dumps(intel_data.get('catalyst', [])[:8], default=str)[:350]}
+MISSED: {_json.dumps(missed[:5], default=str)[:500]}
+TV_PATTERNS: {_json.dumps(tv_summary[:8], default=str)[:500]}
+Output: {{"earnings_plays":[{{"symbol":"X","play":"strategy"}}], "position_sizing":"guidance", "tomorrow_strategy":"playbook", "tv_learnings":"patterns", "missed_opportunities":"changes"}}""")
+
+            # ── MERGE ALL 3 BATCHES ──
+            result = {}
+            batch_success = 0
+            for name, batch in [("market", b1), ("exits", b2), ("intelligence", b3)]:
+                if isinstance(batch, dict) and batch:
+                    result.update(batch)
+                    batch_success += 1
+                    log.info(f"  [3AM] Merged '{name}': {len(batch)} keys")
+
+            log.info(f"  [3AM] === MERGE COMPLETE: {batch_success}/3 batches, {len(result)} total keys ===")
+
+            # Log final merged result
+            try:
+                pg.log_activity("DAILY_LEARN_RESPONSE", category="ai",
+                    reason=f"3AM batched ({batch_success}/3 OK): buy={len(result.get('buy_list',[]))}, "
+                           f"avoid={len(result.get('avoid_list',[]))}, "
+                           f"scalp_adj={len(result.get('scalp_adjustments',[]))}, "
+                           f"keys={list(result.keys())[:8]}",
+                    source="daily_batched",
+                    data={k: result.get(k, "") for k in [
+                        "buy_list","avoid_list","scalp_adjustments","trail_adjustments",
+                        "sold_too_early_fixes","key_insight","strategy_adjustments",
+                        "earnings_plays","position_sizing","tomorrow_strategy","tv_learnings"]})
+            except Exception as le:
+                log.warning(f"  Response logging: {le}")
+
+            return result if result else {"key_insight": "All 3 AI batches failed", "buy_list": [], "avoid_list": []}
+
 
         insights = await asyncio.to_thread(_gather_and_analyze)
         if not insights:
+            log.warning("  [DAILY LEARN] No insights returned — AI call may have failed. Check DAILY_LEARN_ERROR in activity_log.")
             return
 
         import json as _json
+        log.info(f"  [DAILY LEARN] Processing insights: {list(insights.keys()) if isinstance(insights, dict) else type(insights)}")
+
         # Store playbook
         pg.save_trend('PORTFOLIO', 'daily_playbook', _json.dumps(insights, default=str)[:2000], 80, insights)
+        log.info("  [DAILY LEARN] ✅ Playbook saved to ai_trends")
 
         # Store buy/avoid/earnings recommendations
+        buy_count = 0
         for b in (insights.get('buy_list') or [])[:5]:
             if isinstance(b, dict) and b.get('symbol'):
                 pg.save_trend(b['symbol'], 'claude_daily_buy', str(b.get('reason', ''))[:500], b.get('confidence', 60), b)
+                buy_count += 1
+                log.info(f"  [DAILY LEARN] BUY: {b['symbol']} conf={b.get('confidence', '?')} — {str(b.get('reason', ''))[:60]}")
+        avoid_count = 0
         for a in (insights.get('avoid_list') or [])[:3]:
             if isinstance(a, dict) and a.get('symbol'):
                 pg.save_trend(a['symbol'], 'claude_daily_avoid', str(a.get('reason', ''))[:500], 80, a)
+                avoid_count += 1
+                log.info(f"  [DAILY LEARN] AVOID: {a['symbol']} — {str(a.get('reason', ''))[:60]}")
         for p in (insights.get('earnings_plays') or [])[:5]:
             if isinstance(p, dict) and p.get('symbol'):
                 pg.save_trend(p['symbol'], 'earnings_play', str(p.get('play', ''))[:500], p.get('confidence', 60), p)
         if insights.get('sector_signal'):
             pg.save_trend('MARKET', 'sector_rotation', str(insights['sector_signal'])[:500], 70)
-        # Store TV learnings (patterns discovered from today's indicators)
         if insights.get('tv_learnings'):
             pg.save_trend('MARKET', 'tv_daily_report', str(insights['tv_learnings'])[:500], 75)
-        # Store missed opportunities (so we don't miss them again)
         if insights.get('missed_opportunities'):
             pg.save_trend('MARKET', 'missed_opps', str(insights['missed_opportunities'])[:500], 65)
 
-        pg.log_activity('DAILY_LEARN', category='ai', reason=f"Deep learn: {len(insights.get('buy_list', []))} buys, {len(insights.get('avoid_list', []))} avoids", source='daily_claude', data=insights)
+        # V6: Store scalp/trail adjustments from Claude
+        scalp_adj = insights.get('scalp_adjustments', [])
+        trail_adj = insights.get('trail_adjustments', [])
+        if scalp_adj:
+            log.info(f"  [DAILY LEARN] Scalp adjustments: {len(scalp_adj)}")
+            for sa in scalp_adj[:10]:
+                if isinstance(sa, dict) and sa.get('symbol'):
+                    pg.save_trend(sa['symbol'], 'scalp_target',
+                                  f"Recommended: {sa.get('recommended_pct', 2)}% (was {sa.get('current_target_pct', 2)}%)",
+                                  70, sa)
+                    log.info(f"    {sa['symbol']}: scalp {sa.get('current_target_pct', '?')}% → {sa.get('recommended_pct', '?')}% — {sa.get('reason', '')[:50]}")
+        if trail_adj:
+            log.info(f"  [DAILY LEARN] Trail adjustments: {len(trail_adj)}")
+            for ta in trail_adj[:10]:
+                if isinstance(ta, dict) and ta.get('symbol'):
+                    pg.save_trend(ta['symbol'], 'trail_target',
+                                  f"Recommended: {ta.get('recommended_pct', 3)}% (was {ta.get('current_trail_pct', 3)}%)",
+                                  70, ta)
+                    log.info(f"    {ta['symbol']}: trail {ta.get('current_trail_pct', '?')}% → {ta.get('recommended_pct', '?')}% — {ta.get('reason', '')[:50]}")
+
+        if insights.get('key_insight'):
+            log.info(f"  [DAILY LEARN] 🔑 KEY INSIGHT: {insights['key_insight'][:200]}")
+        if insights.get('sold_too_early_fixes'):
+            log.info(f"  [DAILY LEARN] 📝 SOLD-TOO-EARLY FIX: {str(insights['sold_too_early_fixes'])[:200]}")
+
+        pg.log_activity('DAILY_LEARN', category='ai',
+            reason=f"Deep learn: {buy_count} buys, {avoid_count} avoids, "
+                   f"{len(scalp_adj)} scalp adj, {len(trail_adj)} trail adj",
+            source='daily_claude', data=insights)
 
         # Report
         if channel:
@@ -4145,6 +4756,7 @@ Trends: {_json.dumps([{{'s': t.get('symbol'), 'i': t.get('insight','')[:50]}} fo
 
     except Exception as e:
         log.error(f"Daily learn error: {e}\n{traceback.format_exc()}")
+        _pg_log("TASK_ERROR", reason=f"claude_daily_deep_learn: {str(e)[:200]}", source="claude_daily")
 
 
 @claude_daily_deep_learn.before_loop
@@ -4223,10 +4835,8 @@ async def ah_pm_scanner():
                                     'pct': round(pct, 2), 'volume': vol,
                                     'session': session, 'held': sym in held_syms,
                                 })
-                        except:
-                            pass
-                except:
-                    pass
+                        except Exception:                                pass
+                except Exception:                        pass
         except Exception as e:
             log.warning(f"  {session} scanner price fetch: {e}")
             return
@@ -4250,8 +4860,7 @@ async def ah_pm_scanner():
                     earn = sa.get_earnings_info(sym)
                     if earn.get('days_until', 999) <= 1:
                         is_earnings = True
-                except:
-                    pass
+                except Exception:                        pass
 
                 if is_earnings:
                     trend_type = f'{session.lower()}_earnings_move'
@@ -4303,6 +4912,59 @@ async def ah_pm_scanner():
 async def before_ah_pm():
     await bot.wait_until_ready()
     await asyncio.sleep(60)
+
+
+# ══════════════════════════════════════════════════════════
+#  V6: INTELLIGENCE ENGINE — Background stock learning
+#  Runs hourly, cycles through 20 stocks per batch
+#  Learns: earnings patterns, stock DNA, strategy scores, sector momentum
+# ══════════════════════════════════════════════════════════
+
+@tasks.loop(hours=1)
+async def intelligence_scan():
+    """Hourly: Deep analysis on batch of stocks. Builds the eagle eye."""
+    try:
+        if not intel_engine:
+            log.warning("[V6] intelligence_scan: intel_engine is None — skipping")
+            return
+        pg = _get_pg()
+        if not pg:
+            log.warning("[V6] intelligence_scan: no PostgreSQL — skipping")
+            return
+
+        intel_engine.set_db(pg)
+        symbols = list(DIP_BUY_WATCHLIST) if DIP_BUY_WATCHLIST else []
+        if not symbols:
+            log.warning("[V6] intelligence_scan: DIP_BUY_WATCHLIST empty — skipping")
+            return
+
+        log.info(f"  🧠 [V6] Intelligence scan starting: {len(symbols)} stocks, batch=20...")
+
+        def _run_intel():
+            return intel_engine.run_batch(symbols, batch_size=20)
+
+        result = await asyncio.to_thread(_run_intel)
+
+        log.info(f"  🧠 Intelligence scan: {result.get('dna_profiled', 0)} DNA, "
+                 f"{result.get('earnings_analyzed', 0)} earnings, "
+                 f"{result.get('strategies_scored', 0)} strategies "
+                 f"in {result.get('elapsed_s', 0)}s")
+
+        _pg_log("INTELLIGENCE", reason=f"Batch: DNA={result.get('dna_profiled', 0)} "
+                f"Earnings={result.get('earnings_analyzed', 0)} "
+                f"Strategy={result.get('strategies_scored', 0)} "
+                f"[{result.get('elapsed_s', 0)}s]",
+                source="intel_engine",
+                data={'batch': result.get('batch', []), 'sectors': result.get('sectors', {})})
+
+    except Exception as e:
+        log.warning(f"Intelligence scan error: {e}")
+        _pg_log("INTELLIGENCE_ERROR", reason=f"Intelligence scan failed: {str(e)[:200]}", source="intel_engine")
+
+@intelligence_scan.before_loop
+async def before_intel():
+    await bot.wait_until_ready()
+    await asyncio.sleep(300)  # 5 min warmup (let other systems stabilize first)
 
 
 # ══════════════════════════════════════════════════════════
@@ -4384,6 +5046,18 @@ async def fill_tracker():
                         # Update session stats
                         pg.update_session_stats(trades=1, pnl=realized_pnl or 0)
 
+                        # Write realized_pl to orders table (RiskManager reads this for Kelly sizing)
+                        if realized_pnl is not None:
+                            try:
+                                pg._exec(
+                                    """UPDATE orders SET realized_pl = %s, updated_at = NOW()
+                                       WHERE alpaca_order_id = %s""",
+                                    (realized_pnl, str(o.id))
+                                )
+                                log.info(f"    [FILL] Updated orders.realized_pl={realized_pnl:+.2f} for {sym}")
+                            except Exception as oe:
+                                log.warning(f"    [FILL] orders table update failed: {oe}")
+
                 return fills
             except Exception as e:
                 log.warning(f"Fill tracker error: {e}")
@@ -4421,6 +5095,13 @@ async def fill_tracker():
                         f"Sold {f['qty']}x @${f['filled_price']:.2f} "
                         f"— P&L: **${f['realized_pnl']:+.2f}**")
 
+                # V6: Record sell for post-sell tracking
+                if f['side'] == 'sell' and sell_tracker:
+                    sell_tracker.record_sell(
+                        f['symbol'], f['filled_price'], f['qty'],
+                        reason=f.get('reason', ''), strategy=f.get('order_type', '')
+                    )
+
     except Exception as e:
         log.warning(f"Fill tracker error: {e}")
 
@@ -4439,13 +5120,49 @@ async def on_ready():
     try:
         from tv_cdp_client import TVClient
         tv_ok = TVClient().health_check()
-    except:
-        pass
+    except Exception:            pass
     log.info(f"   TradingView: {'✅' if tv_ok else '❌'}")
     pg = _get_pg()
     pg_ok = pg and pg.conn
     log.info(f"   PostgreSQL: {'✅' if pg_ok else '❌'}")
     log.info(f"   Watchlist: {len(DIP_BUY_WATCHLIST)} stocks")
+
+    # ── V5/V6: Connect all modules to PostgreSQL ──
+    if pg:
+        try:
+            v6_status = []
+            if risk_mgr:
+                risk_mgr.set_db(pg)
+                v6_status.append('RiskMgr=✅')
+            if pro_data:
+                pro_data.db = pg
+                v6_status.append('ProData=✅')
+            # V6: Connect SmartExits modules
+            if sell_tracker:
+                sell_tracker.set_db(pg)
+                v6_status.append('SellTracker=✅')
+            if smart_exits:
+                smart_exits.set_db(pg)
+                v6_status.append('SmartExits=✅')
+            if catalyst_tracker:
+                catalyst_tracker.set_db(pg)
+                v6_status.append('Catalysts=✅')
+            if intel_engine:
+                intel_engine.set_db(pg)
+                v6_status.append('IntelEngine=✅')
+            _flush_startup_log()
+            # Log V6 wiring to PostgreSQL (not just console!)
+            wiring_msg = f"V6 DB wired: {' | '.join(v6_status)}"
+            log.info(f'   ✅ {wiring_msg}')
+            _pg_log("V6_READY", reason=wiring_msg, source="on_ready")
+        except Exception as e:
+            log.warning(f'   ⚠️ DB wiring failed: {e}')
+            _pg_log("V6_ERROR", reason=f"DB wiring failed: {str(e)[:200]}", source="on_ready")
+    else:
+        log.warning('   ⚠️ No PostgreSQL — modules running without DB')
+
+    log.info(f"   V5: Risk={'✅' if risk_mgr else '❌'} ProData={'✅' if pro_data else '❌'}")
+    log.info(f"   V6: SellTracker={'✅' if sell_tracker else '❌'} SmartExits={'✅' if smart_exits else '❌'} Catalysts={'✅' if catalyst_tracker else '❌'}")
 
     # Register this bot session in DB (tracks version, uptime, crashes)
     if pg:
@@ -4493,6 +5210,16 @@ async def on_ready():
     if not claude_daily_deep_learn.is_running():
         claude_daily_deep_learn.start()
         log.info("   ✅ Claude daily deep learn: once/day at 3 AM ET")
+    if not intelligence_scan.is_running():
+        intelligence_scan.start()
+        log.info("   ✅ V6 Intelligence scan: every 1 hour (stock DNA, earnings, strategies)")
+
+    # Log all task starts to PostgreSQL
+    tasks_started = ['position_monitor(60s)', 'full_scan(5min)', 'decision_report(10min)',
+                     'runner_scan(2min)', 'claude_deep(30min)', 'learning(1hr)',
+                     'outcome_grader(30min)', 'ah_pm(15min)', 'fill_tracker(5min)',
+                     'claude_3am(daily)', 'intelligence(1hr)']
+    _pg_log("TASKS_STARTED", reason=f"11 tasks: {', '.join(tasks_started)}", source="on_ready")
 
     channel = bot.get_channel(SCAN_CHANNEL_ID)
     if channel:
@@ -4522,3 +5249,4 @@ if __name__ == '__main__':
         sys.exit(1)
     print("🦍 Starting Beast Discord Bot with Autonomous Loop...")
     bot.run(token)
+

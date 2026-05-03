@@ -1,57 +1,113 @@
 @echo off
 echo ============================================
-echo   BEAST TERMINAL V4 - Full Setup + Start
+echo   BEAST TERMINAL V5 - One-Click Startup
+echo   %date% %time%
 echo ============================================
+echo.
+echo   NOTE: TradingView Chrome must already be running!
+echo   If not, run START_CHROME_TV.bat first.
+echo.
 set PYTHONIOENCODING=utf-8
+set PY=C:\Users\beastadmin\AppData\Local\Programs\Python\Python312\python.exe
+set LOG=C:\beast-test2\startup.log
 cd /d C:\beast-test2
 
-echo.
-echo [1/7] Pulling latest code from GitHub...
-"C:\Program Files\Git\cmd\git.exe" pull origin main --force
-echo Waiting 5s...
-timeout /t 5 /nobreak >nul
+echo [%time%] Starting Beast Terminal V5... > %LOG%
 
-echo.
-echo [2/7] Installing Python dependencies...
-C:\Python312\python.exe -m pip install psycopg2-binary --quiet 2>nul
-echo Done.
+REM ── STEP 1: Verify Python ──
+echo [1/6] Checking Python...
+echo [%time%] STEP 1: Checking Python >> %LOG%
+%PY% --version >> %LOG% 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    echo   ERROR: Python not found at %PY%
+    echo   Trying py launcher...
+    py --version >> %LOG% 2>&1
+    if %ERRORLEVEL% NEQ 0 (
+        echo   FATAL: No Python found!
+        pause
+        exit /b 1
+    )
+    set PY=py
+)
+echo   Python OK
 
-echo.
-echo [3/7] Rebuilding Dashboard (Next.js)...
+REM ── STEP 2: Pull latest code ──
+echo [2/6] Pulling latest code...
+echo [%time%] STEP 2: Git pull >> %LOG%
+"C:\Program Files\Git\cmd\git.exe" pull origin main --force >> %LOG% 2>&1
+echo   Done.
+
+REM ── STEP 3: Install deps ──
+echo [3/7] Installing dependencies...
+echo [%time%] STEP 3: Installing deps >> %LOG%
+%PY% -m pip install -r requirements.txt --quiet >> %LOG% 2>&1
+%PY% -m pip install discord.py openai websocket-client aiohttp flask flask-cors beautifulsoup4 pandas --quiet >> %LOG% 2>&1
+echo   Done.
+
+REM ── STEP 4: Rebuild Dashboard ──
+echo [4/7] Rebuilding Dashboard (Next.js)...
+echo [%time%] STEP 4: Dashboard build >> %LOG%
 cd /d C:\beast-test2\dashboard
-if exist .next rd /s /q .next
-call npm install --silent 2>nul
-call npx next build 2>nul
+call npx next build >> %LOG% 2>&1
 cd /d C:\beast-test2
-echo Dashboard built.
+echo   Dashboard built.
 
-echo.
-echo [4/7] Starting TradingView Desktop with CDP...
-start "" "C:\Program Files\WindowsApps\TradingView.Desktop_3.1.0.7818_x64__n534cwy3pjxzj\TradingView.exe" --remote-debugging-port=9222
-echo Waiting 20s for TV to load chart...
-timeout /t 20 /nobreak >nul
+REM ── STEP 4: Verify TV CDP is running ──
+echo [5/7] Checking TradingView CDP...
+echo [%time%] STEP 5: TV CDP check >> %LOG%
+powershell -Command "try { $r = Invoke-WebRequest http://localhost:9222/json/version -UseBasicParsing -TimeoutSec 5; Write-Output ('CDP OK: ' + $r.Content.Substring(0, [Math]::Min(80, $r.Content.Length))); exit 0 } catch { Write-Output 'CDP NOT RESPONDING'; exit 1 }" >> %LOG% 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    echo   WARNING: TV CDP not responding on port 9222!
+    echo   Run START_CHROME_TV.bat first, log into TV, then re-run this script.
+    echo   See TV_SETUP_GUIDE.md for instructions.
+    echo [%time%] WARNING: TV CDP not responding >> %LOG%
+) else (
+    echo   TV CDP connected!
+    echo [%time%] TV CDP OK >> %LOG%
+)
 
-echo.
-echo [5/7] Starting Dashboard API (port 8080)...
-start "BeastAPI" cmd /c "cd /d C:\beast-test2 && set PYTHONIOENCODING=utf-8 && C:\Python312\python.exe dashboard_api.py"
-echo Waiting 5s...
+REM ── STEP 5: Start Dashboard API + UI ──
+echo [6/7] Starting Dashboard...
+echo [%time%] STEP 6: Dashboard >> %LOG%
+
+REM Kill old API/Dashboard if running
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr "8080" ^| findstr "LISTENING"') do (
+    echo   Killing old API on PID %%a >> %LOG%
+    taskkill /F /PID %%a 2>>%LOG%
+)
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr "3000" ^| findstr "LISTENING"') do (
+    echo   Killing old Dashboard on PID %%a >> %LOG%
+    taskkill /F /PID %%a 2>>%LOG%
+)
+timeout /t 3 /nobreak >nul
+
+start "BeastAPI" cmd /c "cd /d C:\beast-test2 && set PYTHONIOENCODING=utf-8 && %PY% dashboard_api.py >> C:\beast-test2\api.log 2>&1"
+echo   API starting on port 8080...
 timeout /t 5 /nobreak >nul
 
-echo.
-echo [6/7] Starting Dashboard UI (port 3000)...
-start "BeastDash" cmd /c "cd /d C:\beast-test2\dashboard && npx next start -p 3000"
-echo Waiting 10s...
-timeout /t 10 /nobreak >nul
+powershell -Command "try { $r = Invoke-WebRequest http://localhost:8080/api/health -UseBasicParsing -TimeoutSec 5; Write-Output ('API OK: ' + $r.Content); exit 0 } catch { Write-Output 'API FAIL'; exit 1 }" >> %LOG% 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    echo   WARNING: Dashboard API failed to start!
+) else (
+    echo   Dashboard API running!
+)
 
-echo.
-echo [7/7] Starting Discord Bot (autonomous trading)...
+start "BeastDash" cmd /c "cd /d C:\beast-test2\dashboard && npx next start -p 3000 >> C:\beast-test2\dash.log 2>&1"
+echo   Dashboard UI starting on port 3000...
+timeout /t 5 /nobreak >nul
+
+REM ── STEP 6: Start Bot ──
+echo [7/7] Starting Beast Bot...
+echo [%time%] STEP 7: Starting bot >> %LOG%
 echo ============================================
-echo   ALL SYSTEMS GO - Beast Terminal V4
-echo   TV: CDP port 9222
+echo   BEAST TERMINAL V5 - ALL SYSTEMS GO
+echo   TV: CDP port 9222 (must be running already)
 echo   API: port 8080
 echo   Dashboard: port 3000
 echo   Bot: autonomous loops starting...
-echo   PostgreSQL: Azure beast-trading-db
+echo   Log: %LOG%
 echo ============================================
 echo.
-C:\Python312\python.exe discord_bot.py
+echo [%time%] Starting discord_bot.py >> %LOG%
+%PY% discord_bot.py
+
