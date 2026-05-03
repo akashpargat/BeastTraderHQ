@@ -38,9 +38,11 @@ AZURE_DEPLOYMENT = os.getenv('AZURE_OPENAI_DEPLOYMENT', 'gpt54')  # GPT-5.4 — 
 AZURE_DEPLOYMENT_FALLBACK = 'gpt4o'  # Fallback if gpt54 fails
 AZURE_API_VERSION = '2024-10-21'
 
-# ── Claude Opus 4.7 via tunnel (30-min deep scans) ──
-CLAUDE_URL = os.getenv('AI_API_URL', 'https://ai.beast-trader.com')
+# ── Claude Opus 4.7 — Direct Anthropic API (primary) + tunnel fallback ──
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')  # Direct Anthropic key (add to .env)
+CLAUDE_URL = os.getenv('AI_API_URL', 'https://ai.beast-trader.com')  # Legacy tunnel (fallback)
 CLAUDE_API_KEY = os.getenv('AI_API_KEY', 'beast-v3-sk-7f3a9e2b4d1c8f5e6a0b3d9c')
+CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', 'claude-sonnet-4-20250514')  # Fast + cheap for batches
 
 # ── Rate limiting + AI health tracking ──
 _ai_last_call = 0
@@ -202,6 +204,7 @@ class AIBrain:
     def __init__(self):
         self._gpt_available = False
         self._claude_available = False
+        self._claude_direct = False  # True = Anthropic API, False = tunnel
         self._azure_client = None
 
         # Check Azure GPT-4o
@@ -217,20 +220,137 @@ class AIBrain:
             except Exception as e:
                 log.warning(f"Azure GPT-4o init failed: {e}")
 
-        # Check Claude tunnel
-        try:
-            resp = requests.get(f"{CLAUDE_URL}/health", timeout=5)
-            if resp.status_code == 200 and resp.json().get('ai_available'):
-                self._claude_available = True
-                log.info(f"🧠 Claude Opus 4.7 ONLINE ({CLAUDE_URL})")
-            else:
-                log.warning("🧠 Claude reachable but AI unavailable")
-        except:
-            log.warning("🧠 Claude OFFLINE — GPT-4o only mode")
+        # Check Claude — Direct Anthropic API first, tunnel fallback
+        if ANTHROPIC_API_KEY:
+            try:
+                resp = requests.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": CLAUDE_MODEL, "max_tokens": 50, "messages": [{"role": "user", "content": "Say OK"}]},
+                    timeout=10)
+                if resp.status_code == 200:
+                    self._claude_available = True
+                    self._claude_direct = True
+                    log.info(f"🧠 Claude ONLINE — Direct Anthropic API ({CLAUDE_MODEL})")
+                else:
+                    log.warning(f"🧠 Claude direct API error: {resp.status_code} — {resp.text[:100]}")
+            except Exception as e:
+                log.warning(f"🧠 Claude direct API failed: {e}")
+
+        # Fallback: tunnel proxy
+        if not self._claude_available:
+            try:
+                resp = requests.get(f"{CLAUDE_URL}/health", timeout=5)
+                if resp.status_code == 200 and resp.json().get('ai_available'):
+                    self._claude_available = True
+                    self._claude_direct = False
+                    log.info(f"🧠 Claude ONLINE via tunnel ({CLAUDE_URL})")
+                else:
+                    log.warning("🧠 Claude tunnel reachable but AI unavailable")
+            except Exception:
+                log.warning("🧠 Claude OFFLINE — GPT-only mode")
 
     @property
     def is_available(self) -> bool:
         return self._gpt_available or self._claude_available
+
+    # ══════════════════════════════════════════════════
+    # RAW PROMPT CALL — for 3AM batched learning
+    # Sends prompt directly, returns parsed JSON dict
+    # Tries: Claude Direct → Claude Tunnel → GPT Raw → {}
+    # ══════════════════════════════════════════════════
+
+    def call_raw(self, prompt: str, system: str = "Output valid JSON only.",
+                 timeout: int = 120) -> dict:
+        """Send a raw prompt to AI and get JSON back. Used by 3AM learning.
+        Does NOT go through analyze_stock (which wraps in its own format)."""
+        import json as _json
+
+        # Try 1: Claude Direct (Anthropic API)
+        if self._claude_available and self._claude_direct and ANTHROPIC_API_KEY:
+            try:
+                t0 = time.time()
+                resp = requests.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": CLAUDE_MODEL,
+                        "max_tokens": 4096,
+                        "system": system,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                    timeout=timeout)
+                elapsed = int((time.time() - t0) * 1000)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    text = data.get('content', [{}])[0].get('text', '{}')
+                    # Extract JSON from possible markdown wrapping
+                    if '```json' in text:
+                        text = text.split('```json')[1].split('```')[0].strip()
+                    elif '```' in text:
+                        text = text.split('```')[1].split('```')[0].strip()
+                    try:
+                        result = _json.loads(text)
+                        log.info(f"  [AI] Claude direct OK ({elapsed}ms, {len(text)} chars)")
+                        return result
+                    except _json.JSONDecodeError:
+                        log.warning(f"  [AI] Claude direct non-JSON: {text[:150]}")
+                        return {'raw_response': text[:1000]}
+                else:
+                    log.warning(f"  [AI] Claude direct HTTP {resp.status_code}: {resp.text[:150]}")
+            except Exception as e:
+                log.warning(f"  [AI] Claude direct error: {e}")
+
+        # Try 2: Claude Tunnel (legacy proxy)
+        if self._claude_available and not self._claude_direct:
+            try:
+                resp = requests.post(
+                    f"{CLAUDE_URL}/analyze",
+                    json={'prompt': prompt, 'system_prompt': system},
+                    headers={'X-API-Key': CLAUDE_API_KEY, 'Content-Type': 'application/json'},
+                    timeout=timeout)
+                if resp.status_code == 200:
+                    try:
+                        result = resp.json()
+                        log.info(f"  [AI] Claude tunnel OK ({len(resp.text)} chars)")
+                        return result
+                    except Exception:
+                        log.warning(f"  [AI] Claude tunnel non-JSON")
+            except Exception as e:
+                log.warning(f"  [AI] Claude tunnel error: {e}")
+
+        # Try 3: Azure GPT Raw (direct OpenAI call, NOT analyze_stock)
+        if self._gpt_available and self._azure_client:
+            try:
+                t0 = time.time()
+                response = self._azure_client.chat.completions.create(
+                    model=AZURE_DEPLOYMENT,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.3,
+                    max_tokens=4096,
+                    response_format={"type": "json_object"},
+                )
+                elapsed = int((time.time() - t0) * 1000)
+                text = response.choices[0].message.content or '{}'
+                try:
+                    result = _json.loads(text)
+                    log.info(f"  [AI] GPT raw OK ({elapsed}ms, {len(text)} chars)")
+                    return result
+                except _json.JSONDecodeError:
+                    log.warning(f"  [AI] GPT raw non-JSON: {text[:150]}")
+                    return {'raw_response': text[:1000]}
+            except Exception as e:
+                log.warning(f"  [AI] GPT raw error: {e}")
+
+        log.warning("  [AI] All AI providers failed for raw call")
+        return {}
 
     # ══════════════════════════════════════════════════
     # 5-MIN SCAN: GPT-4o (fast, maxed out)

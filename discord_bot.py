@@ -4531,47 +4531,23 @@ async def claude_daily_deep_learn():
             import time as _t
 
             def _ai_call(batch_name, batch_prompt, timeout=120):
-                """Send one AI batch. Try Claude -> GPT -> return empty dict."""
+                """Send one AI batch via brain.call_raw() — tries Claude Direct → Tunnel → GPT Raw."""
                 log.info(f"  [3AM] Batch '{batch_name}': {len(batch_prompt)} chars (~{len(batch_prompt)//4} tokens)")
                 _pg_log("DAILY_LEARN_BATCH", reason=f"Batch '{batch_name}': {len(batch_prompt)} chars",
                         source="daily_batch", data={"batch": batch_name, "prompt_len": len(batch_prompt), "prompt_preview": batch_prompt[:1000]})
-                # Try Claude
                 try:
-                    if brain._claude_available:
-                        import requests as _rq
-                        resp = _rq.post(
-                            f"{os.getenv('AI_API_URL', 'https://ai.beast-trader.com')}/analyze",
-                            json={"prompt": batch_prompt, "system_prompt": f"Batch: {batch_name}. Output valid JSON only."},
-                            headers={"X-API-Key": os.getenv("AI_API_KEY", ""), "Content-Type": "application/json"},
-                            timeout=timeout)
-                        if resp.status_code == 200:
-                            try:
-                                r = resp.json()
-                                log.info(f"  [3AM] '{batch_name}' Claude OK ({len(resp.text)} chars)")
-                                return r
-                            except Exception:
-                                log.warning(f"  [3AM] '{batch_name}' Claude non-JSON: {resp.text[:150]}")
-                        else:
-                            log.warning(f"  [3AM] '{batch_name}' Claude HTTP {resp.status_code}")
-                except Exception as ce:
-                    log.warning(f"  [3AM] '{batch_name}' Claude: {ce}")
-                # Try GPT
-                try:
-                    if brain._gpt_available:
-                        log.info(f"  [3AM] '{batch_name}' trying GPT fallback...")
-                        r = brain.analyze_stock("PORTFOLIO", {"deep_analysis_prompt": batch_prompt})
-                        if r:
-                            if isinstance(r, dict) and "analysis" in r:
-                                inner = r.get("analysis", r)
-                                if isinstance(inner, str):
-                                    try:
-                                        r = _json.loads(inner)
-                                    except Exception:
-                                        r = {"raw": inner[:500]}
-                            log.info(f"  [3AM] '{batch_name}' GPT OK")
-                            return r
-                except Exception as ge:
-                    log.warning(f"  [3AM] '{batch_name}' GPT: {ge}")
+                    r = brain.call_raw(
+                        batch_prompt,
+                        system=f"You are a senior quant PM. Batch: {batch_name}. Output valid JSON only. No markdown, no explanation, just the JSON object.",
+                        timeout=timeout
+                    )
+                    if r:
+                        log.info(f"  [3AM] '{batch_name}' OK: {list(r.keys())[:6]}")
+                        return r
+                    else:
+                        log.warning(f"  [3AM] '{batch_name}' returned empty")
+                except Exception as e:
+                    log.warning(f"  [3AM] '{batch_name}' error: {e}")
                 log.warning(f"  [3AM] '{batch_name}' FAILED — both AI unavailable")
                 _pg_log("DAILY_LEARN_ERROR", reason=f"Batch '{batch_name}' failed (Claude+GPT)", source="daily_batch")
                 return {}
