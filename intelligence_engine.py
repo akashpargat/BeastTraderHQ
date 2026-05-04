@@ -1,14 +1,20 @@
 """
-Beast V6 — Intelligence Engine (Background Learning)
+Beast V7 — Intelligence Engine (Background Learning)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 The "eagle eye" — always watching, always learning.
 
 Runs hourly in background, analyzes ALL stocks:
-1. EarningsPatternAnalyzer — backtest 4 quarters of earnings behavior
-2. StockDNAProfiler — learn each stock's "personality" (jumper, grinder, mean-reverter)
+1. EarningsPatternAnalyzer — backtest 12 quarters (3yr) of earnings behavior
+2. StockDNAProfiler — 2yr deep profile: personality, S/R levels, seasonality, EMA alignment
 3. StrategyScorer — which strategy works best on which stock (with confidence)
 4. CorrelationRadar — which stocks move together, sector rotation signals
 5. SmartWatchlist — priority watchlist with custom strategy per stock
+
+V7 UPGRADES:
+- StockDNA: 90d → 2yr daily + hourly (support/resistance, seasonality, vol regime, EMA)
+- Earnings: 1yr/4Q → 3yr/12Q with recency weighting
+- ETF detection: dynamic via yfinance quoteType (not hardcoded)
+- Feature flags: V7_DEEP_DNA, V7_EARNINGS_3Y, V7_ETF_DETECT
 
 All data feeds into 3AM Claude for daily playbook generation.
 """
@@ -29,12 +35,12 @@ log = logging.getLogger("Beast.Intelligence")
 # ══════════════════════════════════════════════════════════
 
 class EarningsPatternAnalyzer:
-    """Backtest earnings behavior: what does each stock do pre/post earnings?
+    """V7: 3yr/12Q earnings analysis with recency weighting + dynamic ETF detection.
     
-    Discovers patterns like:
-    - MSFT: dips 2-3% day after earnings, recovers within 3 days → BUY the dip
-    - TSLA: gaps up 5-10% on earnings, fades 50% by day 3 → SCALP the gap
-    - NVDA: runs up 5% in week before earnings → SELL before, buy after
+    Recent quarters weighted 2x — regime changes matter more than ancient history.
+    ETFs detected dynamically via yfinance quoteType — no hardcoded lists.
+    
+    Patterns: gap_and_fade, dip_and_recover, pre_earnings_run, sustained_mover
     """
 
     def __init__(self, db=None):
@@ -43,37 +49,54 @@ class EarningsPatternAnalyzer:
     def set_db(self, db):
         self.db = db
 
+    def _is_etf(self, symbol: str) -> bool:
+        """Detect if symbol is an ETF/ETN/fund dynamically."""
+        try:
+            import yfinance as yf
+            info = yf.Ticker(symbol).info
+            qt = info.get('quoteType', '').upper()
+            return qt in ('ETF', 'MUTUALFUND', 'INDEX', 'CRYPTOCURRENCY')
+        except Exception:
+            return False
+
     def analyze_stock(self, symbol: str, alpaca_data=None) -> dict:
-        """Analyze earnings pattern for a single stock using price history."""
+        """V7: 3yr earnings analysis with recency weighting."""
         result = {
             'symbol': symbol,
             'pattern': 'unknown',
-            'pre_earnings_avg': 0,    # avg move 5 days before
-            'day_of_avg': 0,          # avg gap on earnings day
-            'post_1d_avg': 0,         # avg move day after
-            'post_3d_avg': 0,         # avg move 3 days after
-            'post_5d_avg': 0,         # avg move 5 days after
+            'pre_earnings_avg': 0,
+            'day_of_avg': 0,
+            'post_1d_avg': 0,
+            'post_3d_avg': 0,
+            'post_5d_avg': 0,
             'best_strategy': 'HOLD',
             'confidence': 30,
             'earnings_dates': [],
             'sample_size': 0,
+            'earnings_applicable': True,
         }
+
+        # V7: Dynamic ETF detection
+        if self._is_etf(symbol):
+            result['earnings_applicable'] = False
+            result['pattern'] = 'etf_no_earnings'
+            result['best_strategy'] = 'N/A — ETF/fund (trade on technicals only)'
+            result['confidence'] = 90
+            return result
 
         try:
             import yfinance as yf
             ticker = yf.Ticker(symbol)
             
-            # Get earnings dates
             try:
                 earnings_hist = ticker.earnings_dates
                 if earnings_hist is None or len(earnings_hist) == 0:
                     return result
-                dates = list(earnings_hist.index)[:8]  # last 8 quarters
+                dates = list(earnings_hist.index)[:12]  # V7: 12 quarters
             except Exception:
                 return result
 
-            # Get 1 year of daily prices
-            hist = ticker.history(period="1y", interval="1d")
+            hist = ticker.history(period="3y", interval="1d")  # V7: 3yr
             if hist is None or len(hist) < 60:
                 return result
 
@@ -83,10 +106,9 @@ class EarningsPatternAnalyzer:
             post_3d = []
             post_5d = []
 
-            for ed in dates:
+            for q_idx, ed in enumerate(dates):
                 try:
                     ed_date = ed.date() if hasattr(ed, 'date') else ed
-                    # Find the earnings date in price history
                     idx = None
                     for i, d in enumerate(hist.index):
                         if d.date() == ed_date or (abs((d.date() - ed_date).days) <= 1):
@@ -99,24 +121,23 @@ class EarningsPatternAnalyzer:
                     close_day = float(hist.iloc[idx]['Close'])
                     close_5d_before = float(hist.iloc[idx - 5]['Close'])
 
-                    # Pre-earnings run (5 days before)
+                    # V7: Recent quarters weighted 2x
+                    w = 2.0 if q_idx < 4 else 1.0
+
                     pre_pct = (close_before - close_5d_before) / close_5d_before * 100
-                    pre_moves.append(pre_pct)
-
-                    # Earnings day gap
+                    pre_moves.append((pre_pct, w))
                     gap_pct = (close_day - close_before) / close_before * 100
-                    day_moves.append(gap_pct)
+                    day_moves.append((gap_pct, w))
 
-                    # Post-earnings recovery
                     if idx + 1 < len(hist):
                         p1 = (float(hist.iloc[idx + 1]['Close']) - close_day) / close_day * 100
-                        post_1d.append(p1)
+                        post_1d.append((p1, w))
                     if idx + 3 < len(hist):
                         p3 = (float(hist.iloc[idx + 3]['Close']) - close_day) / close_day * 100
-                        post_3d.append(p3)
+                        post_3d.append((p3, w))
                     if idx + 5 < len(hist):
                         p5 = (float(hist.iloc[idx + 5]['Close']) - close_day) / close_day * 100
-                        post_5d.append(p5)
+                        post_5d.append((p5, w))
 
                     result['earnings_dates'].append(str(ed_date))
                 except Exception:
@@ -125,14 +146,18 @@ class EarningsPatternAnalyzer:
             if not day_moves:
                 return result
 
-            result['sample_size'] = len(day_moves)
-            result['pre_earnings_avg'] = round(sum(pre_moves) / len(pre_moves), 2) if pre_moves else 0
-            result['day_of_avg'] = round(sum(day_moves) / len(day_moves), 2)
-            result['post_1d_avg'] = round(sum(post_1d) / len(post_1d), 2) if post_1d else 0
-            result['post_3d_avg'] = round(sum(post_3d) / len(post_3d), 2) if post_3d else 0
-            result['post_5d_avg'] = round(sum(post_5d) / len(post_5d), 2) if post_5d else 0
+            def wavg(pairs):
+                if not pairs: return 0
+                tw = sum(wt for _, wt in pairs)
+                return sum(v * wt for v, wt in pairs) / tw if tw > 0 else 0
 
-            # Determine pattern and strategy
+            result['sample_size'] = len(day_moves)
+            result['pre_earnings_avg'] = round(wavg(pre_moves), 2)
+            result['day_of_avg'] = round(wavg(day_moves), 2)
+            result['post_1d_avg'] = round(wavg(post_1d), 2)
+            result['post_3d_avg'] = round(wavg(post_3d), 2)
+            result['post_5d_avg'] = round(wavg(post_5d), 2)
+
             avg_gap = result['day_of_avg']
             avg_post3 = result['post_3d_avg']
             avg_pre = result['pre_earnings_avg']
@@ -140,19 +165,19 @@ class EarningsPatternAnalyzer:
             if avg_gap > 3 and avg_post3 < avg_gap * 0.5:
                 result['pattern'] = 'gap_and_fade'
                 result['best_strategy'] = 'SCALP earnings gap, sell within hours'
-                result['confidence'] = min(80, 50 + len(day_moves) * 8)
+                result['confidence'] = min(85, 50 + len(day_moves) * 5)
             elif avg_gap < -2 and avg_post3 > avg_gap + 2:
                 result['pattern'] = 'dip_and_recover'
                 result['best_strategy'] = 'BUY the post-earnings dip (day 1-2)'
-                result['confidence'] = min(80, 50 + len(day_moves) * 8)
+                result['confidence'] = min(85, 50 + len(day_moves) * 5)
             elif avg_pre > 2:
                 result['pattern'] = 'pre_earnings_run'
                 result['best_strategy'] = 'BUY 5 days before, SELL before earnings'
-                result['confidence'] = min(75, 45 + len(day_moves) * 7)
+                result['confidence'] = min(80, 45 + len(day_moves) * 5)
             elif avg_gap > 0 and avg_post3 > 0:
                 result['pattern'] = 'sustained_mover'
                 result['best_strategy'] = 'HOLD through earnings (trends continue)'
-                result['confidence'] = min(70, 40 + len(day_moves) * 6)
+                result['confidence'] = min(75, 40 + len(day_moves) * 4)
             else:
                 result['pattern'] = 'unpredictable'
                 result['best_strategy'] = 'REDUCE before earnings (too volatile)'
@@ -201,19 +226,20 @@ class EarningsPatternAnalyzer:
 # ══════════════════════════════════════════════════════════
 
 class StockDNAProfiler:
-    """Learn each stock's 'personality' from price history.
+    """V7: 2yr deep stock personality profiling.
     
-    DNA Types:
-    - JUMPER: TSLA-like. Low activity then sudden 5%+ moves. Trade the jumps.
-    - GRINDER: MSFT-like. Steady small moves. Scalp the range.
-    - MEAN_REVERTER: Drops then recovers. Buy dips, sell pops.
-    - MOMENTUM: Once it starts moving, keeps going. Ride the trend.
-    - VOLATILE: Wild swings both ways. Wider stops needed.
-    - STEADY: Low vol, small ATR. Tight scalps work.
+    DNA Types: JUMPER, GRINDER, MEAN_REVERTER, MOMENTUM, VOLATILE, STEADY
+    
+    V7 additions:
+    - 2yr daily + hourly data (was 90d daily only)
+    - Support/resistance levels from price clusters
+    - Seasonality (month-of-year tendencies, marked low-confidence)
+    - Volatility regime (quiet vs wild phase)
+    - EMA alignment (8/21/50/200) for trend strength
     """
 
     def analyze_stock(self, symbol: str, alpaca_data=None) -> dict:
-        """Profile a stock's behavior using price history."""
+        """V7: 2yr deep profile with S/R, seasonality, EMA, vol regime."""
         result = {
             'symbol': symbol,
             'dna_type': 'unknown',
@@ -221,18 +247,27 @@ class StockDNAProfiler:
             'avg_daily_volume': 0,
             'max_gap_up': 0,
             'max_gap_down': 0,
-            'mean_reversion_score': 0,  # -1 to 1 (1 = strong reversion)
-            'momentum_score': 0,         # -1 to 1 (1 = strong momentum)
-            'gap_frequency': 0,          # how often it gaps >2%
-            'best_scalp_pct': 2.0,       # optimal scalp target from history
-            'best_trail_pct': 3.0,       # optimal trail stop from history
+            'mean_reversion_score': 0,
+            'momentum_score': 0,
+            'gap_frequency': 0,
+            'best_scalp_pct': 2.0,
+            'best_trail_pct': 3.0,
             'confidence': 30,
+            # V7 new fields
+            'support_levels': [],
+            'resistance_levels': [],
+            'seasonality': {},
+            'vol_regime': 'unknown',
+            'vol_percentile': 50,
+            'ema_alignment': 'unknown',
+            'ema_trend_strength': 0,
+            'hourly_patterns': {},
         }
 
         try:
             import yfinance as yf
-            hist = yf.Ticker(symbol).history(period="90d", interval="1d")
-            if hist is None or len(hist) < 30:
+            hist = yf.Ticker(symbol).history(period="2y", interval="1d")  # V7: 2yr
+            if hist is None or len(hist) < 60:
                 return result
 
             closes = [float(c) for c in hist['Close']]
@@ -241,59 +276,180 @@ class StockDNAProfiler:
             volumes = [int(v) for v in hist['Volume']]
             opens = [float(o) for o in hist['Open']]
 
-            # Daily range
+            # ── Original DNA metrics ──
             ranges = [(h - l) / l * 100 for h, l in zip(highs, lows) if l > 0]
             result['avg_daily_range_pct'] = round(sum(ranges) / len(ranges), 2) if ranges else 0
             result['avg_daily_volume'] = int(sum(volumes) / len(volumes)) if volumes else 0
 
-            # Gaps
             gaps = [(o - closes[i]) / closes[i] * 100 for i, o in enumerate(opens[1:], 0) if closes[i] > 0]
             big_gaps = [g for g in gaps if abs(g) > 2]
             result['gap_frequency'] = round(len(big_gaps) / len(gaps) * 100, 1) if gaps else 0
             result['max_gap_up'] = round(max(gaps), 2) if gaps else 0
             result['max_gap_down'] = round(min(gaps), 2) if gaps else 0
 
-            # Mean reversion: after a down day, does it bounce?
+            # Mean reversion
             reversions = 0
             continuations = 0
             for i in range(2, len(closes)):
                 day_move = (closes[i-1] - closes[i-2]) / closes[i-2]
                 next_move = (closes[i] - closes[i-1]) / closes[i-1]
-                if day_move < -0.01:  # down day
-                    if next_move > 0:
-                        reversions += 1
-                    else:
-                        continuations += 1
+                if day_move < -0.01:
+                    if next_move > 0: reversions += 1
+                    else: continuations += 1
             total_signals = reversions + continuations
             result['mean_reversion_score'] = round(
                 (reversions - continuations) / total_signals, 2
             ) if total_signals > 5 else 0
 
-            # Momentum: do up days cluster?
+            # Momentum
             daily_returns = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
             momentum_hits = 0
             for i in range(1, len(daily_returns)):
-                if daily_returns[i] > 0 and daily_returns[i-1] > 0:
-                    momentum_hits += 1
-                elif daily_returns[i] < 0 and daily_returns[i-1] < 0:
+                if (daily_returns[i] > 0 and daily_returns[i-1] > 0) or \
+                   (daily_returns[i] < 0 and daily_returns[i-1] < 0):
                     momentum_hits += 1
             result['momentum_score'] = round(
                 momentum_hits / len(daily_returns) * 2 - 1, 2
             ) if daily_returns else 0
 
-            # Optimal scalp target: what % move captures 70th percentile of up moves
+            # Optimal scalp/trail targets
             up_moves = [r * 100 for r in daily_returns if r > 0]
             if up_moves:
                 up_moves.sort()
                 p70_idx = int(len(up_moves) * 0.7)
                 result['best_scalp_pct'] = round(up_moves[p70_idx], 1)
 
-            # Optimal trail: what's the avg drawdown from intraday highs
             drawdowns = [(h - c) / h * 100 for h, c in zip(highs, closes) if h > 0]
             if drawdowns:
-                result['best_trail_pct'] = round(sum(drawdowns) / len(drawdowns) * 2, 1)  # 2x avg drawdown
+                result['best_trail_pct'] = round(sum(drawdowns) / len(drawdowns) * 2, 1)
 
-            # Classify DNA
+            # ── V7: Support/Resistance from price clusters ──
+            try:
+                # Use recency-weighted price histogram to find clusters
+                recent_closes = closes[-120:]  # Last ~6 months weighted higher
+                price_min, price_max = min(recent_closes), max(recent_closes)
+                if price_max > price_min:
+                    n_bins = 20
+                    bin_size = (price_max - price_min) / n_bins
+                    bins = [0] * n_bins
+                    for p in recent_closes:
+                        b = min(int((p - price_min) / bin_size), n_bins - 1)
+                        bins[b] += 1
+                    # Find top 3 clusters as S/R levels
+                    threshold = max(bins) * 0.6
+                    levels = []
+                    for i, count in enumerate(bins):
+                        if count >= threshold:
+                            level = round(price_min + (i + 0.5) * bin_size, 2)
+                            levels.append(level)
+                    current_price = closes[-1]
+                    result['support_levels'] = sorted([l for l in levels if l < current_price])[-3:]
+                    result['resistance_levels'] = sorted([l for l in levels if l > current_price])[:3]
+            except Exception:
+                pass
+
+            # ── V7: Seasonality (month-of-year patterns) ──
+            try:
+                monthly = {}
+                for i in range(1, len(hist)):
+                    month = hist.index[i].month
+                    ret = (closes[i] - closes[i-1]) / closes[i-1] * 100
+                    monthly.setdefault(month, []).append(ret)
+                seasonality = {}
+                for month, rets in monthly.items():
+                    avg = sum(rets) / len(rets)
+                    win_pct = len([r for r in rets if r > 0]) / len(rets) * 100
+                    seasonality[month] = {
+                        'avg_return': round(avg, 3),
+                        'win_pct': round(win_pct, 1),
+                        'samples': len(rets),
+                        'confidence': 'low' if len(rets) < 30 else 'medium',
+                    }
+                result['seasonality'] = seasonality
+            except Exception:
+                pass
+
+            # ── V7: Volatility regime (current vs historical) ──
+            try:
+                recent_vol = sum(abs(r) for r in daily_returns[-20:]) / 20 if len(daily_returns) >= 20 else 0
+                hist_vol = sum(abs(r) for r in daily_returns) / len(daily_returns) if daily_returns else 0
+                if hist_vol > 0:
+                    vol_ratio = recent_vol / hist_vol
+                    if vol_ratio > 1.5:
+                        result['vol_regime'] = 'WILD'
+                    elif vol_ratio < 0.6:
+                        result['vol_regime'] = 'QUIET'
+                    else:
+                        result['vol_regime'] = 'NORMAL'
+                    # Percentile: where does current vol rank in 2yr history?
+                    all_20d_vols = []
+                    for j in range(20, len(daily_returns)):
+                        v = sum(abs(daily_returns[k]) for k in range(j-20, j)) / 20
+                        all_20d_vols.append(v)
+                    if all_20d_vols:
+                        rank = sum(1 for v in all_20d_vols if v < recent_vol) / len(all_20d_vols) * 100
+                        result['vol_percentile'] = round(rank)
+            except Exception:
+                pass
+
+            # ── V7: EMA alignment (8/21/50/200) ──
+            try:
+                def ema(data, period):
+                    if len(data) < period: return None
+                    mult = 2 / (period + 1)
+                    val = sum(data[:period]) / period
+                    for d in data[period:]:
+                        val = (d - val) * mult + val
+                    return val
+
+                ema8 = ema(closes, 8)
+                ema21 = ema(closes, 21)
+                ema50 = ema(closes, 50)
+                ema200 = ema(closes, 200) if len(closes) >= 200 else None
+
+                if ema8 and ema21 and ema50:
+                    if ema200 and ema8 > ema21 > ema50 > ema200:
+                        result['ema_alignment'] = 'PERFECT_BULL'
+                        result['ema_trend_strength'] = 90
+                    elif ema8 > ema21 > ema50:
+                        result['ema_alignment'] = 'BULLISH'
+                        result['ema_trend_strength'] = 70
+                    elif ema200 and ema8 < ema21 < ema50 < ema200:
+                        result['ema_alignment'] = 'PERFECT_BEAR'
+                        result['ema_trend_strength'] = -90
+                    elif ema8 < ema21 < ema50:
+                        result['ema_alignment'] = 'BEARISH'
+                        result['ema_trend_strength'] = -70
+                    else:
+                        result['ema_alignment'] = 'MIXED'
+                        result['ema_trend_strength'] = 0
+            except Exception:
+                pass
+
+            # ── V7: Hourly patterns (intraday tendencies) ──
+            try:
+                hr_hist = yf.Ticker(symbol).history(period="60d", interval="1h")
+                if hr_hist is not None and len(hr_hist) > 100:
+                    hour_returns = {}
+                    hr_closes = [float(c) for c in hr_hist['Close']]
+                    for i in range(1, len(hr_hist)):
+                        hour = hr_hist.index[i].hour
+                        ret = (hr_closes[i] - hr_closes[i-1]) / hr_closes[i-1] * 100
+                        hour_returns.setdefault(hour, []).append(ret)
+                    patterns = {}
+                    for hr, rets in hour_returns.items():
+                        avg = sum(rets) / len(rets)
+                        vol = (sum((r - avg)**2 for r in rets) / len(rets)) ** 0.5
+                        patterns[hr] = {
+                            'avg_move': round(avg, 4),
+                            'volatility': round(vol, 4),
+                            'samples': len(rets),
+                        }
+                    result['hourly_patterns'] = patterns
+            except Exception:
+                pass
+
+            # ── Classify DNA type ──
             avg_range = result['avg_daily_range_pct']
             mr = result['mean_reversion_score']
             mom = result['momentum_score']
@@ -312,7 +468,7 @@ class StockDNAProfiler:
             else:
                 result['dna_type'] = 'GRINDER'
 
-            result['confidence'] = min(80, 40 + len(closes))
+            result['confidence'] = min(85, 40 + min(len(closes), 400) // 10)
 
         except Exception as e:
             log.debug(f"[INTEL] DNA profile {symbol}: {e}")
