@@ -4640,7 +4640,8 @@ async def claude_daily_deep_learn():
                 except Exception as e:
                     log.warning(f"  [3AM] '{batch_name}' error: {e}")
                 log.warning(f"  [3AM] '{batch_name}' FAILED — both AI unavailable")
-                _pg_log("DAILY_LEARN_ERROR", reason=f"Batch '{batch_name}' failed (Claude+GPT)", source="daily_batch")
+                _pg_log("DAILY_LEARN_ERROR", reason=f"Batch '{batch_name}' failed (Claude+GPT)",
+                        source="daily_batch", data={"error": str(e) if 'e' in dir() else "call_raw returned empty"})
                 return {}
 
             # ── BATCH 1: Market + Buy/Avoid ──

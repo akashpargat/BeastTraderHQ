@@ -380,7 +380,7 @@ class AIBrain:
                     log.warning(f"  [AI] GPT-5.4 raw non-JSON: {text[:150]}")
                     return {'raw_response': text[:1000]}
             except Exception as e:
-                log.warning(f"  [AI] GPT-5.4 raw error: {e}")
+                log.warning(f"  [AI] GPT-5.4 raw error: {type(e).__name__}: {e}")
 
         log.warning("  [AI] All AI providers failed for raw call")
         return {}
